@@ -3,7 +3,7 @@ module github.com/velocitykode/velocity-mcp
 go 1.26.3
 
 require (
-	github.com/velocitykode/velocity v0.61.1
+	github.com/velocitykode/velocity v0.62.0
 	github.com/velocitykode/velocity-cli v0.13.1
 )
 
