@@ -118,12 +118,14 @@ func (p *Provider) Routes(r *chain.Routing) {
 }
 
 // Commands implements chain.CommandProvider: it registers the MCP code
-// generators (make:mcp-tool, make:mcp-resource, make:mcp-prompt) so an app that
-// adds this provider can scaffold primitives with `vel run make:mcp-...`. The
-// generators are server-independent; they register whether or not the provider
-// serves a live server.
+// generators (make:mcp-tool, make:mcp-resource, make:mcp-prompt) plus the
+// runtime commands bound to the served server (mcp:start to serve over stdio,
+// mcp:inspect to list registered primitives), so an app that adds this provider
+// gets all of them under `vel run ...`. The generators are server-independent;
+// the runtime commands operate on p.srv.
 func (p *Provider) Commands(r *chain.Commands) {
 	r.Add(console.Generators()...)
+	r.Add(console.ServerCommands(p.srv)...)
 }
 
 var _ velapp.ServiceProvider = (*Provider)(nil)
