@@ -71,7 +71,11 @@ func (f *Fake) Inject(ctx context.Context, raw []byte) ([]byte, error) {
 		return nil, nil
 	}
 
-	res := f.srv.Handle(ctx, raw, f.SessionID())
+	// Offer a streaming sink so a handler's intermediate frames (e.g. progress
+	// notifications) are recorded as sent frames ahead of the final reply,
+	// mirroring how a real streaming transport emits them.
+	emit := func(msg []byte) error { return f.Send(ctx, msg) }
+	res := handleMessage(f.srv, ctx, raw, f.SessionID(), emit)
 	if res.SessionID != "" {
 		f.setSessionID(res.SessionID)
 	}

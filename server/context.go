@@ -41,6 +41,11 @@ type Context struct {
 	// cancellation and request deadlines. Never nil after NewContext.
 	ctx context.Context
 
+	// emit is the streaming sink the transport supplies for server-initiated
+	// frames sent before the final result (e.g. progress notifications). It is
+	// nil for a non-streaming message, in which case Emit is a no-op.
+	emit func(msg []byte) error
+
 	// negotiated is the protocol version agreed during initialize; empty until
 	// negotiated. Guarded by mu.
 	negotiated string
@@ -85,6 +90,25 @@ func (c *Context) withRequestContext(ctx context.Context) *Context {
 		ctx = context.Background()
 	}
 	c.ctx = ctx
+	return c
+}
+
+// Emit sends an already-encoded frame to the client through the transport's
+// streaming sink. It is used for server-initiated notifications (such as
+// progress) emitted while a request is still being handled. When no streaming
+// sink was supplied (a non-streaming transport or message) it is a no-op and
+// returns nil, so callers need not branch on streaming support.
+func (c *Context) Emit(msg []byte) error {
+	if c.emit == nil {
+		return nil
+	}
+	return c.emit(msg)
+}
+
+// withEmitter records the streaming sink on the Context. It is called by
+// Server.createContext for a streaming message; a nil emit leaves Emit a no-op.
+func (c *Context) withEmitter(emit func(msg []byte) error) *Context {
+	c.emit = emit
 	return c
 }
 

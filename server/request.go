@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"github.com/velocitykode/velocity/validation"
+
+	"github.com/velocitykode/velocity-mcp/jsonrpc"
 )
 
 // ErrValidation is returned by Request.Validate when one or more arguments fail
@@ -28,6 +30,23 @@ type Request struct {
 	sessionID string
 	meta      map[string]any
 	uri       string
+	emit      func(msg []byte) error
+}
+
+// ProgressUpdate is a single progress report for a long-running tool or
+// resource handler, sent to the client as a notifications/progress message. The
+// client only receives it when it supplied a progressToken in the request
+// _meta and the serving transport streams (HTTP with an event-stream Accept, or
+// stdio); otherwise ReportProgress is a no-op.
+type ProgressUpdate struct {
+	// Progress is the amount of work done so far. It should increase across
+	// successive reports for the same request.
+	Progress float64
+	// Total is the total amount of work expected, when known. A value <= 0 is
+	// omitted from the wire so the client treats progress as indeterminate.
+	Total float64
+	// Message is an optional human-readable status string for this step.
+	Message string
 }
 
 // NewRequest builds a Request from a decoded arguments map. A nil map is
@@ -56,6 +75,49 @@ func (r *Request) WithMeta(meta map[string]any) *Request {
 func (r *Request) WithURI(uri string) *Request {
 	r.uri = uri
 	return r
+}
+
+// WithEmitter installs the sink used to send progress notifications back to the
+// client during a streaming request. The method handlers wire it from the
+// serving Context; a nil emitter (the non-streaming case) leaves ReportProgress
+// a no-op.
+func (r *Request) WithEmitter(emit func(msg []byte) error) *Request {
+	r.emit = emit
+	return r
+}
+
+// ReportProgress sends a progress notification for this request. It is a no-op
+// (returning nil) unless the client supplied a progressToken in the request
+// _meta and the transport provided a streaming sink, so handlers can call it
+// unconditionally. A non-nil error is the sink's write failure; handlers may
+// ignore it, since progress is best-effort and never affects the final result.
+func (r *Request) ReportProgress(p ProgressUpdate) error {
+	if r.emit == nil {
+		return nil
+	}
+	token, ok := r.meta["progressToken"]
+	if !ok || token == nil {
+		return nil
+	}
+	params := map[string]any{
+		"progressToken": token,
+		"progress":      p.Progress,
+	}
+	if p.Total > 0 {
+		params["total"] = p.Total
+	}
+	if p.Message != "" {
+		params["message"] = p.Message
+	}
+	n, err := jsonrpc.NewNotification("notifications/progress", params)
+	if err != nil {
+		return err
+	}
+	msg, err := json.Marshal(n)
+	if err != nil {
+		return err
+	}
+	return r.emit(msg)
 }
 
 // SessionID returns the id of the session that issued the request, or "".

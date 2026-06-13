@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -96,7 +97,21 @@ func Handler(srv MCPServer, opts ...HandlerOption) func(*router.Context) error {
 			return writeParseError(c, readErr)
 		}
 
-		res := srv.Handle(c.Request.Context(), raw, inboundSessionID(c))
+		sessionID := inboundSessionID(c)
+
+		// Streaming path: when the client negotiated an event stream AND the
+		// message carries a progressToken, serve over SSE so the handler can
+		// emit notifications/progress frames before the final result. Gated on
+		// the progressToken (not just the Accept header) so initialize and other
+		// non-streaming requests keep the buffered path, which can still set the
+		// Mcp-Session-Id response header before the body is committed.
+		if wantsEventStream(c) && hasProgressToken(raw) {
+			if ss, ok := srv.(streamingServer); ok {
+				return serveStream(c, ss, raw, sessionID)
+			}
+		}
+
+		res := srv.Handle(c.Request.Context(), raw, sessionID)
 
 		// A notification (or any message that produces no reply) is acknowledged
 		// with 202 Accepted and an empty body (the MCP spec mandates 202 for a
@@ -195,14 +210,50 @@ func writeJSON(c *router.Context, msg []byte) error {
 }
 
 // writeSSE writes a JSON-RPC reply as a single Server-Sent Events "data:" frame
-// with Content-Type text/event-stream and HTTP 200, as a single "data:
-// <message>\n\n" frame. This is the streamable-HTTP SSE response mode; the
-// framework's PrepareStreamHeaders sets
-// the standard streaming headers (and X-Accel-Buffering: no) so proxies do not
-// buffer the stream.
+// with Content-Type text/event-stream and HTTP 200. This is the buffered SSE
+// response mode (one message, no streamed intermediates); prepareSSE sets the
+// streaming headers and writeSSEFrame writes the frame.
 func writeSSE(c *router.Context, msg []byte) error {
+	prepareSSE(c)
+	return writeSSEFrame(c, msg)
+}
+
+// serveStream serves a request over a streamed SSE response: it commits the SSE
+// headers up front, drives the message through the streaming server with an
+// emitter that writes each intermediate frame (e.g. notifications/progress) as
+// its own SSE event, then writes the final result as the last frame. Because
+// the headers are committed before handling, no Mcp-Session-Id header is set
+// here; only non-session-assigning methods (tools/call, resources/read) take
+// this path.
+func serveStream(c *router.Context, ss streamingServer, raw []byte, sessionID string) error {
+	prepareSSE(c)
+	emit := func(msg []byte) error { return writeSSEFrame(c, msg) }
+
+	res := ss.HandleStream(c.Request.Context(), raw, sessionID, emit)
+	if !res.HasResponse || res.Response == nil {
+		return nil
+	}
+	msg, err := encodeResponse(res.Response)
+	if err != nil {
+		// The headers are already committed, so the framing cannot be changed;
+		// log the defect and end the stream without a final frame.
+		logf(c, err)
+		return nil
+	}
+	return writeSSEFrame(c, msg)
+}
+
+// prepareSSE writes the Server-Sent Events response headers and the 200 status.
+// The framework's PrepareStreamHeaders sets the streaming headers (and
+// X-Accel-Buffering: no) so proxies do not buffer the stream.
+func prepareSSE(c *router.Context) {
 	router.PrepareStreamHeaders(c.Response)
 	c.Response.WriteHeader(http.StatusOK)
+}
+
+// writeSSEFrame writes one "data: <message>\n\n" SSE frame and flushes it so the
+// client receives each frame as it is produced.
+func writeSSEFrame(c *router.Context, msg []byte) error {
 	if _, err := c.Response.Write([]byte("data: ")); err != nil {
 		return err
 	}
@@ -216,6 +267,24 @@ func writeSSE(c *router.Context, msg []byte) error {
 		f.Flush()
 	}
 	return nil
+}
+
+// hasProgressToken reports whether a raw inbound message carries a
+// params._meta.progressToken, the signal that the client wants progress
+// notifications for the request. A parse failure reports false (the buffered
+// path then handles the malformed message and returns a proper JSON-RPC error).
+func hasProgressToken(raw []byte) bool {
+	var m struct {
+		Params struct {
+			Meta struct {
+				ProgressToken json.RawMessage `json:"progressToken"`
+			} `json:"_meta"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return false
+	}
+	return len(m.Params.Meta.ProgressToken) > 0
 }
 
 // writeParseError writes a generic JSON-RPC parse-error response with HTTP 200.

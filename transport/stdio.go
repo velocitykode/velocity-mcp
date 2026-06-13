@@ -100,7 +100,13 @@ func (t *Stdio) dispatch(ctx context.Context, line []byte) error {
 		return nil
 	}
 
-	res := t.srv.Handle(ctx, line, t.currentSessionID())
+	// stdio is a persistent bidirectional stream, so it always offers a
+	// streaming sink: a handler's progress notifications are written as their
+	// own line-delimited frames ahead of the final reply. Send serializes
+	// writes, and emit runs synchronously within handleMessage, so frames stay
+	// correctly ordered.
+	emit := func(msg []byte) error { return t.Send(ctx, msg) }
+	res := handleMessage(t.srv, ctx, line, t.currentSessionID(), emit)
 	if res.SessionID != "" {
 		t.setSessionID(res.SessionID)
 	}

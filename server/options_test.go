@@ -100,7 +100,7 @@ func TestWithCapability(t *testing.T) {
 		WithCapability("experimental.sampling", true),
 		WithCapability("experimental.logging", false),
 	)
-	c := s.createContext(context.Background(), "")
+	c := s.createContext(context.Background(), "", nil)
 	if !c.HasCapability(CapabilityCompletions) {
 		t.Fatal("completions capability not advertised")
 	}
@@ -115,7 +115,7 @@ func TestWithCapability(t *testing.T) {
 
 func TestWithProtocolVersions(t *testing.T) {
 	s := New("d", "1", WithProtocolVersions("2025-06-18", "2024-11-05"))
-	c := s.createContext(context.Background(), "")
+	c := s.createContext(context.Background(), "", nil)
 	versions := c.SupportedProtocolVersions()
 	if len(versions) != 2 || versions[0] != "2025-06-18" {
 		t.Fatalf("versions = %v", versions)
@@ -123,7 +123,7 @@ func TestWithProtocolVersions(t *testing.T) {
 
 	// Empty list is ignored.
 	s2 := New("d", "1", WithProtocolVersions())
-	if len(s2.createContext(context.Background(), "").SupportedProtocolVersions()) != 4 {
+	if len(s2.createContext(context.Background(), "", nil).SupportedProtocolVersions()) != 4 {
 		t.Fatal("empty version list should retain defaults")
 	}
 }

@@ -39,7 +39,8 @@ func (ReadResource) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Re
 	request := server.NewRequest(args).
 		WithSessionID(c.SessionID()).
 		WithMeta(p.mapValue("_meta")).
-		WithURI(uri)
+		WithURI(uri).
+		WithEmitter(c.Emit)
 
 	resp, err := resource.Read(c.RequestContext(), request)
 	if err != nil {

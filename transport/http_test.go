@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -268,6 +269,105 @@ func TestWantsEventStream(t *testing.T) {
 				t.Fatalf("wantsEventStream(%q) = %v, want %v", tt.accept, got, tt.want)
 			}
 		})
+	}
+}
+
+// progressServer builds a server whose "work" tool reports two progress steps
+// before returning, for exercising the streaming path.
+func progressServer(t *testing.T) *server.Server {
+	t.Helper()
+	work := server.NewTool("work", "does work in steps").
+		HandleFunc(func(ctx context.Context, req *server.Request) (*server.Response, error) {
+			_ = req.ReportProgress(server.ProgressUpdate{Progress: 1, Total: 2, Message: "half"})
+			_ = req.ReportProgress(server.ProgressUpdate{Progress: 2, Total: 2})
+			return server.Text("done"), nil
+		})
+	srv := server.New("test", "1.0.0", server.WithTools(work))
+	srv.SetSessionIDGenerator(func() string { return "fixed-session" })
+	return srv
+}
+
+// sseFrames splits an SSE body into the JSON payloads of its "data:" frames.
+func sseFrames(body string) []string {
+	var out []string
+	for _, frame := range strings.Split(body, "\n\n") {
+		frame = strings.TrimSpace(frame)
+		if frame == "" {
+			continue
+		}
+		out = append(out, strings.TrimPrefix(frame, "data: "))
+	}
+	return out
+}
+
+func TestHandler_StreamingProgress(t *testing.T) {
+	h := Handler(progressServer(t))
+
+	// A tools/call carrying a progressToken, with an event-stream Accept, streams
+	// progress notifications followed by the final result on one SSE response.
+	body := `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"work","arguments":{},"_meta":{"progressToken":"tok-1"}}}`
+	c, w := postContext(t, body, "Accept", "text/event-stream")
+	if err := h(c); err != nil {
+		t.Fatalf("handler returned error: %v", err)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	frames := sseFrames(w.Body.String())
+	if len(frames) != 3 {
+		t.Fatalf("want 3 SSE frames (2 progress + result), got %d: %q", len(frames), frames)
+	}
+
+	// First two frames are notifications/progress for the supplied token.
+	for i, f := range frames[:2] {
+		var n struct {
+			Method string `json:"method"`
+			Params struct {
+				ProgressToken string  `json:"progressToken"`
+				Progress      float64 `json:"progress"`
+				Total         float64 `json:"total"`
+			} `json:"params"`
+		}
+		if err := json.Unmarshal([]byte(f), &n); err != nil {
+			t.Fatalf("frame %d decode: %v (%q)", i, err, f)
+		}
+		if n.Method != "notifications/progress" || n.Params.ProgressToken != "tok-1" {
+			t.Fatalf("frame %d = %q, want progress for tok-1", i, f)
+		}
+		if n.Params.Progress != float64(i+1) || n.Params.Total != 2 {
+			t.Fatalf("frame %d progress = %v/%v", i, n.Params.Progress, n.Params.Total)
+		}
+	}
+
+	// Final frame is the tools/call result correlating to the request id.
+	resp := decodeResponse(t, []byte(frames[2]))
+	if resp.Error != nil {
+		t.Fatalf("final frame carried error: %+v", resp.Error)
+	}
+	if resp.ID.String() != "7" {
+		t.Fatalf("final frame id = %s, want 7", resp.ID.String())
+	}
+}
+
+func TestHandler_NoProgressTokenStaysBuffered(t *testing.T) {
+	h := Handler(progressServer(t))
+
+	// Without a progressToken, an event-stream Accept still yields the buffered
+	// single-frame SSE reply (no progress notifications): the tool's
+	// ReportProgress calls are no-ops because no streaming sink is wired.
+	body := `{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"work","arguments":{}}}`
+	c, w := postContext(t, body, "Accept", "text/event-stream")
+	if err := h(c); err != nil {
+		t.Fatalf("handler returned error: %v", err)
+	}
+	frames := sseFrames(w.Body.String())
+	if len(frames) != 1 {
+		t.Fatalf("want a single buffered frame, got %d: %q", len(frames), frames)
+	}
+	resp := decodeResponse(t, []byte(frames[0]))
+	if resp.Error != nil || resp.ID.String() != "8" {
+		t.Fatalf("buffered frame = %q", frames[0])
 	}
 }
 

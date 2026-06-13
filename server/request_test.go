@@ -161,3 +161,80 @@ func TestToFloat(t *testing.T) {
 		}
 	}
 }
+
+func TestReportProgress(t *testing.T) {
+	var sent [][]byte
+	emit := func(msg []byte) error { sent = append(sent, msg); return nil }
+	r := NewRequest(nil).
+		WithMeta(map[string]any{"progressToken": "tok"}).
+		WithEmitter(emit)
+
+	if err := r.ReportProgress(ProgressUpdate{Progress: 1, Total: 4, Message: "step"}); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if len(sent) != 1 {
+		t.Fatalf("want 1 frame, got %d", len(sent))
+	}
+	var n struct {
+		JSONRPC string `json:"jsonrpc"`
+		Method  string `json:"method"`
+		Params  struct {
+			ProgressToken string  `json:"progressToken"`
+			Progress      float64 `json:"progress"`
+			Total         float64 `json:"total"`
+			Message       string  `json:"message"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(sent[0], &n); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if n.JSONRPC != "2.0" || n.Method != "notifications/progress" {
+		t.Fatalf("frame envelope = %+v", n)
+	}
+	if n.Params.ProgressToken != "tok" || n.Params.Progress != 1 || n.Params.Total != 4 || n.Params.Message != "step" {
+		t.Fatalf("params = %+v", n.Params)
+	}
+}
+
+func TestReportProgressOmitsUnsetTotalAndMessage(t *testing.T) {
+	var sent [][]byte
+	r := NewRequest(nil).
+		WithMeta(map[string]any{"progressToken": float64(9)}).
+		WithEmitter(func(msg []byte) error { sent = append(sent, msg); return nil })
+
+	if err := r.ReportProgress(ProgressUpdate{Progress: 2}); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	var params map[string]any
+	var n struct {
+		Params map[string]any `json:"params"`
+	}
+	if err := json.Unmarshal(sent[0], &n); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	params = n.Params
+	if _, ok := params["total"]; ok {
+		t.Fatalf("total should be omitted when <= 0: %v", params)
+	}
+	if _, ok := params["message"]; ok {
+		t.Fatalf("message should be omitted when empty: %v", params)
+	}
+}
+
+func TestReportProgressNoOpWithoutTokenOrEmitter(t *testing.T) {
+	// No emitter: no-op, no error.
+	r := NewRequest(nil).WithMeta(map[string]any{"progressToken": "t"})
+	if err := r.ReportProgress(ProgressUpdate{Progress: 1}); err != nil {
+		t.Fatalf("no-emitter report: %v", err)
+	}
+
+	// Emitter but no progressToken: no-op, nothing sent.
+	var sent int
+	r2 := NewRequest(nil).WithEmitter(func(msg []byte) error { sent++; return nil })
+	if err := r2.ReportProgress(ProgressUpdate{Progress: 1}); err != nil {
+		t.Fatalf("no-token report: %v", err)
+	}
+	if sent != 0 {
+		t.Fatalf("expected no frames without a progressToken, got %d", sent)
+	}
+}

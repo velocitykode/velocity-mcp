@@ -43,6 +43,28 @@ type MCPServer interface {
 	Handle(ctx context.Context, raw []byte, sessionID string) server.HandleResult
 }
 
+// streamingServer is the optional extension a server implements to support
+// streamed, server-initiated frames (such as notifications/progress) sent
+// before the final result. *server.Server satisfies it; a server that does not
+// is driven through the one-shot Handle. It is an optional interface so the
+// MCPServer contract (and existing stub servers) stay minimal.
+type streamingServer interface {
+	HandleStream(ctx context.Context, raw []byte, sessionID string, emit func(msg []byte) error) server.HandleResult
+}
+
+// handleMessage routes one raw inbound message through srv. When emit is non-nil
+// and srv supports streaming, the streaming entry point is used so the handler
+// can send intermediate frames through emit; otherwise the one-shot Handle is
+// used. The final HandleResult is returned in both cases.
+func handleMessage(srv MCPServer, ctx context.Context, raw []byte, sessionID string, emit func(msg []byte) error) server.HandleResult {
+	if emit != nil {
+		if ss, ok := srv.(streamingServer); ok {
+			return ss.HandleStream(ctx, raw, sessionID, emit)
+		}
+	}
+	return srv.Handle(ctx, raw, sessionID)
+}
+
 // encodeResponse marshals a JSON-RPC response into a single message frame
 // (without any trailing newline; framing is the transport's responsibility). A
 // nil response yields a nil slice so callers can skip sending.

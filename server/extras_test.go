@@ -52,7 +52,7 @@ func TestWithLoggerAndDispatchError(t *testing.T) {
 func TestInitializeMethodFallback(t *testing.T) {
 	// Directly exercise the built-in fallback handler (the methods package
 	// override is installed binary-wide, so call the fallback type directly).
-	c := New("demo", "1.0.0").createContext(context.Background(), "")
+	c := New("demo", "1.0.0").createContext(context.Background(), "", nil)
 	rawParams, _ := json.Marshal(map[string]any{"protocolVersion": "2025-06-18"})
 	req := &jsonrpc.Request{
 		JSONRPC: jsonrpc.Version,

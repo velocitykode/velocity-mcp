@@ -16,7 +16,7 @@ func TestNewDefaults(t *testing.T) {
 	if s.Instructions() != defaultInstructions {
 		t.Fatalf("instructions = %q", s.Instructions())
 	}
-	c := s.createContext(context.Background(), "")
+	c := s.createContext(context.Background(), "", nil)
 	for _, cap := range []string{CapabilityTools, CapabilityResources, CapabilityPrompts} {
 		if !c.HasCapability(cap) {
 			t.Fatalf("default capability %q missing", cap)

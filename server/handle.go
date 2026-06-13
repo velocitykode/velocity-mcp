@@ -39,6 +39,20 @@ type HandleResult struct {
 // values. sessionID is the transport's existing session id (for non-initialize
 // requests); it may be empty.
 func (s *Server) Handle(ctx context.Context, raw []byte, sessionID string) HandleResult {
+	return s.handle(ctx, raw, sessionID, nil)
+}
+
+// HandleStream is Handle for a streaming transport: emit is a sink the handler
+// may call to send server-initiated frames (such as notifications/progress)
+// before the final result, which is still returned in the HandleResult. emit is
+// invoked synchronously during handling, so the transport sends the streamed
+// frames and the final result in order on a single connection. A nil emit
+// behaves exactly like Handle.
+func (s *Server) HandleStream(ctx context.Context, raw []byte, sessionID string, emit func(msg []byte) error) HandleResult {
+	return s.handle(ctx, raw, sessionID, emit)
+}
+
+func (s *Server) handle(ctx context.Context, raw []byte, sessionID string, emit func(msg []byte) error) HandleResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -66,7 +80,7 @@ func (s *Server) Handle(ctx context.Context, raw []byte, sessionID string) Handl
 		return HandleResult{Response: jsonrpc.NewErrorResponse(id, rerr), HasResponse: true}
 	}
 
-	sc := s.createContext(ctx, sessionID)
+	sc := s.createContext(ctx, sessionID, emit)
 
 	if req.Method == "initialize" {
 		return s.handleInitialize(ctx, sc, req)

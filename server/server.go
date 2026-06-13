@@ -192,7 +192,7 @@ func (s *Server) implementation() schema.Implementation {
 // initialize request). ctx is the
 // inbound request context, threaded onto the Context so primitive handlers can
 // observe client cancellation and request deadlines.
-func (s *Server) createContext(ctx context.Context, sessionID string) *Context {
+func (s *Server) createContext(ctx context.Context, sessionID string, emit func(msg []byte) error) *Context {
 	c := NewContext(s.implementation(), s.instructions, s.versions, s.capabilities)
 	c.tools = s.tools
 	c.resources = s.resources
@@ -202,6 +202,7 @@ func (s *Server) createContext(ctx context.Context, sessionID string) *Context {
 	c.defaultPageSize = s.defaultPageSize
 	c.sessionID = sessionID
 	c.withRequestContext(ctx)
+	c.withEmitter(emit)
 	return c
 }
 
@@ -214,7 +215,7 @@ func (s *Server) NewTestContext(sessionID ...string) *Context {
 	if len(sessionID) > 0 {
 		id = sessionID[0]
 	}
-	return s.createContext(context.Background(), id)
+	return s.createContext(context.Background(), id, nil)
 }
 
 // SetEventDispatcher installs the framework event dispatcher used to emit MCP
