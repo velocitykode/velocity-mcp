@@ -61,6 +61,28 @@ func (userTemplate) Read(ctx context.Context, req *server.Request) (*server.Resp
 	return server.Text(req.String("id")), nil
 }
 
+// annotatedResource is a non-template resource that exposes MCP annotations.
+type annotatedResource struct{ docResource }
+
+func (annotatedResource) Name() string { return "annotated-doc" }
+func (annotatedResource) URI() string  { return "file://annotated.txt" }
+func (annotatedResource) Annotations() server.ResourceAnnotations {
+	p := 0.7
+	return server.ResourceAnnotations{
+		Audience:     []server.Role{server.RoleUser, server.RoleAssistant},
+		Priority:     &p,
+		LastModified: "2026-06-13T00:00:00Z",
+	}
+}
+
+// annotatedTemplate is a URI-template resource that exposes annotations.
+type annotatedTemplate struct{ userTemplate }
+
+func (annotatedTemplate) Name() string { return "annotated-user" }
+func (annotatedTemplate) Annotations() server.ResourceAnnotations {
+	return server.ResourceAnnotations{Audience: []server.Role{server.RoleAssistant}}
+}
+
 type greetPrompt struct{}
 
 func (greetPrompt) Name() string        { return "greet" }
@@ -353,6 +375,46 @@ func TestListResources(t *testing.T) {
 	r := m["resources"].([]any)[0].(map[string]any)
 	if r["uri"] != "file://doc.txt" {
 		t.Fatalf("resource = %v", r)
+	}
+	// A resource that does not implement ResourceAnnotated omits the key.
+	if _, ok := r["annotations"]; ok {
+		t.Fatalf("unannotated resource carries annotations = %v", r["annotations"])
+	}
+}
+
+func TestListResourcesAnnotations(t *testing.T) {
+	c := ctxWith(server.WithResources(annotatedResource{}))
+	resp, _ := ListResources{}.Handle(c, req(t, 1, "resources/list", nil))
+	m := decodeResult(t, resp)
+	r := m["resources"].([]any)[0].(map[string]any)
+	ann, ok := r["annotations"].(map[string]any)
+	if !ok {
+		t.Fatalf("annotations missing: %v", r)
+	}
+	if ann["priority"] != 0.7 {
+		t.Fatalf("priority = %v, want 0.7", ann["priority"])
+	}
+	if ann["lastModified"] != "2026-06-13T00:00:00Z" {
+		t.Fatalf("lastModified = %v", ann["lastModified"])
+	}
+	aud := ann["audience"].([]any)
+	if len(aud) != 2 || aud[0] != "user" || aud[1] != "assistant" {
+		t.Fatalf("audience = %v", aud)
+	}
+}
+
+func TestListResourceTemplatesAnnotations(t *testing.T) {
+	c := ctxWith(server.WithResources(annotatedTemplate{}))
+	resp, _ := ListResourceTemplates{}.Handle(c, req(t, 1, "resources/templates/list", nil))
+	m := decodeResult(t, resp)
+	tmpl := m["resourceTemplates"].([]any)[0].(map[string]any)
+	ann, ok := tmpl["annotations"].(map[string]any)
+	if !ok {
+		t.Fatalf("annotations missing: %v", tmpl)
+	}
+	aud := ann["audience"].([]any)
+	if len(aud) != 1 || aud[0] != "assistant" {
+		t.Fatalf("audience = %v", aud)
 	}
 }
 

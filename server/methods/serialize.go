@@ -42,25 +42,43 @@ func toolAnnotations(t server.Tool) map[string]any {
 // resourceToMap renders a non-template resource to its resources/list wire
 // shape.
 func resourceToMap(r server.Resource) map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		"name":        r.Name(),
 		"title":       serverTitle(r.Name(), r),
 		"description": r.Description(),
 		"mimeType":    r.MimeType(),
 		"uri":         r.URI(),
 	}
+	return withResourceAnnotations(m, r)
 }
 
 // templateToMap renders a URI-template resource to its resources/templates/list
 // wire shape (uriTemplate instead of uri).
 func templateToMap(r server.URITemplate) map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		"name":        r.Name(),
 		"title":       serverTitle(r.Name(), r),
 		"description": r.Description(),
 		"mimeType":    r.MimeType(),
 		"uriTemplate": r.URITemplate(),
 	}
+	return withResourceAnnotations(m, r)
+}
+
+// withResourceAnnotations adds the "annotations" key to m when r implements
+// server.ResourceAnnotated and carries at least one set annotation. Unlike tool
+// annotations, the key is omitted entirely when empty, following the MCP
+// resources/list and resources/templates/list shapes where annotations are
+// optional.
+func withResourceAnnotations(m map[string]any, r server.Resource) map[string]any {
+	a, ok := r.(server.ResourceAnnotated)
+	if !ok {
+		return m
+	}
+	if ann := a.Annotations().ToMap(); len(ann) > 0 {
+		m["annotations"] = ann
+	}
+	return m
 }
 
 // promptToMap renders a prompt to its prompts/list wire shape.

@@ -44,6 +44,30 @@ func TestPromptArgumentToMap(t *testing.T) {
 	}
 }
 
+func TestResourceAnnotationsToMap(t *testing.T) {
+	if m := (ResourceAnnotations{}).ToMap(); len(m) != 0 {
+		t.Fatalf("empty annotations = %v, want empty map", m)
+	}
+	p := 0.5
+	m := ResourceAnnotations{
+		Audience:     []Role{RoleUser},
+		Priority:     &p,
+		LastModified: "2026-06-13",
+	}.ToMap()
+	if m["priority"] != 0.5 || m["lastModified"] != "2026-06-13" {
+		t.Fatalf("annotations = %v", m)
+	}
+	aud := m["audience"].([]string)
+	if len(aud) != 1 || aud[0] != "user" {
+		t.Fatalf("audience = %v", aud)
+	}
+	// A zero priority is distinct from unset and must be emitted.
+	zero := 0.0
+	if got := (ResourceAnnotations{Priority: &zero}).ToMap(); got["priority"] != 0.0 {
+		t.Fatalf("zero priority dropped: %v", got)
+	}
+}
+
 type titledTool struct{ WeatherTool }
 
 func (titledTool) Title() string { return "Custom Title" }

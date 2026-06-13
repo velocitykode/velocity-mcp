@@ -121,6 +121,52 @@ type URITemplate interface {
 	URITemplate() string
 }
 
+// ResourceAnnotations carries a resource's optional MCP annotations surfaced in
+// resources/list and resources/templates/list under the "annotations" object.
+// Unlike tool behavior hints, the object is omitted entirely when no annotation
+// is set. All three are hints only: clients may use them to prioritize, filter,
+// or order resources but are not required to honor them.
+type ResourceAnnotations struct {
+	// Audience lists the intended audiences for the resource (e.g. RoleUser,
+	// RoleAssistant). Empty omits the "audience" key.
+	Audience []Role
+	// Priority hints relative importance in the inclusive range 0.0 to 1.0,
+	// where higher means more important. A nil pointer omits the "priority"
+	// key, distinguishing "unset" from a deliberate 0.0.
+	Priority *float64
+	// LastModified is the resource's last-modified timestamp as an ISO 8601 /
+	// RFC 3339 string. Empty omits the "lastModified" key.
+	LastModified string
+}
+
+// ToMap renders the annotations to their MCP wire shape, omitting any unset
+// field. An all-unset value yields an empty map, which callers drop rather than
+// emitting an empty "annotations" object.
+func (a ResourceAnnotations) ToMap() map[string]any {
+	m := map[string]any{}
+	if len(a.Audience) > 0 {
+		aud := make([]string, len(a.Audience))
+		for i, r := range a.Audience {
+			aud[i] = string(r)
+		}
+		m["audience"] = aud
+	}
+	if a.Priority != nil {
+		m["priority"] = *a.Priority
+	}
+	if a.LastModified != "" {
+		m["lastModified"] = a.LastModified
+	}
+	return m
+}
+
+// ResourceAnnotated is implemented by resources that expose annotations in
+// resources/list and resources/templates/list. A resource that does not
+// implement it reports no annotations (the key is omitted from its wire shape).
+type ResourceAnnotated interface {
+	Annotations() ResourceAnnotations
+}
+
 // Prompt is a server primitive that produces prompt messages (prompts/get).
 type Prompt interface {
 	// Name is the prompt's unique, kebab-case identifier.
