@@ -136,6 +136,41 @@ func TestListTools(t *testing.T) {
 	if _, ok := input["properties"]; !ok {
 		t.Fatal("inputSchema missing properties")
 	}
+	ann, ok := tool["annotations"].(map[string]any)
+	if !ok || len(ann) != 0 {
+		t.Fatalf("unannotated tool annotations = %v, want empty object", tool["annotations"])
+	}
+}
+
+func TestListToolsAnnotations(t *testing.T) {
+	wipe := server.NewTool("wipe", "deletes things").
+		WithReadOnlyHint(false).
+		WithDestructiveHint(true).
+		WithOpenWorldHint(false)
+	c := ctxWith(server.WithTools(wipe))
+	resp, err := ListTools{}.Handle(c, req(t, 1, "tools/list", nil))
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	tool := decodeResult(t, resp)["tools"].([]any)[0].(map[string]any)
+	ann := tool["annotations"].(map[string]any)
+	want := map[string]any{
+		"readOnlyHint":    false,
+		"destructiveHint": true,
+		"openWorldHint":   false,
+	}
+	if len(ann) != len(want) {
+		t.Fatalf("annotations = %v, want %v", ann, want)
+	}
+	for k, v := range want {
+		if ann[k] != v {
+			t.Fatalf("annotations[%q] = %v, want %v", k, ann[k], v)
+		}
+	}
+	// An unset hint (idempotentHint) must be omitted entirely, not defaulted.
+	if _, present := ann["idempotentHint"]; present {
+		t.Fatalf("unset idempotentHint leaked into wire: %v", ann)
+	}
 }
 
 func TestListToolsPagination(t *testing.T) {

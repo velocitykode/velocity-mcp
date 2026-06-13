@@ -24,8 +24,19 @@ func toolToMap(t server.Tool) map[string]any {
 		"title":       serverTitle(t.Name(), t),
 		"description": t.Description(),
 		"inputSchema": input,
-		"annotations": map[string]any{},
+		"annotations": toolAnnotations(t),
 	}
+}
+
+// toolAnnotations returns a tool's behavior-hint annotations object, delegating
+// to the tool when it implements server.Annotated and otherwise yielding an
+// empty object. Follows the MCP tools/list annotations handling, where
+// unset hints are omitted and an empty set serializes as "{}".
+func toolAnnotations(t server.Tool) map[string]any {
+	if a, ok := t.(server.Annotated); ok {
+		return a.Annotations().ToMap()
+	}
+	return map[string]any{}
 }
 
 // resourceToMap renders a non-template resource to its resources/list wire

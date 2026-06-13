@@ -35,6 +35,59 @@ type Titled interface {
 	Title() string
 }
 
+// ToolAnnotations carries the MCP tool behavior hints surfaced in tools/list
+// under the "annotations" object. Each field is a pointer so an unset hint is
+// omitted from the wire (clients apply the spec default), while an explicit
+// false is still transmitted. The pointer is necessary because destructiveHint
+// and openWorldHint default to true, so a plain bool with omitempty would
+// silently drop a deliberate false.
+//
+// All four are hints only: per the MCP spec, clients must treat them as
+// untrusted unless the server is trusted, and they never guarantee behavior.
+type ToolAnnotations struct {
+	// ReadOnly hints the tool does not modify its environment (readOnlyHint;
+	// spec default false).
+	ReadOnly *bool
+	// Destructive hints the tool may perform destructive updates rather than
+	// only additive ones; meaningful only when ReadOnly is false
+	// (destructiveHint; spec default true).
+	Destructive *bool
+	// Idempotent hints repeated calls with the same arguments have no
+	// additional effect; meaningful only when ReadOnly is false
+	// (idempotentHint; spec default false).
+	Idempotent *bool
+	// OpenWorld hints the tool may interact with an open world of external
+	// entities rather than a closed domain (openWorldHint; spec default true).
+	OpenWorld *bool
+}
+
+// ToMap renders the hints to their MCP wire shape, omitting any unset hint. An
+// all-unset value yields an empty map, which callers emit as an empty
+// "annotations" object.
+func (a ToolAnnotations) ToMap() map[string]any {
+	m := map[string]any{}
+	if a.ReadOnly != nil {
+		m["readOnlyHint"] = *a.ReadOnly
+	}
+	if a.Destructive != nil {
+		m["destructiveHint"] = *a.Destructive
+	}
+	if a.Idempotent != nil {
+		m["idempotentHint"] = *a.Idempotent
+	}
+	if a.OpenWorld != nil {
+		m["openWorldHint"] = *a.OpenWorld
+	}
+	return m
+}
+
+// Annotated is implemented by tools that expose behavior-hint annotations in
+// tools/list. A tool that does not implement it reports no hints (an empty
+// annotations object).
+type Annotated interface {
+	Annotations() ToolAnnotations
+}
+
 // Resource is a readable server primitive identified by a URI (resources/read).
 // A resource whose URI is a template (contains "{var}" placeholders) is listed
 // under resources/templates/list instead of resources/list; implement
