@@ -73,7 +73,7 @@ func resourceToMap(r server.Resource) map[string]any {
 		"mimeType":    r.MimeType(),
 		"uri":         r.URI(),
 	}
-	return withResourceAnnotations(m, r)
+	return withAppMeta(withResourceAnnotations(m, r), r)
 }
 
 // templateToMap renders a URI-template resource to its resources/templates/list
@@ -86,7 +86,29 @@ func templateToMap(r server.URITemplate) map[string]any {
 		"mimeType":    r.MimeType(),
 		"uriTemplate": r.URITemplate(),
 	}
-	return withResourceAnnotations(m, r)
+	return withAppMeta(withResourceAnnotations(m, r), r)
+}
+
+// withAppMeta adds the MCP UI app metadata to m under "_meta.ui" when r is an
+// app resource (implements server.AppResource) and the metadata is non-empty.
+// The key is nested under "_meta" without disturbing any other _meta keys, so a
+// host that ignores the extension sees an ordinary resource entry.
+func withAppMeta(m map[string]any, r server.Resource) map[string]any {
+	a, ok := r.(server.AppResource)
+	if !ok {
+		return m
+	}
+	uiMeta := a.AppMeta().ToMap()
+	if len(uiMeta) == 0 {
+		return m
+	}
+	meta, _ := m["_meta"].(map[string]any)
+	if meta == nil {
+		meta = map[string]any{}
+	}
+	meta["ui"] = uiMeta
+	m["_meta"] = meta
+	return m
 }
 
 // withResourceAnnotations adds the "annotations" key to m when r implements

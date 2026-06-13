@@ -11,6 +11,7 @@ import (
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
 	"github.com/velocitykode/velocity-mcp/schema"
 	"github.com/velocitykode/velocity-mcp/server"
+	"github.com/velocitykode/velocity-mcp/ui"
 )
 
 // --- test fixtures ---
@@ -437,6 +438,50 @@ func TestListResourcesAnnotations(t *testing.T) {
 	aud := ann["audience"].([]any)
 	if len(aud) != 2 || aud[0] != "user" || aud[1] != "assistant" {
 		t.Fatalf("audience = %v", aud)
+	}
+}
+
+func TestListResourcesAppMeta(t *testing.T) {
+	app := server.NewAppResource("dashboard", "ui://dashboard").
+		WithAppMeta(ui.NewAppMeta().
+			WithDomain("example.com").
+			WithLibraries(ui.LibraryTailwind)).
+		HTMLFunc(func(ctx context.Context, req *server.Request) (string, error) {
+			return "<h1>hi</h1>", nil
+		})
+	c := ctxWith(server.WithResources(app))
+	resp, _ := ListResources{}.Handle(c, req(t, 1, "resources/list", nil))
+	m := decodeResult(t, resp)
+	r := m["resources"].([]any)[0].(map[string]any)
+
+	if r["mimeType"] != server.AppResourceMimeType {
+		t.Fatalf("mimeType = %v", r["mimeType"])
+	}
+	meta, ok := r["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("_meta missing: %v", r)
+	}
+	uiMeta, ok := meta["ui"].(map[string]any)
+	if !ok {
+		t.Fatalf("_meta.ui missing: %v", meta)
+	}
+	if uiMeta["domain"] != "example.com" {
+		t.Fatalf("ui.domain = %v", uiMeta["domain"])
+	}
+	// Tailwind's CDN host is merged into the CSP resourceDomains.
+	csp := uiMeta["csp"].(map[string]any)
+	rd := csp["resourceDomains"].([]any)
+	if len(rd) != 1 || rd[0] != "https://cdn.tailwindcss.com" {
+		t.Fatalf("csp.resourceDomains = %v", rd)
+	}
+}
+
+func TestListResourcesNonAppHasNoMetaUI(t *testing.T) {
+	c := ctxWith(server.WithResources(docResource{}))
+	resp, _ := ListResources{}.Handle(c, req(t, 1, "resources/list", nil))
+	r := decodeResult(t, resp)["resources"].([]any)[0].(map[string]any)
+	if _, ok := r["_meta"]; ok {
+		t.Fatalf("ordinary resource should not carry _meta: %v", r["_meta"])
 	}
 }
 
