@@ -10,9 +10,8 @@ import (
 	"github.com/velocitykode/velocity-mcp/schema"
 )
 
-// Tool is a server primitive an MCP client can invoke (tools/call). It mirrors
-// laravel/mcp's Server\Tool. Implementations describe their input arguments via
-// Schema and run via Handle.
+// Tool is a server primitive an MCP client can invoke (tools/call).
+// Implementations describe their input arguments via Schema and run via Handle.
 //
 // Name must be kebab-case and unique within a server; DefaultName derives a
 // suitable name from a Go type. Description is shown to clients in tools/list.
@@ -31,15 +30,68 @@ type Tool interface {
 }
 
 // Titled is implemented by primitives that expose a human-friendly title
-// distinct from their name. Mirrors laravel/mcp's Primitive::title().
+// distinct from their name.
 type Titled interface {
 	Title() string
 }
 
+// ToolAnnotations carries the MCP tool behavior hints surfaced in tools/list
+// under the "annotations" object. Each field is a pointer so an unset hint is
+// omitted from the wire (clients apply the spec default), while an explicit
+// false is still transmitted. The pointer is necessary because destructiveHint
+// and openWorldHint default to true, so a plain bool with omitempty would
+// silently drop a deliberate false.
+//
+// All four are hints only: per the MCP spec, clients must treat them as
+// untrusted unless the server is trusted, and they never guarantee behavior.
+type ToolAnnotations struct {
+	// ReadOnly hints the tool does not modify its environment (readOnlyHint;
+	// spec default false).
+	ReadOnly *bool
+	// Destructive hints the tool may perform destructive updates rather than
+	// only additive ones; meaningful only when ReadOnly is false
+	// (destructiveHint; spec default true).
+	Destructive *bool
+	// Idempotent hints repeated calls with the same arguments have no
+	// additional effect; meaningful only when ReadOnly is false
+	// (idempotentHint; spec default false).
+	Idempotent *bool
+	// OpenWorld hints the tool may interact with an open world of external
+	// entities rather than a closed domain (openWorldHint; spec default true).
+	OpenWorld *bool
+}
+
+// ToMap renders the hints to their MCP wire shape, omitting any unset hint. An
+// all-unset value yields an empty map, which callers emit as an empty
+// "annotations" object.
+func (a ToolAnnotations) ToMap() map[string]any {
+	m := map[string]any{}
+	if a.ReadOnly != nil {
+		m["readOnlyHint"] = *a.ReadOnly
+	}
+	if a.Destructive != nil {
+		m["destructiveHint"] = *a.Destructive
+	}
+	if a.Idempotent != nil {
+		m["idempotentHint"] = *a.Idempotent
+	}
+	if a.OpenWorld != nil {
+		m["openWorldHint"] = *a.OpenWorld
+	}
+	return m
+}
+
+// Annotated is implemented by tools that expose behavior-hint annotations in
+// tools/list. A tool that does not implement it reports no hints (an empty
+// annotations object).
+type Annotated interface {
+	Annotations() ToolAnnotations
+}
+
 // Resource is a readable server primitive identified by a URI (resources/read).
-// It mirrors laravel/mcp's Server\Resource. A resource whose URI is a template
-// (contains "{var}" placeholders) is listed under resources/templates/list
-// instead of resources/list; implement URITemplate to opt in.
+// A resource whose URI is a template (contains "{var}" placeholders) is listed
+// under resources/templates/list instead of resources/list; implement
+// URITemplate to opt in.
 type Resource interface {
 	// Name is the resource's unique, kebab-case identifier.
 	Name() string
@@ -57,7 +109,7 @@ type Resource interface {
 
 // URITemplate is implemented by resources whose URI is an RFC 6570-style
 // template (e.g. "file://users/{id}"). Such resources are reported under
-// resources/templates/list. Mirrors laravel/mcp's HasUriTemplate contract.
+// resources/templates/list.
 //
 // A resource may implement this as a marker (URITemplate() returning its URI)
 // or carry richer matching; the server treats any resource implementing this
@@ -69,8 +121,7 @@ type URITemplate interface {
 	URITemplate() string
 }
 
-// Prompt is a server primitive that produces prompt messages (prompts/get). It
-// mirrors laravel/mcp's Server\Prompt.
+// Prompt is a server primitive that produces prompt messages (prompts/get).
 type Prompt interface {
 	// Name is the prompt's unique, kebab-case identifier.
 	Name() string
@@ -82,8 +133,7 @@ type Prompt interface {
 	Handle(ctx context.Context, req *Request) (*Response, error)
 }
 
-// PromptArgument describes a single declared argument of a Prompt, mirroring
-// laravel/mcp's Server\Prompts\Argument.
+// PromptArgument describes a single declared argument of a Prompt.
 type PromptArgument struct {
 	// Name is the argument name.
 	Name string
@@ -107,10 +157,9 @@ func (a PromptArgument) ToMap() map[string]any {
 	}
 }
 
-// DefaultName derives a kebab-case primitive name from a Go value's type name,
-// mirroring laravel/mcp's Str::kebab(class_basename($this)) default. A pointer
-// is dereferenced to its element type, and any package qualifier is dropped, so
-// *myapp.WeatherTool yields "weather-tool".
+// DefaultName derives a kebab-case primitive name from a Go value's type name.
+// A pointer is dereferenced to its element type, and any package qualifier is
+// dropped, so *myapp.WeatherTool yields "weather-tool".
 //
 // It uses velocity's str.Kebab so naming is consistent with the rest of the
 // framework. An anonymous or unnamed type yields "".
@@ -136,8 +185,7 @@ func DefaultName(v any) string {
 }
 
 // titleOf returns a primitive's title: its Title() when it implements Titled,
-// otherwise a headline derived from its name via velocity's str.Headline,
-// mirroring laravel/mcp's Primitive::title() default.
+// otherwise a headline derived from its name via velocity's str.Headline.
 func titleOf(name string, p any) string {
 	if t, ok := p.(Titled); ok {
 		if v := t.Title(); v != "" {

@@ -7,10 +7,10 @@ import (
 	"github.com/velocitykode/velocity-mcp/server"
 )
 
-// toolToMap renders a tool to its tools/list wire shape, mirroring laravel/mcp's
-// Tool::toArray: name, title, description, inputSchema, and an annotations
-// object (always present, empty by default). The input schema always carries a
-// "properties" object even when empty.
+// toolToMap renders a tool to its tools/list wire shape: name, title,
+// description, inputSchema, and an annotations object (always present, empty by
+// default). The input schema always carries a "properties" object even when
+// empty.
 func toolToMap(t server.Tool) map[string]any {
 	obj := schema.NewObject()
 	t.Schema(obj)
@@ -24,12 +24,23 @@ func toolToMap(t server.Tool) map[string]any {
 		"title":       serverTitle(t.Name(), t),
 		"description": t.Description(),
 		"inputSchema": input,
-		"annotations": map[string]any{},
+		"annotations": toolAnnotations(t),
 	}
 }
 
+// toolAnnotations returns a tool's behavior-hint annotations object, delegating
+// to the tool when it implements server.Annotated and otherwise yielding an
+// empty object. Follows the MCP tools/list annotations handling, where
+// unset hints are omitted and an empty set serializes as "{}".
+func toolAnnotations(t server.Tool) map[string]any {
+	if a, ok := t.(server.Annotated); ok {
+		return a.Annotations().ToMap()
+	}
+	return map[string]any{}
+}
+
 // resourceToMap renders a non-template resource to its resources/list wire
-// shape, mirroring laravel/mcp's Resource::toArray.
+// shape.
 func resourceToMap(r server.Resource) map[string]any {
 	return map[string]any{
 		"name":        r.Name(),
@@ -41,8 +52,7 @@ func resourceToMap(r server.Resource) map[string]any {
 }
 
 // templateToMap renders a URI-template resource to its resources/templates/list
-// wire shape, mirroring laravel/mcp's Resource::toArray for templated resources
-// (uriTemplate instead of uri).
+// wire shape (uriTemplate instead of uri).
 func templateToMap(r server.URITemplate) map[string]any {
 	return map[string]any{
 		"name":        r.Name(),
@@ -53,8 +63,7 @@ func templateToMap(r server.URITemplate) map[string]any {
 	}
 }
 
-// promptToMap renders a prompt to its prompts/list wire shape, mirroring
-// laravel/mcp's Prompt::toArray.
+// promptToMap renders a prompt to its prompts/list wire shape.
 func promptToMap(p server.Prompt) map[string]any {
 	args := p.Arguments()
 	out := make([]map[string]any, 0, len(args))
@@ -71,7 +80,7 @@ func promptToMap(p server.Prompt) map[string]any {
 
 // serverTitle returns a primitive's title, delegating to the primitive's Title
 // method when it implements server.Titled, otherwise deriving a headline from
-// the name. It mirrors laravel/mcp's Primitive::title default.
+// the name.
 func serverTitle(name string, p any) string {
 	if t, ok := p.(server.Titled); ok {
 		if v := t.Title(); v != "" {

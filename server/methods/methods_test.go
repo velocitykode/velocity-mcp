@@ -136,6 +136,41 @@ func TestListTools(t *testing.T) {
 	if _, ok := input["properties"]; !ok {
 		t.Fatal("inputSchema missing properties")
 	}
+	ann, ok := tool["annotations"].(map[string]any)
+	if !ok || len(ann) != 0 {
+		t.Fatalf("unannotated tool annotations = %v, want empty object", tool["annotations"])
+	}
+}
+
+func TestListToolsAnnotations(t *testing.T) {
+	wipe := server.NewTool("wipe", "deletes things").
+		WithReadOnlyHint(false).
+		WithDestructiveHint(true).
+		WithOpenWorldHint(false)
+	c := ctxWith(server.WithTools(wipe))
+	resp, err := ListTools{}.Handle(c, req(t, 1, "tools/list", nil))
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	tool := decodeResult(t, resp)["tools"].([]any)[0].(map[string]any)
+	ann := tool["annotations"].(map[string]any)
+	want := map[string]any{
+		"readOnlyHint":    false,
+		"destructiveHint": true,
+		"openWorldHint":   false,
+	}
+	if len(ann) != len(want) {
+		t.Fatalf("annotations = %v, want %v", ann, want)
+	}
+	for k, v := range want {
+		if ann[k] != v {
+			t.Fatalf("annotations[%q] = %v, want %v", k, ann[k], v)
+		}
+	}
+	// An unset hint (idempotentHint) must be omitted entirely, not defaulted.
+	if _, present := ann["idempotentHint"]; present {
+		t.Fatalf("unset idempotentHint leaked into wire: %v", ann)
+	}
 }
 
 func TestListToolsPagination(t *testing.T) {
@@ -164,7 +199,7 @@ func TestListToolsPagination(t *testing.T) {
 }
 
 // TestListTools_PerPageZeroEmptyPage asserts an explicit per_page of 0 yields an
-// empty page with no nextCursor (min(0, max) = 0), mirroring laravel/mcp, while
+// empty page with no nextCursor (min(0, max) = 0), while
 // an absent per_page falls back to the default page size.
 func TestListTools_PerPageZeroEmptyPage(t *testing.T) {
 	c := ctxWith(server.WithTools(echoTool(), failingTool(), validatingTool()))
@@ -442,7 +477,7 @@ func TestCompletionValidation(t *testing.T) {
 // TestCompletionComplete_ResolvedRefMissingArgumentName asserts that when a
 // reference resolves to a registered (but non-completable) primitive and the
 // argument.name is absent, the handler returns the empty completion shape with
-// no error, mirroring laravel/mcp which short-circuits non-completable
+// no error, since the handler short-circuits non-completable
 // primitives BEFORE inspecting argument.name.
 func TestCompletionComplete_ResolvedRefMissingArgumentName(t *testing.T) {
 	c := ctxWith(
