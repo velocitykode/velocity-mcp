@@ -2,7 +2,10 @@ module github.com/velocitykode/velocity-mcp
 
 go 1.26.3
 
-require github.com/velocitykode/velocity v0.61.0
+require (
+	github.com/velocitykode/velocity v0.61.1
+	github.com/velocitykode/velocity-cli v0.13.1
+)
 
 require (
 	github.com/BurntSushi/toml v1.6.0 // indirect
@@ -33,7 +36,6 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
-	github.com/velocitykode/velocity-cli v0.13.1 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/crypto v0.46.0 // indirect
 	golang.org/x/net v0.48.0 // indirect
