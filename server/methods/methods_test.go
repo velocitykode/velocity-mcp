@@ -94,6 +94,15 @@ func (greetPrompt) Handle(ctx context.Context, req *server.Request) (*server.Res
 	return server.Text("hello " + req.String("name")).AsAssistant(), nil
 }
 
+// completablePrompt is a prompt that supplies argument completions, exercising
+// the server.Completable path of completion/complete.
+type completablePrompt struct{ greetPrompt }
+
+func (completablePrompt) Name() string { return "city-greet" }
+func (completablePrompt) Complete(ctx context.Context, req server.CompletionRequest) (server.Completion, error) {
+	return server.CompleteValues(req.Value, []string{"London", "Lahore", "Lisbon", "Paris"}), nil
+}
+
 func req(t *testing.T, id int, method string, params map[string]any) *jsonrpc.Request {
 	t.Helper()
 	var raw json.RawMessage
@@ -592,6 +601,43 @@ func TestCompletionComplete_ResolvedRefMissingArgumentName(t *testing.T) {
 	}
 	if comp["total"].(float64) != 0 || comp["hasMore"].(bool) != false {
 		t.Fatalf("expected empty completion, got %v", comp)
+	}
+}
+
+func TestCompletionCompletable(t *testing.T) {
+	c := ctxWith(
+		server.WithPrompts(completablePrompt{}),
+		server.WithCapability(server.CapabilityCompletions),
+	)
+	resp, err := CompletionComplete{}.Handle(c, req(t, 1, "completion/complete", map[string]any{
+		"ref":      map[string]any{"type": "ref/prompt", "name": "city-greet"},
+		"argument": map[string]any{"name": "name", "value": "L"},
+	}))
+	if err != nil {
+		t.Fatalf("completion: %v", err)
+	}
+	comp := decodeResult(t, resp)["completion"].(map[string]any)
+	// "L" prefix (case-insensitive) keeps London, Lahore, Lisbon (not Paris).
+	vals := comp["values"].([]any)
+	if len(vals) != 3 || comp["total"].(float64) != 3 || comp["hasMore"].(bool) {
+		t.Fatalf("completion = %v", comp)
+	}
+}
+
+// TestCompletionCompletableMissingName asserts a completable reference still
+// requires argument.name: unlike a non-completable reference, an absent name is
+// InvalidParams because the provider needs to know which argument to complete.
+func TestCompletionCompletableMissingName(t *testing.T) {
+	c := ctxWith(
+		server.WithPrompts(completablePrompt{}),
+		server.WithCapability(server.CapabilityCompletions),
+	)
+	resp, _ := CompletionComplete{}.Handle(c, req(t, 1, "completion/complete", map[string]any{
+		"ref":      map[string]any{"type": "ref/prompt", "name": "city-greet"},
+		"argument": map[string]any{},
+	}))
+	if resp.Error == nil || resp.Error.Code != jsonrpc.CodeInvalidParams {
+		t.Fatalf("expected InvalidParams, got %+v", resp.Error)
 	}
 }
 
