@@ -45,7 +45,7 @@ func TestObject_EmptyMarshalsToObjectWithEmptyProperties(t *testing.T) {
 }
 
 func TestObject_StringPropertyWithDescriptionAndRequired(t *testing.T) {
-	// Mirrors laravel's say-hi-tool golden schema.
+	// Golden schema for the say-hi-tool example.
 	s := schema.NewObject()
 	s.String("name").Description("The name of the person to greet").Required()
 

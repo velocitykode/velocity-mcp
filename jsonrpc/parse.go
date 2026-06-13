@@ -10,8 +10,8 @@ import (
 // JSON value (e.g. a second message in the same buffer).
 var errTrailingData = errors.New("jsonrpc: trailing data after JSON value")
 
-// Sentinel error messages mirror laravel/mcp's JsonRpcException strings so the
-// wire-level diagnostics match the reference implementation.
+// Sentinel error messages are the canonical JSON-RPC error strings so the
+// wire-level diagnostics are stable and descriptive.
 const (
 	msgParseError       = "Parse error: Invalid JSON was received by the server."
 	msgInvalidID        = "Invalid Request: The [id] member must be a string, number."
@@ -36,9 +36,8 @@ func (e envelope) has(key string) bool {
 }
 
 // hasNonNull reports whether the named member is present AND its value is not
-// JSON null. It mirrors PHP's isset(): a present-but-null member counts as
-// "not set", which is how laravel/mcp routes messages (Server::handle uses
-// isset($jsonRequest['id'])).
+// JSON null. A present-but-null member counts as "not set", which is how
+// messages are routed: a present-but-null id is treated as absent.
 func (e envelope) hasNonNull(key string) bool {
 	v, ok := e[key]
 	if !ok {
@@ -58,9 +57,8 @@ func (e envelope) raw(key string) json.RawMessage {
 // IsNotificationBytes reports whether the incoming JSON-RPC message should be
 // routed as a notification (no reply) rather than a request. A message is a
 // notification when it has no usable id member: either the id is absent or it is
-// present but JSON null. This mirrors laravel/mcp's Server::handle, which uses
-// isset($jsonRequest['id']) to choose between a request and a notification, and
-// PHP's isset() is false for a present-but-null key. Malformed JSON yields a
+// present but JSON null. A present-but-null id is treated as absent when
+// choosing between a request and a notification. Malformed JSON yields a
 // CodeParseError.
 func IsNotificationBytes(data []byte) (bool, error) {
 	var env envelope
@@ -72,18 +70,17 @@ func IsNotificationBytes(data []byte) (bool, error) {
 
 // ParseRequest strictly decodes a JSON-RPC request. It rejects malformed JSON
 // (CodeParseError), a missing or non-string/number id, a jsonrpc version other
-// than exactly "2.0", and a missing or non-string method (all CodeInvalidRequest),
-// mirroring laravel/mcp's JsonRpcRequest::from. On the id and version/method
-// checks the recovered id (when usable) is returned so callers can correlate the
-// error response.
+// than exactly "2.0", and a missing or non-string method (all CodeInvalidRequest).
+// On the id and version/method checks the recovered id (when usable) is returned
+// so callers can correlate the error response.
 func ParseRequest(data []byte) (*Request, ID, *Error) {
 	var env envelope
 	if err := strictUnmarshal(data, &env); err != nil {
 		return nil, NullID(), NewError(CodeParseError, msgParseError)
 	}
 
-	// Recover the id first so it can be echoed on subsequent validation errors,
-	// exactly as laravel does (it reads $jsonRequest['id'] before validating).
+	// Recover the id first so it can be echoed on subsequent validation errors:
+	// the id is read before any other member is validated.
 	var id ID
 	if env.has("id") {
 		id = ID{raw: cloneRaw(env.raw("id"))}
@@ -113,8 +110,8 @@ func ParseRequest(data []byte) (*Request, ID, *Error) {
 
 // ParseNotification strictly decodes a JSON-RPC notification. It rejects
 // malformed JSON (CodeParseError), a jsonrpc version other than exactly "2.0",
-// and a missing or non-string method (CodeInvalidRequest), mirroring
-// laravel/mcp's JsonRpcNotification::from. A notification carries no id.
+// and a missing or non-string method (CodeInvalidRequest). A notification
+// carries no id.
 func ParseNotification(data []byte) (*Notification, *Error) {
 	var env envelope
 	if err := strictUnmarshal(data, &env); err != nil {

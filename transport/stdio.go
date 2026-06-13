@@ -16,9 +16,9 @@ import (
 // for line-delimited framing.
 const maxLineBytes = 4 << 20 // 4 MiB
 
-// Stdio is a line-delimited JSON-RPC transport over a reader/writer pair,
-// mirroring laravel/mcp's StdioTransport. Each inbound line is one JSON-RPC
-// message; each outbound message is written as one line terminated by '\n'. The
+// Stdio is a line-delimited JSON-RPC transport over a reader/writer pair.
+// Each inbound line is one JSON-RPC message; each outbound message is written
+// as one line terminated by '\n'. The
 // reader and writer are parameterized so tests can drive the transport without
 // real process stdio; ServeStdio wires them to os.Stdin/os.Stdout.
 //
@@ -78,8 +78,8 @@ func (t *Stdio) Run(ctx context.Context) error {
 		case <-errc:
 			// The reader goroutine ended: EOF or a read error. Either way the
 			// stream is done. A read error (non-EOF) ends the session but is not
-			// surfaced as a failure to the caller, matching laravel/mcp's
-			// StdioTransport, which simply loops until feof(STDIN).
+			// surfaced as a failure to the caller; the loop simply reads until the
+			// input stream reaches EOF.
 			return nil
 		case line, ok := <-lines:
 			if !ok {
@@ -118,9 +118,9 @@ func (t *Stdio) dispatch(ctx context.Context, line []byte) error {
 	return t.Send(ctx, msg)
 }
 
-// Send writes a single message frame followed by a newline, mirroring
-// laravel/mcp's StdioTransport::send (fwrite(STDOUT, $message.PHP_EOL)). It is
-// safe for concurrent use; writes are serialized by the transport mutex.
+// Send writes a single message frame followed by a newline to the output
+// stream. It is safe for concurrent use; writes are serialized by the transport
+// mutex.
 func (t *Stdio) Send(ctx context.Context, msg []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()

@@ -4,12 +4,11 @@ import "encoding/json"
 
 // ResourceLink references a resource by uri and name without embedding its
 // contents. It may be used in tool and prompt results but not in a resource
-// (resources/read) context, where ToResource returns ErrNotAllowed (mirrors
-// laravel/mcp which throws there).
+// (resources/read) context, where ToResource returns ErrNotAllowed.
 //
 // Wire shape: {"type":"resource_link","uri":...,"name":...,...}. Optional
 // fields (title, description, mimeType, size, annotations, icons) are omitted
-// when unset, matching laravel/mcp Server\Content\ResourceLink.
+// when unset.
 type ResourceLink struct {
 	meta
 	uri         string

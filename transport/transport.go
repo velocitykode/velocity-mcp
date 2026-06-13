@@ -17,11 +17,10 @@ import (
 	_ "github.com/velocitykode/velocity-mcp/server/methods"
 )
 
-// Transport is the contract every MCP transport implements. It mirrors
-// laravel/mcp's Server\Contracts\Transport, reshaped to Go idioms: a blocking
-// Run loop driven by a context for cancellation, and a Send that emits an
-// already-encoded message frame. Implementations are responsible for framing
-// (line-delimited for stdio, the HTTP body for the HTTP transport).
+// Transport is the contract every MCP transport implements, shaped to Go
+// idioms: a blocking Run loop driven by a context for cancellation, and a Send
+// that emits an already-encoded message frame. Implementations are responsible
+// for framing (line-delimited for stdio, the HTTP body for the HTTP transport).
 type Transport interface {
 	// Run drives the transport's message loop until ctx is cancelled or the
 	// underlying stream ends. It blocks for the lifetime of the connection and

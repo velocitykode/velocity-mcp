@@ -4,9 +4,9 @@ import (
 	"github.com/velocitykode/velocity-mcp/server"
 )
 
-// toolResult builds the tools/call result map from a response, mirroring
-// laravel/mcp's CallTool serializable: a "content" array of per-item tool
-// shapes, an "isError" flag, and any merged _meta / structuredContent. A
+// toolResult builds the tools/call result map from a response: a "content"
+// array of per-item tool shapes, an "isError" flag, and any merged _meta /
+// structuredContent. A
 // content item that cannot be represented in a tool context (e.g. a Blob)
 // surfaces as a tool-level error result rather than failing the call.
 func toolResult(resp *server.Response) (map[string]any, error) {
@@ -30,9 +30,9 @@ func toolResult(resp *server.Response) (map[string]any, error) {
 	return mergeResponseMeta(resp, result), nil
 }
 
-// promptResult builds the prompts/get result map from a response, mirroring
-// laravel/mcp's GetPrompt serializable: a "description" and a "messages" array,
-// each message carrying a role and a single content shape. A response with
+// promptResult builds the prompts/get result map from a response: a
+// "description" and a "messages" array, each message carrying a role and a
+// single content shape. A response with
 // multiple content items yields multiple messages sharing the response role.
 func promptResult(description string, resp *server.Response) (map[string]any, error) {
 	messages := make([]any, 0)
@@ -56,9 +56,9 @@ func promptResult(description string, resp *server.Response) (map[string]any, er
 	return mergeResponseMeta(resp, result), nil
 }
 
-// resourceResult builds the resources/read result map from a response,
-// mirroring laravel/mcp's ReadResource serializable: a "contents" array of
-// per-item resource shapes carrying the resource uri and mimeType.
+// resourceResult builds the resources/read result map from a response: a
+// "contents" array of per-item resource shapes carrying the resource uri and
+// mimeType.
 func resourceResult(uri, mimeType string, resp *server.Response) (map[string]any, error) {
 	contents := make([]any, 0)
 	if resp != nil {
@@ -78,8 +78,7 @@ func resourceResult(uri, mimeType string, resp *server.Response) (map[string]any
 }
 
 // mergeResponseMeta folds a response's _meta and structured content into the
-// result map. It mirrors laravel/mcp's ResponseFactory mergeMeta /
-// mergeStructuredContent: keys are added only when present and never overwrite
+// result map: keys are added only when present and never overwrite
 // an existing key.
 func mergeResponseMeta(resp *server.Response, result map[string]any) map[string]any {
 	if resp == nil {

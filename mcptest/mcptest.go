@@ -17,8 +17,7 @@ import (
 const defaultProtocolVersion = "2025-06-18"
 
 // Server drives a *server.Server through the in-memory Fake transport with
-// fluent, t-aware assertions. It mirrors laravel/mcp's
-// Server\Testing\PendingTestResponse: each driver method (Initialize, CallTool,
+// fluent, t-aware assertions. Each driver method (Initialize, CallTool,
 // ListTools, ReadResource, GetPrompt, ...) sends one JSON-RPC message through
 // the server and returns a *Response carrying the reply for chained assertions.
 //
@@ -35,8 +34,7 @@ type Server struct {
 
 // NewServer builds a test harness around srv, wiring it to a fresh Fake
 // transport. t is used to fail the test (via t.Helper/t.Fatalf) when an
-// assertion does not hold, mirroring laravel/mcp's test-response helpers that
-// call PHPUnit assertions. The full MCP method set must be installed (blank
+// assertion does not hold. The full MCP method set must be installed (blank
 // import _ "github.com/velocitykode/velocity-mcp/server/methods") for list and
 // call methods to resolve; an un-imported method surfaces as a MethodNotFound
 // response that the assertions report.
@@ -101,8 +99,7 @@ func (s *Server) InitializeWith(protocolVersion, clientName, clientVersion strin
 }
 
 // CallTool invokes a tool (tools/call) with the given arguments and returns the
-// reply for assertions. A nil arguments map is sent as an empty object. It
-// mirrors laravel/mcp's PendingTestResponse::tool.
+// reply for assertions. A nil arguments map is sent as an empty object.
 func (s *Server) CallTool(name string, arguments map[string]any) *Response {
 	if arguments == nil {
 		arguments = map[string]any{}
@@ -132,14 +129,13 @@ func (s *Server) ListPrompts() *Response {
 }
 
 // ReadResource reads a resource by uri (resources/read) and returns the reply
-// for assertions. It mirrors laravel/mcp's PendingTestResponse::resource.
+// for assertions.
 func (s *Server) ReadResource(uri string) *Response {
 	return s.call("resources/read", map[string]any{"uri": uri})
 }
 
 // GetPrompt renders a prompt (prompts/get) with the given arguments and returns
-// the reply for assertions. A nil arguments map is sent as an empty object. It
-// mirrors laravel/mcp's PendingTestResponse::prompt.
+// the reply for assertions. A nil arguments map is sent as an empty object.
 func (s *Server) GetPrompt(name string, arguments map[string]any) *Response {
 	if arguments == nil {
 		arguments = map[string]any{}

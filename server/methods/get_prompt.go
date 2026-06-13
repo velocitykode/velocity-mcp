@@ -8,12 +8,11 @@ import (
 )
 
 // GetPrompt handles "prompts/get": it resolves the named prompt, runs it against
-// the request arguments, and serializes the messages. It mirrors laravel/mcp's
-// Server\Methods\GetPrompt.
+// the request arguments, and serializes the messages.
 //
 // A missing "name" or an unknown prompt is an InvalidParams (-32602) protocol
 // error. A validation failure becomes an error result text prefixed with
-// "Invalid params: " (matching laravel), surfaced as a single user message.
+// "Invalid params: ", surfaced as a single user message.
 type GetPrompt struct{}
 
 var _ server.Method = GetPrompt{}

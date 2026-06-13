@@ -4,9 +4,9 @@ import "encoding/json"
 
 // Notification is a JSON-RPC notification emitted as content. Unlike the other
 // content types its wire shape is {"method":...,"params":{...}} and its _meta
-// metadata is folded into params under "_meta" (not at the top level), mirroring
-// laravel/mcp Server\Content\Notification. It is valid in every context and the
-// three context conversions all return the same shape.
+// metadata is folded into params under "_meta" (not at the top level). It is
+// valid in every context and the three context conversions all return the same
+// shape.
 type Notification struct {
 	meta
 	method string

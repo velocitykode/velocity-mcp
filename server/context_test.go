@@ -28,8 +28,8 @@ func TestContextPerPage(t *testing.T) {
 		{"absent falls back to default", nil, defaultPageSize},
 		{"honors positive requested", intp(10), 10},
 		{"caps at max", intp(1000), defaultMaxPageSize},
-		// An explicit per_page of 0 yields an empty page (min(0, max) = 0),
-		// mirroring laravel: the default only fires on an absent (nil) value.
+		// An explicit per_page of 0 yields an empty page (min(0, max) = 0):
+		// the default only fires on an absent (nil) value.
 		{"explicit zero stays zero", intp(0), 0},
 		// A negative explicit value is likewise passed through (not defaulted).
 		{"explicit negative stays negative", intp(-5), -5},

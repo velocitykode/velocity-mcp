@@ -6,14 +6,13 @@ import (
 )
 
 // DefaultImageMimeType is the mimeType used when an Image is constructed
-// without one. Mirrors laravel/mcp's image/png default.
+// without one.
 const DefaultImageMimeType = "image/png"
 
 // Image is binary image content. The constructor takes the raw (unencoded)
 // image bytes; the wire shape base64-encodes them under "data".
 // Wire shape: {"type":"image","data":"<base64>","mimeType":"..."}.
 // In a resource context the encoded bytes are carried under "blob".
-// Mirrors laravel/mcp Server\Content\Image.
 type Image struct {
 	meta
 	data     []byte
@@ -56,8 +55,7 @@ func (i *Image) ToTool() (map[string]any, error) { return i.toArray(), nil }
 func (i *Image) ToPrompt() (map[string]any, error) { return i.toArray(), nil }
 
 // ToResource returns the resources/read contents shape. The image's own
-// mimeType is used; the resource's mimeType argument is ignored to match
-// laravel/mcp behavior.
+// mimeType is used; the resource's mimeType argument is ignored.
 func (i *Image) ToResource(uri, mimeType string) (map[string]any, error) {
 	return i.merge(map[string]any{
 		"blob":     i.encoded(),

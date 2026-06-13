@@ -6,15 +6,13 @@ import (
 )
 
 // CompletionComplete handles "completion/complete": argument autocompletion for
-// a prompt or resource reference. It mirrors laravel/mcp's
-// Server\Methods\CompletionComplete.
+// a prompt or resource reference.
 //
 // Completion providers (the Completable primitives) are out of scope for this
 // phase, so a resolvable but non-completable primitive returns an empty
-// completion, exactly as laravel does for non-completable primitives. The
-// capability gate, parameter validation, and reference resolution still mirror
-// laravel precisely: completions must be advertised (else MethodNotFound), and
-// a missing ref or argument is InvalidParams.
+// completion. The capability gate, parameter validation, and reference
+// resolution still apply: completions must be advertised (else MethodNotFound),
+// and a missing ref or argument is InvalidParams.
 type CompletionComplete struct{}
 
 var _ server.Method = CompletionComplete{}
@@ -36,13 +34,12 @@ func (CompletionComplete) Handle(c *server.Context, req *jsonrpc.Request) (*json
 		return jsonrpc.NewErrorResponse(req.ID, err), nil
 	}
 
-	// laravel/mcp resolves the primitive, then returns CompletionResponse::empty()
-	// for any primitive that is not Completable BEFORE inspecting argument.name.
-	// No primitive in this phase implements Completable, so every resolvable
+	// The primitive is resolved, then an empty completion is returned for any
+	// primitive that is not Completable BEFORE inspecting argument.name. No
+	// primitive in this phase implements Completable, so every resolvable
 	// reference is non-completable and yields the empty completion shape here,
-	// even when argument.name is absent. Matching that ordering avoids a spurious
-	// "Missing argument name." InvalidParams that laravel never raises for a
-	// non-completable reference.
+	// even when argument.name is absent. This ordering avoids a spurious
+	// "Missing argument name." InvalidParams for a non-completable reference.
 	return jsonrpc.NewResult(req.ID, map[string]any{
 		"completion": emptyCompletion(),
 	})
@@ -50,8 +47,7 @@ func (CompletionComplete) Handle(c *server.Context, req *jsonrpc.Request) (*json
 
 // validateReference resolves a completion reference (ref/prompt or ref/resource)
 // to ensure it names a registered primitive, returning a *jsonrpc.Error when the
-// reference type is unknown or the primitive cannot be found, mirroring
-// laravel/mcp's resolvePrimitive.
+// reference type is unknown or the primitive cannot be found.
 func validateReference(c *server.Context, ref map[string]any) *jsonrpc.Error {
 	switch ref["type"] {
 	case "ref/prompt":
@@ -77,8 +73,7 @@ func validateReference(c *server.Context, ref map[string]any) *jsonrpc.Error {
 	}
 }
 
-// emptyCompletion returns the empty completion result shape, mirroring
-// laravel/mcp's CompletionResponse::empty()->toArray().
+// emptyCompletion returns the empty completion result shape.
 func emptyCompletion() map[string]any {
 	return map[string]any{
 		"values":  []string{},

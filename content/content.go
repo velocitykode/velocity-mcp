@@ -8,8 +8,7 @@ import (
 // ErrNotAllowed is returned by a context conversion (ToTool, ToPrompt, or
 // ToResource) when the concrete content type may not be used in that context.
 // For example Blob content may not appear in tools or prompts, and ResourceLink
-// content may not appear in resources. Mirrors the InvalidArgumentException the
-// laravel/mcp content types throw in the same situations.
+// content may not appear in resources.
 var ErrNotAllowed = errors.New("content: type not allowed in this context")
 
 // Content is the common interface implemented by every MCP content type.
@@ -25,8 +24,7 @@ var ErrNotAllowed = errors.New("content: type not allowed in this context")
 //   - ToPrompt   - shape for a prompts/get message content item.
 //   - ToResource - shape for a resources/read contents item (carries uri/mimeType).
 //
-// A conversion returns ErrNotAllowed when the type is invalid in that context
-// (mirrors laravel/mcp throwing InvalidArgumentException).
+// A conversion returns ErrNotAllowed when the type is invalid in that context.
 type Content interface {
 	json.Marshaler
 
@@ -65,9 +63,8 @@ var (
 	_ Content = (*Notification)(nil)
 )
 
-// meta is the embedded metadata helper shared by all content types. It mirrors
-// the laravel/mcp HasMeta concern: an optional _meta map merged into the wire
-// shape under the "_meta" key when non-empty.
+// meta is the embedded metadata helper shared by all content types: an optional
+// _meta map merged into the wire shape under the "_meta" key when non-empty.
 type meta struct {
 	data map[string]any
 }

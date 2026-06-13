@@ -2,8 +2,7 @@ package schema
 
 import "encoding/json"
 
-// IconTheme is the optional theme hint for an icon, mirroring laravel/mcp's
-// IconTheme enum.
+// IconTheme is the optional theme hint for an icon.
 type IconTheme string
 
 const (
@@ -24,8 +23,8 @@ func (t IconTheme) Valid() bool {
 }
 
 // Icon is protocol metadata describing an icon associated with an
-// implementation or primitive, mirroring laravel/mcp's Schema\Icon. It marshals
-// to its MCP wire shape, omitting any unset optional field:
+// implementation or primitive. It marshals to its MCP wire shape, omitting any
+// unset optional field:
 //
 //	{"src":"...","mimeType":"...","sizes":["48x48"],"theme":"dark"}
 type Icon struct {
@@ -63,8 +62,7 @@ func (i Icon) WithTheme(theme IconTheme) Icon {
 	return i
 }
 
-// ToMap renders the icon as a map, omitting unset optional fields, mirroring
-// laravel's Arr::whereNotNull behavior.
+// ToMap renders the icon as a map, omitting unset optional fields.
 func (i Icon) ToMap() map[string]any {
 	m := map[string]any{
 		"src": i.Src,
@@ -87,8 +85,8 @@ func (i Icon) MarshalJSON() ([]byte, error) {
 }
 
 // Implementation is protocol metadata describing an MCP implementation
-// (server or client), mirroring laravel/mcp's Schema\Implementation. It
-// marshals to its MCP wire shape, omitting any unset optional field:
+// (server or client). It marshals to its MCP wire shape, omitting any unset
+// optional field:
 //
 //	{"name":"demo","version":"1.0.0","title":"...","icons":[...]}
 type Implementation struct {
@@ -137,8 +135,7 @@ func (im Implementation) WithWebsiteURL(url string) Implementation {
 	return im
 }
 
-// ToMap renders the implementation as a map, omitting unset optional fields,
-// mirroring laravel's Arr::whereNotNull behavior.
+// ToMap renders the implementation as a map, omitting unset optional fields.
 func (im Implementation) ToMap() map[string]any {
 	m := map[string]any{
 		"name":    im.Name,

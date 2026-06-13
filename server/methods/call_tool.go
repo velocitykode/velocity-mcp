@@ -8,10 +8,9 @@ import (
 )
 
 // CallTool handles "tools/call": it resolves the named tool, runs it against the
-// request arguments, and serializes the result. It mirrors laravel/mcp's
-// Server\Methods\CallTool.
+// request arguments, and serializes the result.
 //
-// Error handling mirrors laravel: a missing "name" or an unknown tool is an
+// Error handling: a missing "name" or an unknown tool is an
 // InvalidParams (-32602) protocol error; a validation failure from the tool
 // handler becomes a tool-level error result (isError:true) rather than a
 // protocol error, so the client sees the message without the call failing. Any
@@ -42,8 +41,7 @@ func (CallTool) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Respon
 	resp, err := tool.Handle(c.RequestContext(), request)
 	if err != nil {
 		// A validation failure is a client-facing error result, not a protocol
-		// error, mirroring laravel which catches ValidationException and turns
-		// it into Response::error.
+		// error, surfaced to the client as a tool-level error response.
 		if errors.Is(err, server.ErrValidation) {
 			resp = server.Error(validationMessage(err))
 		} else {

@@ -163,8 +163,8 @@ func TestCallToolUnknownIsInvalidParams(t *testing.T) {
 	s := server.New("calc", "1.0.0", server.WithTools(addTool()))
 	res := handle(t, s, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"missing","arguments":{}}}`)
 	if res.Response.Error != nil {
-		// laravel returns this as a protocol error response; our handler maps
-		// it onto an error response too. Either way the code is InvalidParams.
+		// The handler maps this onto an error response. Either way the code is
+		// InvalidParams.
 		if res.Response.Error.Code != jsonrpc.CodeInvalidParams {
 			t.Fatalf("error code = %d", res.Response.Error.Code)
 		}
@@ -243,7 +243,7 @@ func TestToolReceivesRequestContext(t *testing.T) {
 }
 
 // TestNullIDRoutedAsNotification asserts a present-but-null id is routed as a
-// notification (no reply), matching laravel/mcp's isset()-based routing.
+// notification (no reply).
 func TestNullIDRoutedAsNotification(t *testing.T) {
 	s := server.New("demo", "1.0.0")
 	res := s.Handle(context.Background(), []byte(`{"jsonrpc":"2.0","id":null,"method":"ping"}`), "sess-1")

@@ -6,14 +6,13 @@ import (
 )
 
 // DefaultAudioMimeType is the mimeType used when an Audio is constructed
-// without one. Mirrors laravel/mcp's audio/wav default.
+// without one.
 const DefaultAudioMimeType = "audio/wav"
 
 // Audio is binary audio content. The constructor takes the raw (unencoded)
 // audio bytes; the wire shape base64-encodes them under "data".
 // Wire shape: {"type":"audio","data":"<base64>","mimeType":"..."}.
 // In a resource context the encoded bytes are carried under "blob".
-// Mirrors laravel/mcp Server\Content\Audio.
 type Audio struct {
 	meta
 	data     []byte
@@ -56,8 +55,7 @@ func (a *Audio) ToTool() (map[string]any, error) { return a.toArray(), nil }
 func (a *Audio) ToPrompt() (map[string]any, error) { return a.toArray(), nil }
 
 // ToResource returns the resources/read contents shape. The audio's own
-// mimeType is used; the resource's mimeType argument is ignored to match
-// laravel/mcp behavior.
+// mimeType is used; the resource's mimeType argument is ignored.
 func (a *Audio) ToResource(uri, mimeType string) (map[string]any, error) {
 	return a.merge(map[string]any{
 		"blob":     a.encoded(),

@@ -43,7 +43,7 @@ func WithTools(tools ...Tool) Option {
 
 // WithResources registers the given resources, routing URI-template resources
 // to the templates set (reported under resources/templates/list) and the rest
-// to the plain resources set, mirroring laravel/mcp's ServerContext split.
+// to the plain resources set.
 func WithResources(resources ...Resource) Option {
 	return func(s *Server) {
 		for _, r := range resources {
@@ -93,9 +93,8 @@ func WithMaxPageSize(size int) Option {
 
 // WithCapability adds or overrides an advertised capability. A key containing a
 // dot ("feature.enabled") sets a nested boolean capability; a plain key
-// registers an empty-object capability, mirroring laravel/mcp's
-// Server::addCapability. Use this to opt into capabilities not enabled by
-// default, such as completions.
+// registers an empty-object capability. Use this to opt into capabilities not
+// enabled by default, such as completions.
 func WithCapability(key string, value ...bool) Option {
 	v := true
 	if len(value) > 0 {
@@ -114,7 +113,7 @@ func WithCapability(key string, value ...bool) Option {
 			s.capabilities[root] = existing
 			return
 		}
-		// A bare key registers an empty-object capability, mirroring laravel's
+		// A bare key registers an empty-object capability, the
 		// representation of an enabled-but-empty capability.
 		s.capabilities[key] = map[string]any{}
 	}

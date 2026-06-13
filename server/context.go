@@ -7,7 +7,7 @@ import (
 	"github.com/velocitykode/velocity-mcp/schema"
 )
 
-// Context is the per-request server context (laravel/mcp's ServerContext). It
+// Context is the per-request server context. It
 // exposes the server's negotiated protocol version, advertised capabilities,
 // implementation metadata, instructions, registered primitives, pagination
 // bounds, and a mutex-protected per-session state store the method handlers and
@@ -107,8 +107,7 @@ func (c *Context) SupportedProtocolVersions() []ProtocolVersion {
 // Capabilities returns a copy of the advertised server capabilities map.
 func (c *Context) Capabilities() map[string]any { return cloneCapabilities(c.capabilities) }
 
-// HasCapability reports whether the named capability is advertised, mirroring
-// laravel/mcp's ServerContext::hasCapability.
+// HasCapability reports whether the named capability is advertised.
 func (c *Context) HasCapability(name string) bool {
 	_, ok := c.capabilities[name]
 	return ok
@@ -128,11 +127,10 @@ func (c *Context) Prompts() []Prompt { return c.prompts }
 
 // PerPage resolves the page size for a list request: the smaller of the
 // requested size and the server max, falling back to the default only when no
-// size is requested (requested is nil). It mirrors laravel/mcp's
-// ServerContext::perPage, which computes min($requestedPerPage ?? $default,
-// $max): the ?? default fires only on a null (absent) value, so an explicit
-// per_page of 0 (or negative) yields min(0, max) = 0 (an empty page), NOT the
-// default. Passing a nil pointer means the client omitted per_page.
+// size is requested (requested is nil). The default fires only on a null
+// (absent) value, so an explicit per_page of 0 (or negative) yields
+// min(0, max) = 0 (an empty page), NOT the default. Passing a nil pointer
+// means the client omitted per_page.
 func (c *Context) PerPage(requested *int) int {
 	size := c.defaultPageSize
 	if requested != nil {

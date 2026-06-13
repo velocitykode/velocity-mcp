@@ -12,15 +12,14 @@ type initializeMethod struct{}
 
 // Handle negotiates the protocol version and returns the initialize result. An
 // unsupported requested version yields an InvalidParams error carrying the
-// supported and requested versions, mirroring laravel/mcp's Initialize.
+// supported and requested versions.
 func (initializeMethod) Handle(c *Context, req *jsonrpc.Request) (*jsonrpc.Response, error) {
 	return Initialize(c, req)
 }
 
 // Initialize is the shared initialize negotiation used by both the fallback and
-// the methods package, so the two never drift. It mirrors laravel/mcp's
-// Server\Methods\Initialize exactly: an explicit unsupported version is an
-// InvalidParams (-32602) error with {supported, requested} data; otherwise the
+// the methods package, so the two never drift. An explicit unsupported version
+// is an InvalidParams (-32602) error with {supported, requested} data; otherwise the
 // negotiated version is the requested one (when supported) or the server's
 // first supported version.
 func Initialize(c *Context, req *jsonrpc.Request) (*jsonrpc.Response, error) {

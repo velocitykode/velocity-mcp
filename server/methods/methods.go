@@ -11,17 +11,15 @@
 // Dispatch ownership: the server package owns message routing (server.Handle
 // maps method name to handler and special-cases initialize and tools/call so it
 // can emit MCP events). This package owns the per-method request/response
-// translation, mirroring laravel/mcp's split between Server.php (routing,
-// events) and Server\Methods\* (handlers).
+// translation.
 package methods
 
 import (
 	"github.com/velocitykode/velocity-mcp/server"
 )
 
-// init installs the default method set on every server. It mirrors the
-// laravel/mcp Server::$methods map (plus initialize and ping, which the server
-// also serves directly).
+// init installs the default method set on every server (plus initialize and
+// ping, which the server also serves directly).
 func init() {
 	server.SetMethodFactory(defaultMethods)
 }

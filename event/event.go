@@ -26,7 +26,7 @@ type ClientInfo struct {
 }
 
 // SessionInitialized is dispatched once an MCP session has completed the
-// initialize handshake. It mirrors laravel/mcp's SessionInitialized event.
+// initialize handshake.
 //
 // ClientInfo and ClientCapabilities are nil when the client did not supply
 // them. Use the ClientName, ClientTitle and ClientVersion helpers to read

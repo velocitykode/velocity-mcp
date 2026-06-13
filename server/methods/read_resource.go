@@ -9,11 +9,11 @@ import (
 
 // ReadResource handles "resources/read": it resolves the resource for the
 // requested uri (matching templates where needed), reads it, and serializes the
-// contents. It mirrors laravel/mcp's Server\Methods\ReadResource.
+// contents.
 //
 // A missing or unresolvable uri is a ResourceNotFound (-32002) protocol error.
 // A validation failure becomes an error result text prefixed with "Invalid
-// params: " (matching laravel).
+// params: ".
 type ReadResource struct{}
 
 var _ server.Method = ReadResource{}
@@ -60,7 +60,7 @@ func (ReadResource) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Re
 // resolveResource finds the resource matching uri: first an exact match on a
 // registered non-template resource, then a template match. It returns the
 // resolved resource and any variables extracted from a template match (nil for
-// a plain resource), mirroring laravel/mcp's ResolvesResources::resolveResource.
+// a plain resource).
 func resolveResource(c *server.Context, uri string) (server.Resource, map[string]string) {
 	for _, r := range c.Resources() {
 		if r.URI() == uri {

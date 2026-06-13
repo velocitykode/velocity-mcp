@@ -43,7 +43,7 @@ func containsAny(in []string, sub string) bool {
 }
 
 // dedupeNonEmpty returns the non-empty elements of in, de-duplicated, preserving
-// first-seen order. It mirrors laravel/mcp's collect(...)->filter()->unique().
+// first-seen order.
 func dedupeNonEmpty(in []string) []string {
 	seen := make(map[string]struct{}, len(in))
 	out := make([]string, 0, len(in))

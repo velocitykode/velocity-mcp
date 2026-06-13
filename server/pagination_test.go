@@ -65,7 +65,7 @@ func TestCursorPaginator_EdgeCase_MalformedCursor(t *testing.T) {
 	items := []string{"a", "b", "c"}
 
 	// A non-base64 cursor, a non-JSON cursor, and a negative offset all fall
-	// back to offset 0 (first page), mirroring laravel's defensive decode.
+	// back to offset 0 (first page) via the defensive decode.
 	bad := []string{
 		"!!!not-base64!!!",
 		base64.StdEncoding.EncodeToString([]byte("not json")),

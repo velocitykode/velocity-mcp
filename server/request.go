@@ -11,18 +11,18 @@ import (
 // ErrValidation is returned by Request.Validate when one or more arguments fail
 // their rules. The concrete *validation.ValidationErrors (carrying per-field
 // messages) is wrapped; recover it with errors.As. Methods turn this into a
-// tool-level error result rather than a transport error, mirroring laravel/mcp.
+// tool-level error result rather than a transport error.
 var ErrValidation = errors.New("mcp: request validation failed")
 
-// Request carries the arguments of a tool, resource, or prompt invocation. It
-// mirrors laravel/mcp's Request: a typed view over the decoded "arguments"
-// object plus session metadata. The zero value is not usable; the server
-// constructs Requests from incoming JSON-RPC params.
+// Request carries the arguments of a tool, resource, or prompt invocation: a
+// typed view over the decoded "arguments" object plus session metadata. The
+// zero value is not usable; the server constructs Requests from incoming
+// JSON-RPC params.
 //
 // Typed getters come in two forms: the plain form (String, Int, Float, Bool)
 // returns the zero value when the key is missing or the wrong type, and the
 // ok-variant (StringOK, ...) additionally reports whether a usable value was
-// present. This mirrors Go's comma-ok idiom and laravel's nullable getters.
+// present. This mirrors Go's comma-ok idiom.
 type Request struct {
 	args      map[string]any
 	sessionID string
@@ -174,9 +174,9 @@ func (r *Request) Bool(key string) bool {
 }
 
 // Bind JSON round-trips the request arguments into dst, which must be a
-// non-nil pointer. It mirrors laravel/mcp's typed argument hydration. A decode
-// error is returned to the caller (the method handler surfaces it as an error
-// result, never leaking internals to clients).
+// non-nil pointer, hydrating typed arguments. A decode error is returned to the
+// caller (the method handler surfaces it as an error result, never leaking
+// internals to clients).
 func (r *Request) Bind(dst any) error {
 	b, err := json.Marshal(r.args)
 	if err != nil {

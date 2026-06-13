@@ -5,8 +5,7 @@ import (
 	"github.com/velocitykode/velocity-mcp/server"
 )
 
-// ListTools handles "tools/list": a cursor-paginated list of registered tools,
-// mirroring laravel/mcp's Server\Methods\ListTools.
+// ListTools handles "tools/list": a cursor-paginated list of registered tools.
 type ListTools struct{}
 
 var _ server.Method = ListTools{}
@@ -22,7 +21,7 @@ func (ListTools) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Respo
 }
 
 // ListResources handles "resources/list": a cursor-paginated list of registered
-// non-template resources, mirroring laravel/mcp's Server\Methods\ListResources.
+// non-template resources.
 type ListResources struct{}
 
 var _ server.Method = ListResources{}
@@ -38,8 +37,7 @@ func (ListResources) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.R
 }
 
 // ListResourceTemplates handles "resources/templates/list": a cursor-paginated
-// list of registered URI-template resources, mirroring laravel/mcp's
-// Server\Methods\ListResourceTemplates.
+// list of registered URI-template resources.
 type ListResourceTemplates struct{}
 
 var _ server.Method = ListResourceTemplates{}
@@ -56,7 +54,7 @@ func (ListResourceTemplates) Handle(c *server.Context, req *jsonrpc.Request) (*j
 }
 
 // ListPrompts handles "prompts/list": a cursor-paginated list of registered
-// prompts, mirroring laravel/mcp's Server\Methods\ListPrompts.
+// prompts.
 type ListPrompts struct{}
 
 var _ server.Method = ListPrompts{}
@@ -72,8 +70,7 @@ func (ListPrompts) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Res
 }
 
 // paginatedResult slices items into a page and builds the JSON-RPC result,
-// emitting the page under key and a "nextCursor" only when more pages remain,
-// mirroring laravel/mcp's CursorPaginator::paginate.
+// emitting the page under key and a "nextCursor" only when more pages remain.
 func paginatedResult(req *jsonrpc.Request, key string, items []map[string]any, perPage int, cursor string) (*jsonrpc.Response, error) {
 	page, next := server.NewCursorPaginator(items, perPage, cursor).Paginate()
 	result := map[string]any{key: page}

@@ -2,8 +2,8 @@ package server
 
 import "github.com/velocitykode/velocity-mcp/content"
 
-// Role identifies the author of a prompt message, mirroring laravel/mcp's Role
-// enum. Tool and resource results do not carry a role; prompt messages do.
+// Role identifies the author of a prompt message. Tool and resource results do
+// not carry a role; prompt messages do.
 type Role string
 
 const (
@@ -13,10 +13,10 @@ const (
 	RoleAssistant Role = "assistant"
 )
 
-// Response is the result of handling a tool, resource, or prompt invocation. It
-// mirrors the combination of laravel/mcp's Response and ResponseFactory: one or
-// more content items, an optional role (for prompt messages), an isError flag
-// (for tool-level error results), and optional structured content and metadata.
+// Response is the result of handling a tool, resource, or prompt invocation:
+// one or more content items, an optional role (for prompt messages), an isError
+// flag (for tool-level error results), and optional structured content and
+// metadata.
 //
 // Build responses with the package constructors (Text, NewResponse, Error) and
 // the fluent With* methods. A nil *Response is treated by the method handlers as
@@ -31,21 +31,20 @@ type Response struct {
 
 // NewResponse builds a Response carrying the given content items in order. At
 // least one item is expected; an empty call yields a response with no content
-// (a valid, if unusual, result). Mirrors laravel/mcp's Response::make.
+// (a valid, if unusual, result).
 func NewResponse(items ...content.Content) *Response {
 	return &Response{items: append([]content.Content(nil), items...), role: RoleUser}
 }
 
-// Text builds a Response with a single text content item, mirroring
-// laravel/mcp's Response::text.
+// Text builds a Response with a single text content item.
 func Text(text string) *Response {
 	return NewResponse(content.NewText(text))
 }
 
 // Error builds a tool-level error Response with a single text content item and
-// the isError flag set, mirroring laravel/mcp's Response::error. The message is
-// returned to the client as the error result text, so callers must pass a
-// client-safe message and never leak internal error detail.
+// the isError flag set. The message is returned to the client as the error
+// result text, so callers must pass a client-safe message and never leak
+// internal error detail.
 func Error(message string) *Response {
 	r := Text(message)
 	r.isError = true
@@ -53,14 +52,14 @@ func Error(message string) *Response {
 }
 
 // AsError marks the response as a tool-level error result and returns it for
-// chaining. Mirrors laravel/mcp's isError flag.
+// chaining.
 func (r *Response) AsError() *Response {
 	r.isError = true
 	return r
 }
 
 // AsAssistant sets the response role to assistant (for prompt messages) and
-// returns it for chaining. Mirrors laravel/mcp's Response::asAssistant.
+// returns it for chaining.
 func (r *Response) AsAssistant() *Response {
 	r.role = RoleAssistant
 	return r
@@ -78,7 +77,7 @@ func (r *Response) WithMeta(key string, value any) *Response {
 
 // WithStructuredContent attaches structured content to the response (surfaced
 // under "structuredContent" in a tools/call result) and returns the response
-// for chaining. Mirrors laravel/mcp's withStructuredContent.
+// for chaining.
 func (r *Response) WithStructuredContent(structured map[string]any) *Response {
 	r.structured = structured
 	return r
@@ -120,8 +119,7 @@ func (r *Response) StructuredContent() map[string]any {
 }
 
 // mergeMeta folds the response _meta and structured content into a result map
-// produced by a method serializer. It mirrors laravel/mcp's ResponseFactory
-// mergeMeta + mergeStructuredContent: keys are only added when present and do
+// produced by a method serializer: keys are only added when present and do
 // not overwrite an existing key.
 func (r *Response) mergeMeta(base map[string]any) map[string]any {
 	if r == nil {

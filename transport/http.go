@@ -16,10 +16,10 @@ import (
 // unbounded memory growth. Override per-handler with WithMaxBodyBytes.
 const DefaultMaxBodyBytes int64 = 4 << 20 // 4 MiB
 
-// sessionHeader is the HTTP header carrying the MCP session id, mirroring
-// laravel/mcp's HttpTransport (the "MCP-Session-Id" header). Header names are
-// case-insensitive per RFC 7230, so the canonical Go form is used on read and
-// write; clients sending "Mcp-Session-Id" are matched identically.
+// sessionHeader is the HTTP header carrying the MCP session id (the
+// "MCP-Session-Id" header). Header names are case-insensitive per RFC 7230, so
+// the canonical Go form is used on read and write; clients sending
+// "Mcp-Session-Id" are matched identically.
 const sessionHeader = "Mcp-Session-Id"
 
 // contentTypeJSON is the media type for a plain JSON-RPC reply body.
@@ -45,8 +45,7 @@ func WithMaxBodyBytes(n int64) HandlerOption {
 }
 
 // Handler returns a velocity router handler that serves the MCP server srv over
-// streamable HTTP, mirroring laravel/mcp's HttpTransport. Mount it on a POST
-// route:
+// streamable HTTP. Mount it on a POST route:
 //
 //	r.Post("/mcp", transport.Handler(srv))
 //
@@ -62,8 +61,8 @@ func WithMaxBodyBytes(n int64) HandlerOption {
 //     body, per the MCP spec
 //     (modelcontextprotocol.io/specification/.../transports#sending-messages-to-the-server).
 //
-// Session semantics mirror laravel: the inbound "Mcp-Session-Id" header (if any)
-// is supplied to srv.Handle as the existing session id; an initialize response
+// Session semantics: the inbound "Mcp-Session-Id" header (if any) is supplied
+// to srv.Handle as the existing session id; an initialize response
 // assigns a new session id which is echoed back in the "Mcp-Session-Id"
 // response header. The per-route handler holds no session map of its own (the
 // server owns session state), so there is no shared map to guard here; concrete
@@ -100,8 +99,8 @@ func Handler(srv MCPServer, opts ...HandlerOption) func(*router.Context) error {
 		res := srv.Handle(c.Request.Context(), raw, inboundSessionID(c))
 
 		// A notification (or any message that produces no reply) is acknowledged
-		// with 202 Accepted and an empty body, matching laravel's HttpTransport
-		// (the MCP spec mandates 202 for a message that yields no response).
+		// with 202 Accepted and an empty body (the MCP spec mandates 202 for a
+		// message that yields no response).
 		if !res.HasResponse || res.Response == nil {
 			return c.Status(http.StatusAccepted)
 		}
@@ -143,9 +142,8 @@ func readBody(c *router.Context, maxBytes int64) ([]byte, error) {
 	return raw, nil
 }
 
-// inboundSessionID reads the MCP session id from the request header, mirroring
-// laravel's (string) $request->header('MCP-Session-Id'). Header lookup is
-// case-insensitive, so a client sending any casing matches.
+// inboundSessionID reads the MCP session id from the request header. Header
+// lookup is case-insensitive, so a client sending any casing matches.
 func inboundSessionID(c *router.Context) string {
 	return strings.TrimSpace(c.Request.Header.Get(sessionHeader))
 }
@@ -155,11 +153,11 @@ func inboundSessionID(c *router.Context) string {
 // negotiate an event stream; absent text/event-stream we reply with plain JSON.
 //
 // A client that accepts application/json is served JSON even when it also lists
-// text/event-stream, so the lighter single-message representation wins (this
-// matches laravel's ReorderJsonAccept, which sorts application/json ahead of the
-// event stream before the transport inspects the header). Only when the client
-// asks for text/event-stream and does NOT also accept application/json (nor the
-// "*/*" wildcard) do we switch to the SSE framing.
+// text/event-stream, so the lighter single-message representation wins
+// (application/json is sorted ahead of the event stream before the header is
+// inspected). Only when the client asks for text/event-stream and does NOT also
+// accept application/json (nor the "*/*" wildcard) do we switch to the SSE
+// framing.
 func wantsEventStream(c *router.Context) bool {
 	accept := c.Request.Header.Get("Accept")
 	if accept == "" {
@@ -197,9 +195,9 @@ func writeJSON(c *router.Context, msg []byte) error {
 }
 
 // writeSSE writes a JSON-RPC reply as a single Server-Sent Events "data:" frame
-// with Content-Type text/event-stream and HTTP 200, mirroring laravel's
-// HttpTransport::sendStreamMessage ("data: <message>\n\n"). This is the
-// streamable-HTTP SSE response mode; the framework's PrepareStreamHeaders sets
+// with Content-Type text/event-stream and HTTP 200, as a single "data:
+// <message>\n\n" frame. This is the streamable-HTTP SSE response mode; the
+// framework's PrepareStreamHeaders sets
 // the standard streaming headers (and X-Accel-Buffering: no) so proxies do not
 // buffer the stream.
 func writeSSE(c *router.Context, msg []byte) error {

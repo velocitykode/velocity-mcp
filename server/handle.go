@@ -29,7 +29,7 @@ type HandleResult struct {
 }
 
 // Handle processes a single raw inbound JSON-RPC message and returns the result
-// to send back. It mirrors laravel/mcp's Server::handle: parse error and
+// to send back. It routes inbound messages by method: parse error and
 // invalid-request handling, notification short-circuit (no reply), the special
 // initialize path (which dispatches SessionInitialized and assigns a session
 // id), method lookup with MethodNotFound for unknown methods, and a generic
@@ -119,8 +119,7 @@ func (r HandleResult) withError(id jsonrpc.ID, err error) HandleResult {
 }
 
 // handleInitialize runs the initialize method, assigns a session id, and
-// dispatches the SessionInitialized event, mirroring laravel/mcp's
-// Server::handleInitializeMessage.
+// dispatches the SessionInitialized event.
 func (s *Server) handleInitialize(ctx context.Context, sc *Context, req *jsonrpc.Request) HandleResult {
 	method, ok := s.methods["initialize"]
 	if !ok {
@@ -148,8 +147,8 @@ func (s *Server) handleInitialize(ctx context.Context, sc *Context, req *jsonrpc
 }
 
 // handleToolCall runs a tools/call request and dispatches ToolCalled on a
-// completed call or ToolFailed when the handler errors, mirroring laravel/mcp's
-// tool events. Event dispatch lives here (rather than in the methods package)
+// completed call or ToolFailed when the handler errors. Event dispatch lives
+// here (rather than in the methods package)
 // because the Server owns the event dispatcher.
 func (s *Server) handleToolCall(ctx context.Context, sc *Context, req *jsonrpc.Request, method Method, sessionID string) HandleResult {
 	params := decodeParams(req.Params)

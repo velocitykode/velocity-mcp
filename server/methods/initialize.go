@@ -7,7 +7,7 @@ import (
 
 // InitializeMethod handles the "initialize" request: it negotiates the protocol
 // version and returns the server capabilities, implementation metadata, and
-// instructions. It mirrors laravel/mcp's Server\Methods\Initialize.
+// instructions.
 //
 // The negotiation itself lives in server.Initialize so the server package's
 // fallback handler and this handler never drift. The Server (server.Handle)
@@ -22,8 +22,7 @@ func (InitializeMethod) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrp
 	return server.Initialize(c, req)
 }
 
-// Ping handles the "ping" request with an empty success result, mirroring
-// laravel/mcp's Server\Methods\Ping.
+// Ping handles the "ping" request with an empty success result.
 type Ping struct{}
 
 // Compile-time assertion that the handler satisfies server.Method.

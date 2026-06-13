@@ -141,7 +141,7 @@ func TestParseRequest(t *testing.T) {
 
 func TestParseRequest_EdgeCase_IDEchoedOnVersionError(t *testing.T) {
 	// A valid id with a bad version should still echo the id so the caller can
-	// correlate the error response, mirroring laravel.
+	// correlate the error response.
 	_, id, jerr := ParseRequest([]byte(`{"jsonrpc":"x","id":"abc","method":"ping"}`))
 	if jerr == nil || jerr.Code != CodeInvalidRequest {
 		t.Fatalf("expected invalid request, got %v", jerr)
@@ -369,9 +369,9 @@ func TestIsNotificationBytes(t *testing.T) {
 		{"notification", `{"jsonrpc":"2.0","method":"x"}`, true, false},
 		{"request with int id", `{"jsonrpc":"2.0","id":1,"method":"x"}`, false, false},
 		{"request with string id", `{"jsonrpc":"2.0","id":"abc","method":"x"}`, false, false},
-		// A present-but-null id is routed as a notification (no reply), mirroring
-		// laravel/mcp's isset()-based routing in Server::handle: isset() is false
-		// for a present-but-null key, so {"id":null,...} becomes a notification.
+		// A present-but-null id is routed as a notification (no reply): a
+		// present-but-null id is treated as absent, so {"id":null,...} becomes
+		// a notification.
 		{"present-but-null id is a notification", `{"jsonrpc":"2.0","id":null,"method":"x"}`, true, false},
 		{"malformed", `{oops`, false, true},
 	}

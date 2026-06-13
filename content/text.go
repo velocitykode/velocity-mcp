@@ -4,7 +4,7 @@ import "encoding/json"
 
 // Text is plain text content. Wire shape: {"type":"text","text":"..."}.
 // In a resource context it carries the owning resource's uri and mimeType
-// instead of a "type" discriminator. Mirrors laravel/mcp Server\Content\Text.
+// instead of a "type" discriminator.
 type Text struct {
 	meta
 	text string

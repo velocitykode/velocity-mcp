@@ -8,9 +8,8 @@ import (
 )
 
 // Response is the decoded reply to one driven JSON-RPC message plus fluent,
-// t-aware assertions. It mirrors laravel/mcp's Server\Testing\TestResponse: each
-// Assert* method fails the test (via t.Fatalf) when the expectation does not
-// hold and returns the Response so assertions chain.
+// t-aware assertions. Each Assert* method fails the test (via t.Fatalf) when the
+// expectation does not hold and returns the Response so assertions chain.
 //
 // The assertions read the JSON-RPC result generically, so a single Response type
 // serves tool, resource, prompt, and list replies. Methods are named for the
@@ -55,7 +54,7 @@ func (r *Response) fatalf(format string, args ...any) {
 }
 
 // AssertOk asserts the reply carries no error: neither a protocol-level error
-// object nor a tool-level isError result. Mirrors laravel/mcp's assertOk.
+// object nor a tool-level isError result.
 func (r *Response) AssertOk() *Response {
 	if r.t != nil {
 		r.t.Helper()
@@ -68,8 +67,7 @@ func (r *Response) AssertOk() *Response {
 
 // AssertError asserts the reply carries at least one error (a protocol-level
 // error object or a tool-level isError result). When messages are supplied, each
-// must appear as a substring of some error message. Mirrors laravel/mcp's
-// assertHasErrors.
+// must appear as a substring of some error message.
 func (r *Response) AssertError(messages ...string) *Response {
 	if r.t != nil {
 		r.t.Helper()
@@ -105,8 +103,8 @@ func (r *Response) AssertErrorCode(code int) *Response {
 
 // AssertText asserts the given text appears as a substring of some content
 // message in the reply (tool content, prompt message content, or resource
-// contents), mirroring laravel/mcp's assertSee. Multiple arguments must all be
-// present (each may match a different message).
+// contents). Multiple arguments must all be present (each may match a different
+// message).
 func (r *Response) AssertText(texts ...string) *Response {
 	if r.t != nil {
 		r.t.Helper()
@@ -121,7 +119,7 @@ func (r *Response) AssertText(texts ...string) *Response {
 }
 
 // AssertDontSeeText asserts the given text does NOT appear in any content
-// message in the reply, mirroring laravel/mcp's assertDontSee.
+// message in the reply.
 func (r *Response) AssertDontSeeText(texts ...string) *Response {
 	if r.t != nil {
 		r.t.Helper()
@@ -263,7 +261,7 @@ func (r *Response) AssertPromptListed(name string) *Response {
 
 // errors returns the human-readable error messages for the reply: a
 // protocol-level error message, or (when the tool result carries isError:true)
-// the tool content messages, mirroring laravel/mcp's TestResponse::errors.
+// the tool content messages.
 func (r *Response) errors() []string {
 	if r.resp != nil && r.resp.Error != nil {
 		return []string{r.resp.Error.Message}
@@ -277,8 +275,7 @@ func (r *Response) errors() []string {
 }
 
 // seeable returns every content message in the reply (content, prompt messages,
-// resource contents) plus any error messages, mirroring laravel/mcp's
-// TestResponse::assertSee source set.
+// resource contents) plus any error messages.
 func (r *Response) seeable() []string {
 	out := r.contentMessages()
 	out = append(out, r.errors()...)
@@ -287,7 +284,7 @@ func (r *Response) seeable() []string {
 
 // contentMessages extracts the text/data/blob string of every content item in
 // the reply, across the three result shapes (tool content, prompt messages,
-// resource contents). It mirrors laravel/mcp's TestResponse::content.
+// resource contents).
 func (r *Response) contentMessages() []string {
 	if r.result == nil {
 		return nil

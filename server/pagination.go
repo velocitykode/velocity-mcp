@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 )
 
-// CursorPaginator slices an ordered item set into cursor-delimited pages,
-// mirroring laravel/mcp's Server\Pagination\CursorPaginator. The cursor is an
+// CursorPaginator slices an ordered item set into cursor-delimited pages
+// following the MCP cursor-pagination convention. The cursor is an
 // opaque base64-encoded JSON object carrying the next page's start offset; an
 // unreadable or malformed cursor is treated as the start of the list (offset 0),
-// matching laravel's defensive decode.
+// a defensive decode.
 type CursorPaginator[T any] struct {
 	items   []T
 	perPage int
@@ -27,7 +27,7 @@ func NewCursorPaginator[T any](items []T, perPage int, cursor string) *CursorPag
 // Paginate returns the page slice and the next cursor. nextCursor is empty when
 // there are no further pages. The page is always a non-nil slice (possibly
 // empty) so JSON encoders emit "[]" rather than "null", matching the MCP wire
-// shape laravel produces.
+// shape.
 func (p *CursorPaginator[T]) Paginate() (page []T, nextCursor string) {
 	start := p.startOffset()
 	page = []T{}
@@ -52,7 +52,7 @@ func (p *CursorPaginator[T]) Paginate() (page []T, nextCursor string) {
 }
 
 // startOffset decodes the incoming cursor to a start offset, defaulting to 0 on
-// any decode failure, mirroring laravel's getStartOffsetFromCursor.
+// any decode failure.
 func (p *CursorPaginator[T]) startOffset() int {
 	if p.cursor == "" {
 		return 0
@@ -73,8 +73,8 @@ func (p *CursorPaginator[T]) startOffset() int {
 	return data.Offset
 }
 
-// encodeCursor encodes an offset into an opaque cursor, mirroring laravel's
-// createCursor (base64 of {"offset":N}).
+// encodeCursor encodes an offset into an opaque cursor
+// (base64 of {"offset":N}).
 func encodeCursor(offset int) string {
 	b, err := json.Marshal(struct {
 		Offset int `json:"offset"`

@@ -31,8 +31,8 @@ const (
 )
 
 // MCP-specific error codes. These live in the implementation-defined server
-// range (-32000 to -32099) reserved by the JSON-RPC spec and are mirrored from
-// laravel/mcp's usage and the MCP specification.
+// range (-32000 to -32099) reserved by the JSON-RPC spec and are defined by the
+// MCP specification.
 const (
 	// CodeResourceNotFound indicates the requested resource (URI) could not be
 	// resolved. Used by resources/read.
@@ -192,8 +192,8 @@ type Response struct {
 }
 
 // NewResult builds a success Response correlating to id and carrying result.
-// A nil result is encoded as an empty JSON object, mirroring laravel/mcp which
-// represents an empty result as {} rather than null.
+// A nil result is encoded as an empty JSON object: an empty result is
+// represented as {} rather than null.
 func NewResult(id ID, result any) (*Response, error) {
 	raw, err := marshalResult(result)
 	if err != nil {

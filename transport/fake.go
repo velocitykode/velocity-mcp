@@ -5,8 +5,8 @@ import (
 	"sync"
 )
 
-// Fake is an in-memory transport for tests, mirroring laravel/mcp's
-// FakeTransporter. It records every message sent through Send, and lets a test
+// Fake is an in-memory transport for tests. It records every message sent
+// through Send, and lets a test
 // inject inbound messages (driving them through the wired MCP server) without
 // any real I/O. mcptest builds its fluent assertions on top of Fake, so its
 // recording surface is exported.

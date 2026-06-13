@@ -1,8 +1,7 @@
 package content
 
-// Icon is an icon reference attached to a ResourceLink. It mirrors the
-// laravel/mcp Schema\Icon wire shape. Only non-empty fields appear in the
-// marshaled output.
+// Icon is an icon reference attached to a ResourceLink. Only non-empty fields
+// appear in the marshaled output.
 //
 // Icon is declared here (rather than imported from the schema package) so that
 // content remains a stdlib-only leaf with no sibling-package dependency. The

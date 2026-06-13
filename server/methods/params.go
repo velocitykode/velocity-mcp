@@ -7,8 +7,7 @@ import (
 )
 
 // params is a decoded view over a JSON-RPC request's params object. It provides
-// the small set of typed accessors the method handlers need (string, int, map),
-// mirroring laravel/mcp's JsonRpcRequest::get / Request accessors.
+// the small set of typed accessors the method handlers need (string, int, map).
 type params map[string]any
 
 // decode decodes a request's params into a params map. Absent or non-object
@@ -57,7 +56,7 @@ func (p params) intValue(key string) int {
 // intPtr returns a pointer to the integer value for key, or nil when the key is
 // absent or non-numeric. It lets a caller distinguish an omitted parameter from
 // an explicit 0 (JSON numbers decode to float64), which the page-size resolution
-// needs to mirror laravel/mcp's null-coalescing default (an absent per_page
+// needs to honor its null-coalescing default (an absent per_page
 // falls back to the default; an explicit per_page of 0 does not).
 func (p params) intPtr(key string) *int {
 	v, ok := p[key]

@@ -7,12 +7,11 @@ import (
 
 // Blob is embedded binary resource content. It may only be used in a resource
 // (resources/read) context; using it as a tool or prompt result returns
-// ErrNotAllowed, mirroring laravel/mcp which throws there.
+// ErrNotAllowed.
 //
 // The default wire shape (toArray) is {"type":"blob","blob":"<raw content>"}
-// and carries the content verbatim (no base64), matching laravel/mcp. The
-// resource shape base64-encodes the content under "blob" alongside uri and
-// mimeType. Mirrors laravel/mcp Server\Content\Blob.
+// and carries the content verbatim (no base64). The resource shape
+// base64-encodes the content under "blob" alongside uri and mimeType.
 type Blob struct {
 	meta
 	content []byte
@@ -26,8 +25,8 @@ func NewBlob(content []byte) *Blob {
 // String returns the raw blob bytes as a string.
 func (b *Blob) String() string { return string(b.content) }
 
-// toArray returns the default blob wire shape. Per laravel/mcp the content is
-// carried verbatim here (not base64-encoded).
+// toArray returns the default blob wire shape. The content is carried verbatim
+// here (not base64-encoded).
 func (b *Blob) toArray() map[string]any {
 	return b.merge(map[string]any{
 		"type": "blob",

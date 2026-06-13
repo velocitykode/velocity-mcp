@@ -9,10 +9,9 @@ import (
 )
 
 // validationMessage renders a validation error into a single client-facing
-// string, mirroring laravel/mcp's Support\ValidationMessages::from (flatten all
-// field messages, join with a space). Field iteration order is sorted so the
-// message is deterministic. When no field messages can be recovered, a generic
-// fallback is returned so no internal detail leaks.
+// string (flatten all field messages, join with a space). Field iteration order
+// is sorted so the message is deterministic. When no field messages can be
+// recovered, a generic fallback is returned so no internal detail leaks.
 func validationMessage(err error) string {
 	var verr contract.ValidationErrors
 	if errors.As(err, &verr) && len(verr.Errors) > 0 {

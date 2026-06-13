@@ -11,20 +11,19 @@ import (
 	"github.com/velocitykode/velocity-mcp/schema"
 )
 
-// Pagination defaults mirror laravel/mcp's Server::$defaultPaginationLength and
-// $maxPaginationLength.
+// Pagination defaults follow the MCP cursor-pagination convention.
 const (
 	defaultPageSize    = 15
 	defaultMaxPageSize = 50
 )
 
-// defaultInstructions mirrors the spirit of laravel/mcp's default instructions
-// without naming a specific host framework.
+// defaultInstructions is the generic instruction string used when a server does
+// not supply its own, without naming a specific host framework.
 const defaultInstructions = "This MCP server lets AI agents interact with the application."
 
-// Method is a single MCP protocol method handler (e.g. tools/call). It mirrors
-// laravel/mcp's Server\Contracts\Method. Handlers receive the per-request
-// server Context and the parsed JSON-RPC request and return a JSON-RPC response.
+// Method is a single MCP protocol method handler (e.g. tools/call). Handlers
+// receive the per-request server Context and the parsed JSON-RPC request and
+// return a JSON-RPC response.
 //
 // A handler reports a protocol-level failure by returning a *jsonrpc.Error
 // (wrapped or direct); the Server turns it into an error response. A handler
@@ -55,7 +54,7 @@ func SetMethodFactory(fn func() map[string]Method) {
 type SessionIDGenerator func() string
 
 // Server is an MCP server: a named, versioned implementation exposing tools,
-// resources, and prompts over a transport. It mirrors laravel/mcp's Server.
+// resources, and prompts over a transport.
 //
 // Construct one with New and configure it with the With* options. A Server is
 // safe for concurrent use once constructed: its configuration is immutable
@@ -127,9 +126,8 @@ func New(name, version string, opts ...Option) *Server {
 	return s
 }
 
-// defaultCapabilities returns the capabilities advertised by default, mirroring
-// laravel/mcp's Server::$capabilities (tools, resources, prompts each with
-// listChanged:false).
+// defaultCapabilities returns the capabilities advertised by default (tools,
+// resources, prompts each with listChanged:false).
 func defaultCapabilities() map[string]any {
 	return map[string]any{
 		CapabilityTools:     map[string]any{"listChanged": false},
@@ -189,9 +187,9 @@ func (s *Server) implementation() schema.Implementation {
 	return impl
 }
 
-// createContext builds a fresh per-message server context, mirroring
-// laravel/mcp's Server::createContext. sessionID is the transport's session id
-// for the message being handled (empty for the initialize request). ctx is the
+// createContext builds a fresh per-message server context. sessionID is the
+// transport's session id for the message being handled (empty for the
+// initialize request). ctx is the
 // inbound request context, threaded onto the Context so primitive handlers can
 // observe client cancellation and request deadlines.
 func (s *Server) createContext(ctx context.Context, sessionID string) *Context {
