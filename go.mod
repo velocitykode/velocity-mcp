@@ -2,7 +2,7 @@ module github.com/velocitykode/velocity-mcp
 
 go 1.26.3
 
-require github.com/velocitykode/velocity v0.60.0
+require github.com/velocitykode/velocity v0.61.0
 
 require (
 	github.com/BurntSushi/toml v1.6.0 // indirect
