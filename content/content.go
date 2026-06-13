@@ -63,10 +63,13 @@ var (
 	_ Content = (*Notification)(nil)
 )
 
-// meta is the embedded metadata helper shared by all content types: an optional
-// _meta map merged into the wire shape under the "_meta" key when non-empty.
+// meta is the embedded helper shared by all content types. It carries an
+// optional _meta map merged into the wire shape under the "_meta" key when
+// non-empty, and embeds annotations so every content type also gains the MCP
+// audience/priority/lastModified hints (emitted under "annotations").
 type meta struct {
 	data map[string]any
+	annotations
 }
 
 // SetMeta sets a single metadata key/value pair.
@@ -91,9 +94,11 @@ func (m *meta) MergeMeta(meta map[string]any) {
 	}
 }
 
-// merge returns base with the "_meta" key added when metadata is present.
-// It does not mutate base in place beyond setting that single key.
+// merge returns base decorated with the "annotations" key (when any annotation
+// is set) and the "_meta" key (when metadata is present). It only adds those
+// keys and does not otherwise mutate base.
 func (m *meta) merge(base map[string]any) map[string]any {
+	base = m.mergeAnnotations(base)
 	if len(m.data) == 0 {
 		return base
 	}
