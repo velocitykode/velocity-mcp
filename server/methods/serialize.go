@@ -19,13 +19,37 @@ func toolToMap(t server.Tool) map[string]any {
 		input["properties"] = map[string]any{}
 	}
 
-	return map[string]any{
+	m := map[string]any{
 		"name":        t.Name(),
 		"title":       serverTitle(t.Name(), t),
 		"description": t.Description(),
 		"inputSchema": input,
 		"annotations": toolAnnotations(t),
 	}
+	if out, ok := toolOutputSchema(t); ok {
+		m["outputSchema"] = out
+	}
+	return m
+}
+
+// toolOutputSchema returns a tool's output schema and whether it declares one.
+// A tool opts in by implementing server.StructuredOutput and returning true
+// from OutputSchema; the rendered schema always carries a "properties" object
+// (empty when none were declared), matching the inputSchema shape.
+func toolOutputSchema(t server.Tool) (map[string]any, bool) {
+	so, ok := t.(server.StructuredOutput)
+	if !ok {
+		return nil, false
+	}
+	obj := schema.NewObject()
+	if !so.OutputSchema(obj) {
+		return nil, false
+	}
+	out := obj.ToMap()
+	if _, ok := out["properties"]; !ok {
+		out["properties"] = map[string]any{}
+	}
+	return out, true
 }
 
 // toolAnnotations returns a tool's behavior-hint annotations object, delegating

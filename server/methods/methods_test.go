@@ -195,6 +195,34 @@ func TestListToolsAnnotations(t *testing.T) {
 	}
 }
 
+func TestListToolsOutputSchema(t *testing.T) {
+	tool := server.NewTool("forecast", "weather forecast").
+		WithSchema(func(s *schema.Object) { s.String("city").Required() }).
+		WithOutputSchema(func(s *schema.Object) { s.Number("tempC").Required() })
+	c := ctxWith(server.WithTools(tool))
+	resp, _ := ListTools{}.Handle(c, req(t, 1, "tools/list", nil))
+	m := decodeResult(t, resp)["tools"].([]any)[0].(map[string]any)
+	out, ok := m["outputSchema"].(map[string]any)
+	if !ok {
+		t.Fatalf("outputSchema missing: %v", m)
+	}
+	props, ok := out["properties"].(map[string]any)
+	if !ok || props["tempC"] == nil {
+		t.Fatalf("outputSchema properties = %v", out)
+	}
+}
+
+func TestListToolsOutputSchemaOmittedByDefault(t *testing.T) {
+	// A tool that declares no output schema (closure builder without
+	// WithOutputSchema) omits the key entirely.
+	c := ctxWith(server.WithTools(echoTool()))
+	resp, _ := ListTools{}.Handle(c, req(t, 1, "tools/list", nil))
+	m := decodeResult(t, resp)["tools"].([]any)[0].(map[string]any)
+	if _, ok := m["outputSchema"]; ok {
+		t.Fatalf("outputSchema should be omitted: %v", m["outputSchema"])
+	}
+}
+
 func TestListToolsPagination(t *testing.T) {
 	c := ctxWith(
 		server.WithTools(echoTool(), failingTool(), validatingTool()),

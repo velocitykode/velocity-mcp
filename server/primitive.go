@@ -88,6 +88,19 @@ type Annotated interface {
 	Annotations() ToolAnnotations
 }
 
+// StructuredOutput is implemented by tools that declare an output schema: a
+// JSON Schema describing the structuredContent they return from tools/call.
+// When a tool declares one, it is surfaced under "outputSchema" in tools/list
+// and clients may validate the tool's structuredContent against it.
+//
+// OutputSchema populates s with the output schema and reports whether the tool
+// declares one at all. Returning false (with s left untouched) signals "no
+// output schema", so the key is omitted from the wire. This lets a single
+// concrete type opt in or out at runtime without changing its method set.
+type StructuredOutput interface {
+	OutputSchema(s *schema.Object) bool
+}
+
 // Resource is a readable server primitive identified by a URI (resources/read).
 // A resource whose URI is a template (contains "{var}" placeholders) is listed
 // under resources/templates/list instead of resources/list; implement

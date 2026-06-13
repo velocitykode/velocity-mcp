@@ -15,20 +15,22 @@ import (
 // HandleFunc. A ToolBuilder with no HandleFunc returns an error result when
 // invoked, so a misconfigured tool fails cleanly instead of panicking.
 type ToolBuilder struct {
-	name        string
-	description string
-	schemaFn    func(s *schema.Object)
-	handleFn    func(ctx context.Context, req *Request) (*Response, error)
-	title       string
-	annotations ToolAnnotations
+	name           string
+	description    string
+	schemaFn       func(s *schema.Object)
+	outputSchemaFn func(s *schema.Object)
+	handleFn       func(ctx context.Context, req *Request) (*Response, error)
+	title          string
+	annotations    ToolAnnotations
 }
 
-// Compile-time assertions that *ToolBuilder satisfies the Tool, Titled, and
-// Annotated interfaces.
+// Compile-time assertions that *ToolBuilder satisfies the Tool, Titled,
+// Annotated, and StructuredOutput interfaces.
 var (
-	_ Tool      = (*ToolBuilder)(nil)
-	_ Titled    = (*ToolBuilder)(nil)
-	_ Annotated = (*ToolBuilder)(nil)
+	_ Tool             = (*ToolBuilder)(nil)
+	_ Titled           = (*ToolBuilder)(nil)
+	_ Annotated        = (*ToolBuilder)(nil)
+	_ StructuredOutput = (*ToolBuilder)(nil)
 )
 
 // NewTool starts building a closure tool with the given kebab-case name and
@@ -41,6 +43,14 @@ func NewTool(name, description string) *ToolBuilder {
 // returns the builder for chaining.
 func (t *ToolBuilder) WithSchema(fn func(s *schema.Object)) *ToolBuilder {
 	t.schemaFn = fn
+	return t
+}
+
+// WithOutputSchema sets the callback that describes the tool's output schema
+// (the structuredContent it returns) and returns the builder for chaining.
+// Setting it opts the tool into the "outputSchema" key in tools/list.
+func (t *ToolBuilder) WithOutputSchema(fn func(s *schema.Object)) *ToolBuilder {
+	t.outputSchemaFn = fn
 	return t
 }
 
@@ -103,6 +113,17 @@ func (t *ToolBuilder) Schema(s *schema.Object) {
 	if t.schemaFn != nil {
 		t.schemaFn(s)
 	}
+}
+
+// OutputSchema implements StructuredOutput. It populates s from the configured
+// output-schema callback and reports whether one was set; a builder with no
+// WithOutputSchema declares no output schema and the key is omitted.
+func (t *ToolBuilder) OutputSchema(s *schema.Object) bool {
+	if t.outputSchemaFn == nil {
+		return false
+	}
+	t.outputSchemaFn(s)
+	return true
 }
 
 // Handle invokes the configured handler. When no handler was set it returns a
