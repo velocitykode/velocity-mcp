@@ -1,6 +1,10 @@
 package server
 
-import "github.com/velocitykode/velocity-mcp/content"
+import (
+	"encoding/json"
+
+	"github.com/velocitykode/velocity-mcp/content"
+)
 
 // Role identifies the author of a prompt message. Tool and resource results do
 // not carry a role; prompt messages do.
@@ -49,6 +53,35 @@ func Error(message string) *Response {
 	r := Text(message)
 	r.isError = true
 	return r
+}
+
+// Image builds a Response with a single image content item from raw (unencoded)
+// bytes. An empty mimeType falls back to the image content default.
+func Image(data []byte, mimeType string) *Response {
+	return NewResponse(content.NewImage(data, mimeType))
+}
+
+// Audio builds a Response with a single audio content item from raw (unencoded)
+// bytes. An empty mimeType falls back to the audio content default.
+func Audio(data []byte, mimeType string) *Response {
+	return NewResponse(content.NewAudio(data, mimeType))
+}
+
+// JSON builds a Response from an arbitrary value: the value is encoded as a
+// text content item (so any client can display it) and, when it encodes to a
+// JSON object, also attached as structuredContent for clients that consume the
+// machine-readable form. An encoding error is returned to the caller.
+func JSON(v any) (*Response, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	r := Text(string(b))
+	var obj map[string]any
+	if json.Unmarshal(b, &obj) == nil && obj != nil {
+		r.structured = obj
+	}
+	return r, nil
 }
 
 // AsError marks the response as a tool-level error result and returns it for
