@@ -168,3 +168,24 @@ func TestProvider_ShutdownIsNoop(t *testing.T) {
 		t.Fatalf("Shutdown: %v", err)
 	}
 }
+
+func TestProvider_CommandsRegistersGenerators(t *testing.T) {
+	r := chain.NewCommands()
+	New(newTestServer()).Commands(r)
+
+	want := map[string]bool{
+		"make:mcp-tool":     false,
+		"make:mcp-resource": false,
+		"make:mcp-prompt":   false,
+	}
+	for _, c := range r.All() {
+		if _, ok := want[c.Name()]; ok {
+			want[c.Name()] = true
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Fatalf("generator %q not registered", name)
+		}
+	}
+}

@@ -1,0 +1,33 @@
+package {{.Package}}
+
+import (
+	"context"
+
+	"github.com/velocitykode/velocity-mcp/server"
+)
+
+// {{.Type}} is the "{{.PrimitiveName}}" resource. Register it on a server with
+// server.WithResources(&{{.Type}}{}).
+type {{.Type}} struct{}
+
+// Name is the resource's unique, kebab-case identifier.
+func (r *{{.Type}}) Name() string { return "{{.PrimitiveName}}" }
+
+// Description is the human-readable resource description.
+func (r *{{.Type}}) Description() string {
+	return "TODO: describe the {{.PrimitiveName}} resource"
+}
+
+// URI is the resource URI clients read.
+func (r *{{.Type}}) URI() string { return "{{.URI}}" }
+
+// MimeType is the resource's MIME type.
+func (r *{{.Type}}) MimeType() string { return "text/plain" }
+
+// Read returns the resource contents for the requested URI.
+func (r *{{.Type}}) Read(ctx context.Context, req *server.Request) (*server.Response, error) {
+	// TODO: produce the resource contents.
+	return server.Text("TODO: implement {{.PrimitiveName}}"), nil
+}
+
+var _ server.Resource = (*{{.Type}})(nil)

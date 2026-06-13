@@ -27,6 +27,7 @@ import (
 	"github.com/velocitykode/velocity/chain"
 	"github.com/velocitykode/velocity/router"
 
+	"github.com/velocitykode/velocity-mcp/console"
 	"github.com/velocitykode/velocity-mcp/server"
 	"github.com/velocitykode/velocity-mcp/transport"
 )
@@ -116,5 +117,15 @@ func (p *Provider) Routes(r *chain.Routing) {
 	}
 }
 
+// Commands implements chain.CommandProvider: it registers the MCP code
+// generators (make:mcp-tool, make:mcp-resource, make:mcp-prompt) so an app that
+// adds this provider can scaffold primitives with `vel run make:mcp-...`. The
+// generators are server-independent; they register whether or not the provider
+// serves a live server.
+func (p *Provider) Commands(r *chain.Commands) {
+	r.Add(console.Generators()...)
+}
+
 var _ velapp.ServiceProvider = (*Provider)(nil)
 var _ chain.RouteProvider = (*Provider)(nil)
+var _ chain.CommandProvider = (*Provider)(nil)

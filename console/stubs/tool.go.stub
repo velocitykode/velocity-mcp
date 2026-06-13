@@ -1,0 +1,23 @@
+package {{.Package}}
+
+import (
+	"context"
+
+	"github.com/velocitykode/velocity-mcp/schema"
+	"github.com/velocitykode/velocity-mcp/server"
+)
+
+// New{{.Type}} builds the "{{.PrimitiveName}}" tool. Register it on a server with
+// server.WithTools(New{{.Type}}()).
+func New{{.Type}}() *server.ToolBuilder {
+	return server.NewTool("{{.PrimitiveName}}", "TODO: describe the {{.PrimitiveName}} tool").
+		WithSchema(func(s *schema.Object) {
+			// Declare the tool's arguments here, for example:
+			// s.String("query").Required().Description("the search query")
+			_ = s
+		}).
+		HandleFunc(func(ctx context.Context, req *server.Request) (*server.Response, error) {
+			// TODO: implement the tool. Read arguments from req and return content.
+			return server.Text("TODO: implement {{.PrimitiveName}}"), nil
+		})
+}

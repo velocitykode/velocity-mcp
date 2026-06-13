@@ -1,0 +1,34 @@
+package {{.Package}}
+
+import (
+	"context"
+
+	"github.com/velocitykode/velocity-mcp/server"
+)
+
+// {{.Type}} is the "{{.PrimitiveName}}" prompt. Register it on a server with
+// server.WithPrompts(&{{.Type}}{}).
+type {{.Type}} struct{}
+
+// Name is the prompt's unique, kebab-case identifier.
+func (p *{{.Type}}) Name() string { return "{{.PrimitiveName}}" }
+
+// Description is the human-readable prompt description.
+func (p *{{.Type}}) Description() string {
+	return "TODO: describe the {{.PrimitiveName}} prompt"
+}
+
+// Arguments declares the prompt's accepted arguments for prompts/list.
+func (p *{{.Type}}) Arguments() []server.PromptArgument {
+	return []server.PromptArgument{
+		// server.NewPromptArgument("topic", "the topic to summarize", true),
+	}
+}
+
+// Handle produces the prompt response from the supplied arguments.
+func (p *{{.Type}}) Handle(ctx context.Context, req *server.Request) (*server.Response, error) {
+	// TODO: build the prompt messages from req arguments.
+	return server.Text("TODO: implement {{.PrimitiveName}}"), nil
+}
+
+var _ server.Prompt = (*{{.Type}})(nil)
