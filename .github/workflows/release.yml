@@ -1,0 +1,122 @@
+name: Auto Release
+
+# Two entry points:
+#   - push to main: release this repo's own changes
+#   - workflow_dispatch: triggered by the velocity framework's release cascade;
+#     bumps the velocity dependency to the given version, then releases.
+# The dep-bump commit carries [skip ci] so its push does not re-trigger this
+# workflow (the dispatch run itself continues on to tag and release).
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - ".github/**"
+  workflow_dispatch:
+    inputs:
+      velocity_version:
+        description: "velocity framework version to pin (e.g. v0.59.0); empty = latest"
+        required: false
+        default: ""
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+
+      - name: Bump velocity dependency
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VELOCITY_VERSION: ${{ inputs.velocity_version }}
+        run: |
+          go get "github.com/velocitykode/velocity@${VELOCITY_VERSION:-latest}"
+          go mod tidy
+
+          if git diff --quiet go.mod go.sum; then
+            echo "velocity already up to date"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add go.mod go.sum
+            git commit -m "chore: update velocity to ${VELOCITY_VERSION:-latest} [skip ci]"
+            git push
+          fi
+
+      - name: Calculate version
+        id: version
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          COMMITS=$(git log ${LAST_TAG}..HEAD --pretty=format:"%s" 2>/dev/null || git log --pretty=format:"%s")
+
+          VERSION=${LAST_TAG#v}
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          PATCH=$(echo $VERSION | cut -d. -f3)
+
+          HAS_BREAKING=false
+          HAS_FEAT=false
+          while IFS= read -r msg; do
+            [ -z "$msg" ] && continue
+            if echo "$msg" | grep -qiE "BREAKING|!:"; then
+              HAS_BREAKING=true
+            fi
+            if echo "$msg" | grep -qiE "^feat|^add"; then
+              HAS_FEAT=true
+            fi
+          done <<< "$COMMITS"
+
+          # Pre-1.0: a breaking change bumps the minor, not the major.
+          if [ "$HAS_BREAKING" = true ]; then
+            if [ "$MAJOR" -eq 0 ]; then
+              MINOR=$((MINOR + 1))
+              PATCH=0
+            else
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+            fi
+          elif [ "$HAS_FEAT" = true ]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          else
+            PATCH=$((PATCH + 1))
+          fi
+
+          NEW="$MAJOR.$MINOR.$PATCH"
+          echo "new=$NEW" >> $GITHUB_OUTPUT
+          echo "Bumping version: $LAST_TAG -> v$NEW"
+
+      - name: Run tests
+        run: go test ./... -race
+
+      - name: Create tag
+        run: |
+          NEW_VERSION=${{ steps.version.outputs.new }}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "v$NEW_VERSION"
+          git push origin "v$NEW_VERSION"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.new }}
+          generate_release_notes: true
+
+      - name: Notify Go Module Proxy
+        run: |
+          VERSION=v${{ steps.version.outputs.new }}
+          curl -sf "https://proxy.golang.org/github.com/velocitykode/velocity-mcp/@v/${VERSION}.info" || true
+          echo "Go module proxy notified for ${VERSION}"

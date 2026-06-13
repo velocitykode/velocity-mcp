@@ -6,6 +6,15 @@ import (
 
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
 	"github.com/velocitykode/velocity-mcp/server"
+
+	// Blank-import the protocol method set so it self-registers with the server
+	// package. The MCP methods (tools/list, tools/call, resources/*, prompts/*,
+	// etc.) are mandatory protocol surface, not opt-in, and live in their own
+	// package because they import server (which therefore cannot import them
+	// back). Every serving path goes through a transport, so importing it here
+	// guarantees the methods are registered for any consumer that serves a
+	// server, without requiring a magic blank import in their own main package.
+	_ "github.com/velocitykode/velocity-mcp/server/methods"
 )
 
 // Transport is the contract every MCP transport implements, shaped to Go
