@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	cli "github.com/velocitykode/velocity-cli"
+	"github.com/velocitykode/prism"
 	velapp "github.com/velocitykode/velocity/app"
 	"github.com/velocitykode/velocity/chain"
 	"github.com/velocitykode/velocity/console/scaffold"
@@ -110,7 +110,7 @@ func (g generator) Handle(s *velapp.Services, args []string) error {
 		return err
 	}
 
-	cli.Success(fmt.Sprintf("Created %s: %s", g.kind, res.Path))
+	prism.Success(fmt.Sprintf("Created %s: %s", g.kind, res.Path))
 	return nil
 }
 

@@ -77,6 +77,8 @@ github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qq
 github.com/rivo/uniseg v0.2.0/go.mod h1:J6wj4VEh+S6ZtnVlnTBMWIodfgj8LQOQFoIToxlJtxc=
 github.com/rivo/uniseg v0.4.7 h1:WUdvkW8uEhrYfLC4ZzdpI2ztxP1I582+49Oc5Mq64VQ=
 github.com/rivo/uniseg v0.4.7/go.mod h1:FN3SvrM+Zdj16jyLfmOkMNblXMcoc8DfTHruCPUcx88=
+github.com/velocitykode/prism v0.16.0 h1:i03yvGdb/+sHqC537CuIzJluJ7J8blzfqZK+I/bjJ8A=
+github.com/velocitykode/prism v0.16.0/go.mod h1:N2LasRemjLaLYsW5yhmcfSv8/x+lFyb/0QJQCbwBYbY=
 github.com/velocitykode/velocity v0.62.1 h1:/8eELteF68b1Leu74nXt+ULxlMUHIi3CwCtTgmOu9XI=
 github.com/velocitykode/velocity v0.62.1/go.mod h1:fcA8P/0JOubAn8d1U65A08PnzhZhTpnSB62INOrO7ow=
 github.com/velocitykode/velocity-cli v0.13.1 h1:hJHRSocCxr9Meg+1BStKEiUEzLZGUfR1I9+xGv+aE/8=
