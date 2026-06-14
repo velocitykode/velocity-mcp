@@ -4,7 +4,7 @@ go 1.26.3
 
 require (
 	github.com/velocitykode/prism v0.16.0
-	github.com/velocitykode/velocity v0.62.2
+	github.com/velocitykode/velocity v0.62.3
 )
 
 require (
