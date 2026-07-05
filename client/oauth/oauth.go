@@ -43,10 +43,18 @@ func NewClient(config Config, resourceURL, resourceMetadataURL, challengeScope s
 		resourceURL:         beforeFragment(resourceURL),
 		resourceMetadataURL: resourceMetadataURL,
 		challengeScope:      challengeScope,
-		discovery:           NewDiscovery(),
+		discovery:           discoveryFor(config),
 		httpClient:          endpointClient(),
 		now:                 time.Now,
 	}
+}
+
+// discoveryFor picks the Discovery variant matching the config's host posture.
+func discoveryFor(config Config) *Discovery {
+	if config.AllowPrivateHosts {
+		return NewDiscoveryAllowingPrivateHosts()
+	}
+	return NewDiscovery()
 }
 
 // PendingAuthorization is the per-attempt state a caller must persist between

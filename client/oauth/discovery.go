@@ -17,11 +17,42 @@ import (
 // host, guarding against server-advertised SSRF targets.
 type Discovery struct {
 	client *httpclient.Client
+	// allowPrivate relaxes the HTTPS + non-internal-host requirements for
+	// consumers that vouch for a private or plain-HTTP deployment (see
+	// Config.AllowPrivateHosts). SSRF guards stay on by default.
+	allowPrivate bool
 }
 
 // NewDiscovery builds a Discovery with the default OAuth endpoint client.
 func NewDiscovery() *Discovery {
 	return &Discovery{client: endpointClient()}
+}
+
+// NewDiscoveryAllowingPrivateHosts builds a Discovery that accepts plain-HTTP
+// and private/internal endpoints (Config.AllowPrivateHosts semantics).
+func NewDiscoveryAllowingPrivateHosts() *Discovery {
+	return &Discovery{client: endpointClient(), allowPrivate: true}
+}
+
+// requireSecureURL applies requireSecure unless private hosts are allowed.
+func (d *Discovery) requireSecureURL(rawURL string) error {
+	if d.allowPrivate {
+		// Still insist the URL parses; only the transport posture is relaxed.
+		u, err := url.Parse(rawURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return newError("unable to parse URL [%s] during OAuth discovery", rawURL)
+		}
+		return nil
+	}
+	return requireSecure(rawURL)
+}
+
+// requireExternalURL applies requireNotInternal unless private hosts are allowed.
+func (d *Discovery) requireExternalURL(rawURL, resourceURL string) error {
+	if d.allowPrivate {
+		return nil
+	}
+	return requireNotInternal(rawURL, resourceURL)
 }
 
 // Discover resolves the authorization-server metadata for resourceURL. When
@@ -61,10 +92,10 @@ func (d *Discovery) Discover(ctx context.Context, resourceURL, resourceMetadataU
 		}
 	}
 
-	if err := requireSecure(issuer); err != nil {
+	if err := d.requireSecureURL(issuer); err != nil {
 		return nil, err
 	}
-	if err := requireNotInternal(issuer, resourceURL); err != nil {
+	if err := d.requireExternalURL(issuer, resourceURL); err != nil {
 		return nil, err
 	}
 
@@ -78,18 +109,18 @@ func (d *Discovery) Discover(ctx context.Context, resourceURL, resourceMetadataU
 	}
 
 	for _, endpoint := range []string{serverMetadata.AuthorizationEndpoint, serverMetadata.TokenEndpoint} {
-		if err := requireSecure(endpoint); err != nil {
+		if err := d.requireSecureURL(endpoint); err != nil {
 			return nil, err
 		}
-		if err := requireNotInternal(endpoint, resourceURL); err != nil {
+		if err := d.requireExternalURL(endpoint, resourceURL); err != nil {
 			return nil, err
 		}
 	}
 	if serverMetadata.RegistrationEndpoint != "" {
-		if err := requireSecure(serverMetadata.RegistrationEndpoint); err != nil {
+		if err := d.requireSecureURL(serverMetadata.RegistrationEndpoint); err != nil {
 			return nil, err
 		}
-		if err := requireNotInternal(serverMetadata.RegistrationEndpoint, resourceURL); err != nil {
+		if err := d.requireExternalURL(serverMetadata.RegistrationEndpoint, resourceURL); err != nil {
 			return nil, err
 		}
 	}
@@ -139,10 +170,10 @@ func (d *Discovery) fetchMetadata(ctx context.Context, issuer string) (*AuthServ
 
 // requireFetchable asserts a URL is HTTPS (or localhost) and not an internal host.
 func (d *Discovery) requireFetchable(u, resourceURL string) error {
-	if err := requireSecure(u); err != nil {
+	if err := d.requireSecureURL(u); err != nil {
 		return err
 	}
-	return requireNotInternal(u, resourceURL)
+	return d.requireExternalURL(u, resourceURL)
 }
 
 // requireResourceMatches asserts that, when the resource metadata declares a
