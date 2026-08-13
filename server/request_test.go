@@ -119,8 +119,8 @@ func TestRequestBind_EdgeCase(t *testing.T) {
 func TestRequestValidate(t *testing.T) {
 	req := NewRequest(map[string]any{"name": "ada", "email": "ada@example.com"})
 	err := req.Validate(validation.Rules{
-		"name":  {"required"},
-		"email": {"required", "email"},
+		"name":  {validation.Required()},
+		"email": {validation.Required(), validation.Email()},
 	})
 	if err != nil {
 		t.Fatalf("validate passed should be nil: %v", err)
@@ -129,7 +129,7 @@ func TestRequestValidate(t *testing.T) {
 
 func TestRequestValidate_EdgeCase(t *testing.T) {
 	req := NewRequest(map[string]any{"name": ""})
-	err := req.Validate(validation.Rules{"name": {"required"}})
+	err := req.Validate(validation.Rules{"name": {validation.Required()}})
 	if err == nil {
 		t.Fatal("expected validation error")
 	}

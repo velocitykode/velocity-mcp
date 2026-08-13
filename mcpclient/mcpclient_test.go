@@ -162,10 +162,10 @@ func TestForAttachesStoredToken(t *testing.T) {
 
 func TestProviderLifecycleNoops(t *testing.T) {
 	p := OAuthRoutesFor("x", oauth.Config{})
-	if err := p.Register(nil); err != nil {
+	if err := p.Init(nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Boot(nil); err != nil {
+	if err := p.Start(nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.Shutdown(context.Background()); err != nil {

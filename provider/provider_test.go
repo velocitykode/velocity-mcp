@@ -40,11 +40,11 @@ func TestProvider_RegisterStoresServerTyped(t *testing.T) {
 	s := &velapp.Services{}
 
 	p := New(srv)
-	if err := p.Register(s); err != nil {
-		t.Fatalf("Register: %v", err)
+	if err := p.Init(s); err != nil {
+		t.Fatalf("Init: %v", err)
 	}
-	if err := p.Boot(s); err != nil {
-		t.Fatalf("Boot: %v", err)
+	if err := p.Start(s); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
 
 	if got := server.FromServices(s); got != srv {
@@ -54,17 +54,17 @@ func TestProvider_RegisterStoresServerTyped(t *testing.T) {
 
 func TestProvider_RegisterDuplicateErrors(t *testing.T) {
 	s := &velapp.Services{}
-	if err := New(newTestServer()).Register(s); err != nil {
-		t.Fatalf("first Register: %v", err)
+	if err := New(newTestServer()).Init(s); err != nil {
+		t.Fatalf("first Init: %v", err)
 	}
-	if err := New(newTestServer()).Register(s); err == nil {
-		t.Fatal("second Register should error (duplicate *server.Server key)")
+	if err := New(newTestServer()).Init(s); err == nil {
+		t.Fatal("second Init should error (duplicate *server.Server key)")
 	}
 }
 
 func TestProvider_RegisterWithoutServerErrors(t *testing.T) {
-	if err := New(nil).Register(&velapp.Services{}); err == nil {
-		t.Fatal("Register with nil server should error")
+	if err := New(nil).Init(&velapp.Services{}); err == nil {
+		t.Fatal("Init with nil server should error")
 	}
 }
 

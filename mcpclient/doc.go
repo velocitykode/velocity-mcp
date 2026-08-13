@@ -6,7 +6,7 @@
 //
 //	mcpclient.RegisterClient("example", "https://mcp.example.com/mcp")
 //
-//	func Configure(reg *velocity.ProviderRegistry) {
+//	func Configure(reg *velocity.ModuleRegistry) {
 //	    reg.Add(mcpclient.OAuthRoutesFor("example", oauth.Config{
 //	        ClientID: "veladmin", Scope: "mcp:use",
 //	    }))

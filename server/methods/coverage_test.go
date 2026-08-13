@@ -80,7 +80,7 @@ func (validatingPrompt) Name() string                       { return "vp" }
 func (validatingPrompt) Description() string                { return "validates" }
 func (validatingPrompt) Arguments() []server.PromptArgument { return nil }
 func (validatingPrompt) Handle(ctx context.Context, r *server.Request) (*server.Response, error) {
-	if err := r.Validate(validation.Rules{"name": {"required"}}); err != nil {
+	if err := r.Validate(validation.Rules{"name": {validation.Required()}}); err != nil {
 		return nil, err
 	}
 	return server.Text("ok"), nil
@@ -127,7 +127,7 @@ func (validatingResource) Description() string { return "validates" }
 func (validatingResource) URI() string         { return "file://vr" }
 func (validatingResource) MimeType() string    { return "text/plain" }
 func (validatingResource) Read(ctx context.Context, r *server.Request) (*server.Response, error) {
-	if err := r.Validate(validation.Rules{"x": {"required"}}); err != nil {
+	if err := r.Validate(validation.Rules{"x": {validation.Required()}}); err != nil {
 		return nil, err
 	}
 	return server.Text("ok"), nil

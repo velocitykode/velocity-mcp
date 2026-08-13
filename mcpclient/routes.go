@@ -20,8 +20,8 @@ const DefaultBasePath = "/mcp/oauth"
 const flowTimeout = 15 * time.Second
 
 // OAuthRouteProvider mounts the authorization-code routes for one registered
-// MCP server. It implements chain.RouteProvider (so it installs when added to
-// the provider registry) and app.ServiceProvider (so it is addable via
+// MCP server. It implements chain.RouteModule (so it installs when added to
+// the module registry) and app.Module (so it is addable via
 // reg.Add).
 type OAuthRouteProvider struct {
 	name     string
@@ -70,11 +70,11 @@ func OAuthRoutesFor(name string, cfg oauth.Config, opts ...Option) *OAuthRoutePr
 	return p
 }
 
-// Register is a no-op; the provider only contributes routes.
-func (p *OAuthRouteProvider) Register(s *velapp.Services) error { return nil }
+// Init is a no-op; the module only contributes routes.
+func (p *OAuthRouteProvider) Init(s *velapp.Services) error { return nil }
 
-// Boot is a no-op.
-func (p *OAuthRouteProvider) Boot(s *velapp.Services) error { return nil }
+// Start is a no-op.
+func (p *OAuthRouteProvider) Start(s *velapp.Services) error { return nil }
 
 // Shutdown is a no-op.
 func (p *OAuthRouteProvider) Shutdown(ctx context.Context) error { return nil }
@@ -170,6 +170,6 @@ func baseURL(c *router.Context) string {
 }
 
 var (
-	_ velapp.ServiceProvider = (*OAuthRouteProvider)(nil)
-	_ chain.RouteProvider    = (*OAuthRouteProvider)(nil)
+	_ velapp.Module     = (*OAuthRouteProvider)(nil)
+	_ chain.RouteModule = (*OAuthRouteProvider)(nil)
 )

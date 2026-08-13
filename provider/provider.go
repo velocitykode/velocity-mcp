@@ -7,7 +7,7 @@
 //	srv := server.New("my-app", "1.0.0", server.WithTools(...))
 //
 //	v, _ := velocity.New()
-//	v.Providers(func(r *chain.ProviderRegistry) {
+//	v.Modules(func(r *chain.ModuleRegistry) {
 //	    r.Add(provider.New(srv))
 //	})
 //
@@ -37,8 +37,8 @@ import (
 const DefaultPath = "/mcp"
 
 // Provider integrates an MCP server into a Velocity application. It
-// implements app.ServiceProvider for lifecycle and chain.RouteProvider so the
-// HTTP transport route installs automatically when added as a chain provider.
+// implements app.Module for lifecycle and chain.RouteModule so the
+// HTTP transport route installs automatically when added as a chain module.
 type Provider struct {
 	srv         *server.Server
 	path        string
@@ -85,27 +85,27 @@ func New(srv *server.Server, opts ...Option) *Provider {
 	return p
 }
 
-// Register stores the server in the typed component registry (key:
-// *server.Server). The framework's wiring sweep runs after the provider
+// Init stores the server in the typed component registry (key:
+// *server.Server). The framework's wiring sweep runs after module
 // lifecycle and injects the event dispatcher into the server
 // (contract.EventDispatcherAware), so MCP events reach app listeners with no
 // extra wiring here.
-func (p *Provider) Register(s *velapp.Services) error {
+func (p *Provider) Init(s *velapp.Services) error {
 	if p.srv == nil {
 		return errors.New("mcp: provider constructed without a server")
 	}
 	return server.RegisterServices(s, p.srv)
 }
 
-// Boot is a no-op: the server has no cross-provider dependencies to resolve.
-func (p *Provider) Boot(s *velapp.Services) error { return nil }
+// Start is a no-op: the server has no cross-module dependencies to resolve.
+func (p *Provider) Start(s *velapp.Services) error { return nil }
 
 // Shutdown is a no-op: the server holds no connections or goroutines of its
 // own, and per the registry ownership rule any teardown would belong to the
-// registry sweep, not the provider.
+// registry sweep, not the module.
 func (p *Provider) Shutdown(ctx context.Context) error { return nil }
 
-// Routes implements chain.RouteProvider: it mounts the streamable-HTTP
+// Routes implements chain.RouteModule: it mounts the streamable-HTTP
 // transport at the configured path on the raw router. The route is
 // deliberately NOT placed in the web middleware group: MCP clients are
 // programs, not browsers, and the web stack's CSRF/session middleware would
@@ -117,7 +117,7 @@ func (p *Provider) Routes(r *chain.Routing) {
 	}
 }
 
-// Commands implements chain.CommandProvider: it registers the MCP code
+// Commands implements chain.CommandModule: it registers the MCP code
 // generators (make:mcp-tool, make:mcp-resource, make:mcp-prompt) plus the
 // runtime commands bound to the served server (mcp:start to serve over stdio,
 // mcp:inspect to list registered primitives), so an app that adds this provider
@@ -128,6 +128,6 @@ func (p *Provider) Commands(r *chain.Commands) {
 	r.Add(console.ServerCommands(p.srv)...)
 }
 
-var _ velapp.ServiceProvider = (*Provider)(nil)
-var _ chain.RouteProvider = (*Provider)(nil)
-var _ chain.CommandProvider = (*Provider)(nil)
+var _ velapp.Module = (*Provider)(nil)
+var _ chain.RouteModule = (*Provider)(nil)
+var _ chain.CommandModule = (*Provider)(nil)

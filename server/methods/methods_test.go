@@ -27,7 +27,7 @@ func echoTool() server.Tool {
 func validatingTool() server.Tool {
 	return server.NewTool("strict", "validates input").
 		HandleFunc(func(ctx context.Context, req *server.Request) (*server.Response, error) {
-			if err := req.Validate(validation.Rules{"name": {"required"}}); err != nil {
+			if err := req.Validate(validation.Rules{"name": {validation.Required()}}); err != nil {
 				return nil, err
 			}
 			return server.Text("ok"), nil
