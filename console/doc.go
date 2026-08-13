@@ -2,8 +2,8 @@
 // make:mcp-resource, make:mcp-prompt) that scaffold primitive starter files
 // into a user's project.
 //
-// The commands are chain.Command values exposed via Generators. A service
-// provider adds them to the application's command registry, after which they
+// The commands are chain.Command values exposed via Generators. A chain
+// module adds them to the application's command registry, after which they
 // run as `vel run make:mcp-...`. All file writing delegates to velocity's
 // console/scaffold.Generator, so directory resolution, the --dir override,
 // path-traversal and symlink guards, and overwrite protection match the

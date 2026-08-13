@@ -28,9 +28,9 @@ type generator struct {
 	typeSuffix  string // appended to the derived Pascal name (e.g. "Tool")
 }
 
-// Generators returns the MCP code-generator commands. A service provider
+// Generators returns the MCP code-generator commands. A chain module
 // exposes them to an application by adding them to the command registry (see
-// provider.Provider.Commands), after which they run as `vel run make:mcp-...`.
+// module.Module.Commands), after which they run as `vel run make:mcp-...`.
 func Generators() []chain.Command {
 	return []chain.Command{
 		generator{

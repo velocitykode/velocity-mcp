@@ -160,7 +160,7 @@ func TestForAttachesStoredToken(t *testing.T) {
 	}
 }
 
-func TestProviderLifecycleNoops(t *testing.T) {
+func TestModuleLifecycleNoops(t *testing.T) {
 	p := OAuthRoutesFor("x", oauth.Config{})
 	if err := p.Init(nil); err != nil {
 		t.Fatal(err)

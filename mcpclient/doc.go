@@ -2,7 +2,7 @@
 // MCP servers from a Velocity web app. Where the client package is the
 // low-level engine (transports, protocol, oauth), this package is the ergonomic
 // front door: register named MCP servers once, then mount the OAuth
-// authorization-code routes for any of them with a single provider.
+// authorization-code routes for any of them with a single module.
 //
 //	mcpclient.RegisterClient("example", "https://mcp.example.com/mcp")
 //

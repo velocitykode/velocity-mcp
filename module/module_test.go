@@ -1,4 +1,4 @@
-package provider
+package module
 
 import (
 	"context"
@@ -17,14 +17,14 @@ import (
 	"github.com/velocitykode/velocity-mcp/server"
 )
 
-// The provider relies on the framework's post-bootstrap wiring sweep to
+// The module relies on the framework's post-bootstrap wiring sweep to
 // inject the event dispatcher into the registered server; that only works
 // while *server.Server implements contract.EventDispatcherAware. Lock the
 // contract here so a server-side regression fails this package too.
 var _ contract.EventDispatcherAware = (*server.Server)(nil)
 
 func newTestServer() *server.Server {
-	return server.New("provider-test", "0.0.1",
+	return server.New("module-test", "0.0.1",
 		server.WithTools(
 			server.NewTool("hello", "greet").
 				WithSchema(func(s *schema.Object) { s.String("name") }).
@@ -35,15 +35,15 @@ func newTestServer() *server.Server {
 	)
 }
 
-func TestProvider_RegisterStoresServerTyped(t *testing.T) {
+func TestModule_RegisterStoresServerTyped(t *testing.T) {
 	srv := newTestServer()
 	s := &velapp.Services{}
 
-	p := New(srv)
-	if err := p.Init(s); err != nil {
+	m := New(srv)
+	if err := m.Init(s); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
-	if err := p.Start(s); err != nil {
+	if err := m.Start(s); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -52,7 +52,7 @@ func TestProvider_RegisterStoresServerTyped(t *testing.T) {
 	}
 }
 
-func TestProvider_RegisterDuplicateErrors(t *testing.T) {
+func TestModule_RegisterDuplicateErrors(t *testing.T) {
 	s := &velapp.Services{}
 	if err := New(newTestServer()).Init(s); err != nil {
 		t.Fatalf("first Init: %v", err)
@@ -62,20 +62,20 @@ func TestProvider_RegisterDuplicateErrors(t *testing.T) {
 	}
 }
 
-func TestProvider_RegisterWithoutServerErrors(t *testing.T) {
+func TestModule_RegisterWithoutServerErrors(t *testing.T) {
 	if err := New(nil).Init(&velapp.Services{}); err == nil {
 		t.Fatal("Init with nil server should error")
 	}
 }
 
-// mountAndCall registers the provider's routes on a fresh router and drives
+// mountAndCall registers the module's routes on a fresh router and drives
 // one JSON-RPC request through the mounted endpoint.
-func mountAndCall(t *testing.T, p *Provider, path, body string) *httptest.ResponseRecorder {
+func mountAndCall(t *testing.T, m *Module, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 
 	r := router.NewV2()
 	routing := chain.NewRouting(r, chain.NewMiddlewareStack(&velapp.Services{}))
-	p.Routes(routing)
+	m.Routes(routing)
 
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -84,9 +84,9 @@ func mountAndCall(t *testing.T, p *Provider, path, body string) *httptest.Respon
 	return rec
 }
 
-func TestProvider_RoutesMountsTransportAtDefaultPath(t *testing.T) {
-	p := New(newTestServer())
-	rec := mountAndCall(t, p, DefaultPath, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+func TestModule_RoutesMountsTransportAtDefaultPath(t *testing.T) {
+	m := New(newTestServer())
+	rec := mountAndCall(t, m, DefaultPath, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
@@ -110,9 +110,9 @@ func TestProvider_RoutesMountsTransportAtDefaultPath(t *testing.T) {
 	}
 }
 
-func TestProvider_WithPathOverridesMount(t *testing.T) {
-	p := New(newTestServer(), WithPath("/ai/mcp"))
-	rec := mountAndCall(t, p, "/ai/mcp", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+func TestModule_WithPathOverridesMount(t *testing.T) {
+	m := New(newTestServer(), WithPath("/ai/mcp"))
+	rec := mountAndCall(t, m, "/ai/mcp", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
 	}
@@ -124,15 +124,15 @@ func TestProvider_WithPathOverridesMount(t *testing.T) {
 	}
 }
 
-func TestProvider_WithPathEmptyKeepsDefault(t *testing.T) {
-	p := New(newTestServer(), WithPath(""))
-	rec := mountAndCall(t, p, DefaultPath, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+func TestModule_WithPathEmptyKeepsDefault(t *testing.T) {
+	m := New(newTestServer(), WithPath(""))
+	rec := mountAndCall(t, m, DefaultPath, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
 	}
 }
 
-func TestProvider_WithMiddlewareWrapsRoute(t *testing.T) {
+func TestModule_WithMiddlewareWrapsRoute(t *testing.T) {
 	called := false
 	mw := func(next router.HandlerFunc) router.HandlerFunc {
 		return func(c *router.Context) error {
@@ -140,8 +140,8 @@ func TestProvider_WithMiddlewareWrapsRoute(t *testing.T) {
 			return next(c)
 		}
 	}
-	p := New(newTestServer(), WithMiddleware(mw))
-	rec := mountAndCall(t, p, DefaultPath, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	m := New(newTestServer(), WithMiddleware(mw))
+	rec := mountAndCall(t, m, DefaultPath, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
 	}
@@ -150,26 +150,26 @@ func TestProvider_WithMiddlewareWrapsRoute(t *testing.T) {
 	}
 }
 
-func TestProvider_MiddlewareCanRejectBeforeTransport(t *testing.T) {
+func TestModule_MiddlewareCanRejectBeforeTransport(t *testing.T) {
 	deny := func(next router.HandlerFunc) router.HandlerFunc {
 		return func(c *router.Context) error {
 			return router.NewHTTPError(http.StatusUnauthorized, "no token")
 		}
 	}
-	p := New(newTestServer(), WithMiddleware(deny))
-	rec := mountAndCall(t, p, DefaultPath, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	m := New(newTestServer(), WithMiddleware(deny))
+	rec := mountAndCall(t, m, DefaultPath, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401; body: %s", rec.Code, rec.Body.String())
 	}
 }
 
-func TestProvider_ShutdownIsNoop(t *testing.T) {
+func TestModule_ShutdownIsNoop(t *testing.T) {
 	if err := New(newTestServer()).Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 }
 
-func TestProvider_CommandsRegistersGenerators(t *testing.T) {
+func TestModule_CommandsRegistersGenerators(t *testing.T) {
 	r := chain.NewCommands()
 	New(newTestServer()).Commands(r)
 

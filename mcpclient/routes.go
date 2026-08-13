@@ -19,11 +19,11 @@ const DefaultBasePath = "/mcp/oauth"
 // flowTimeout bounds the discovery + token exchange network work per request.
 const flowTimeout = 15 * time.Second
 
-// OAuthRouteProvider mounts the authorization-code routes for one registered
+// OAuthRouteModule mounts the authorization-code routes for one registered
 // MCP server. It implements chain.RouteModule (so it installs when added to
 // the module registry) and app.Module (so it is addable via
 // reg.Add).
-type OAuthRouteProvider struct {
+type OAuthRouteModule struct {
 	name     string
 	cfg      oauth.Config
 	store    Store
@@ -31,33 +31,33 @@ type OAuthRouteProvider struct {
 	basePath string
 }
 
-// Option customises an OAuthRouteProvider.
-type Option func(*OAuthRouteProvider)
+// Option customises an OAuthRouteModule.
+type Option func(*OAuthRouteModule)
 
 // WithStore overrides the token/pending store (default: the package default
 // store, SessionStore).
-func WithStore(s Store) Option { return func(p *OAuthRouteProvider) { p.store = s } }
+func WithStore(s Store) Option { return func(p *OAuthRouteModule) { p.store = s } }
 
 // WithSuccessRedirect sets the path to redirect to after a successful exchange
 // when the flow carried no return target (default "/").
 func WithSuccessRedirect(path string) Option {
-	return func(p *OAuthRouteProvider) { p.success = path }
+	return func(p *OAuthRouteModule) { p.success = path }
 }
 
 // WithBasePath overrides the route prefix (default DefaultBasePath).
 func WithBasePath(prefix string) Option {
-	return func(p *OAuthRouteProvider) {
+	return func(p *OAuthRouteModule) {
 		if prefix != "" {
 			p.basePath = prefix
 		}
 	}
 }
 
-// OAuthRoutesFor builds a provider that mounts the OAuth client routes for a
+// OAuthRoutesFor builds a module that mounts the OAuth client routes for a
 // previously RegisterClient'd name, using cfg (client id, scope, optional
 // secret) for the authorization request.
-func OAuthRoutesFor(name string, cfg oauth.Config, opts ...Option) *OAuthRouteProvider {
-	p := &OAuthRouteProvider{
+func OAuthRoutesFor(name string, cfg oauth.Config, opts ...Option) *OAuthRouteModule {
+	p := &OAuthRouteModule{
 		name:     name,
 		cfg:      cfg,
 		store:    defaultStore,
@@ -71,18 +71,18 @@ func OAuthRoutesFor(name string, cfg oauth.Config, opts ...Option) *OAuthRoutePr
 }
 
 // Init is a no-op; the module only contributes routes.
-func (p *OAuthRouteProvider) Init(s *velapp.Services) error { return nil }
+func (p *OAuthRouteModule) Init(s *velapp.Services) error { return nil }
 
 // Start is a no-op.
-func (p *OAuthRouteProvider) Start(s *velapp.Services) error { return nil }
+func (p *OAuthRouteModule) Start(s *velapp.Services) error { return nil }
 
 // Shutdown is a no-op.
-func (p *OAuthRouteProvider) Shutdown(ctx context.Context) error { return nil }
+func (p *OAuthRouteModule) Shutdown(ctx context.Context) error { return nil }
 
 // Routes mounts the redirect and callback handlers on the session-backed web
 // stack (so the default SessionStore can persist state). Both are GET, so the
 // web stack's CSRF guard does not reject them.
-func (p *OAuthRouteProvider) Routes(r *chain.Routing) {
+func (p *OAuthRouteModule) Routes(r *chain.Routing) {
 	base := p.basePath + "/" + p.name
 	r.Web(func(web router.Router) {
 		web.Get(base+"/redirect", p.handleRedirect)
@@ -92,7 +92,7 @@ func (p *OAuthRouteProvider) Routes(r *chain.Routing) {
 
 // handleRedirect begins the flow: discovery, PKCE, persist pending, then send
 // the browser to the authorization server's consent screen.
-func (p *OAuthRouteProvider) handleRedirect(c *router.Context) error {
+func (p *OAuthRouteModule) handleRedirect(c *router.Context) error {
 	e, ok := lookup(p.name)
 	if !ok {
 		return c.String(http.StatusInternalServerError, "mcp client ["+p.name+"] is not registered")
@@ -125,7 +125,7 @@ func (p *OAuthRouteProvider) handleRedirect(c *router.Context) error {
 
 // handleCallback completes the flow: match the pending authorization by state,
 // exchange the code for a token, persist it, and redirect onward.
-func (p *OAuthRouteProvider) handleCallback(c *router.Context) error {
+func (p *OAuthRouteModule) handleCallback(c *router.Context) error {
 	e, ok := lookup(p.name)
 	if !ok {
 		return c.String(http.StatusInternalServerError, "mcp client ["+p.name+"] is not registered")
@@ -170,6 +170,6 @@ func baseURL(c *router.Context) string {
 }
 
 var (
-	_ velapp.Module     = (*OAuthRouteProvider)(nil)
-	_ chain.RouteModule = (*OAuthRouteProvider)(nil)
+	_ velapp.Module     = (*OAuthRouteModule)(nil)
+	_ chain.RouteModule = (*OAuthRouteModule)(nil)
 )

@@ -14,7 +14,7 @@ go get github.com/velocitykode/velocity-mcp
 
 - **Server and client in one SDK.** Most MCP libraries do one side. This does both: serve your app to agents, and turn your app into an agent that consumes other MCP servers.
 - **Fluent, type-safe primitives.** Define tools with a schema builder and a typed request, not hand-rolled JSON Schema.
-- **OAuth that just works.** The client speaks RFC 9728 discovery, PKCE, and dynamic client registration. Mount the authorization-code routes with one provider; tokens persist in the session automatically.
+- **OAuth that just works.** The client speaks RFC 9728 discovery, PKCE, and dynamic client registration. Mount the authorization-code routes with one module; tokens persist in the session automatically.
 - **Two transports.** Serve over stdio for desktop clients, or over HTTP on your existing Velocity router.
 - **Built on Velocity.** Validation, events, and routing come from the framework you already use, so it stays light and consistent.
 
