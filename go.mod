@@ -1,10 +1,10 @@
 module github.com/velocitykode/velocity-mcp
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/velocitykode/prism v0.16.0
-	github.com/velocitykode/velocity v0.73.2
+	github.com/velocitykode/velocity v0.75.1
 )
 
 require (
