@@ -123,7 +123,8 @@ func TestWithProtocolVersions(t *testing.T) {
 
 	// Empty list is ignored.
 	s2 := New("d", "1", WithProtocolVersions())
-	if len(s2.createContext(context.Background(), "", nil).SupportedProtocolVersions()) != 4 {
-		t.Fatal("empty version list should retain defaults")
+	got := s2.createContext(context.Background(), "", nil).SupportedProtocolVersions()
+	if len(got) != 1 || got[0] != LatestProtocolVersion {
+		t.Fatalf("empty version list should retain defaults, got %v", got)
 	}
 }

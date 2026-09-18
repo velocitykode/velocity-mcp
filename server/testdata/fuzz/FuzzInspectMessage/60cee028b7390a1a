@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"00000000000\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"0000000000\"}}}}")

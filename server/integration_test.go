@@ -193,8 +193,18 @@ func TestPing(t *testing.T) {
 	s := server.New("demo", "1.0.0")
 	res := handle(t, s, `{"jsonrpc":"2.0","id":3,"method":"ping"}`)
 	result := decodeResult(t, res.Response)
-	if len(result) != 0 {
-		t.Fatalf("ping result should be empty, got %v", result)
+	// A ping carries no payload of its own, so all that remains is the envelope
+	// the server puts on every result.
+	if result["resultType"] != "complete" {
+		t.Fatalf("ping resultType = %v", result["resultType"])
+	}
+	meta, _ := result["_meta"].(map[string]any)
+	info, _ := meta[server.MetaKeyServerInfo].(map[string]any)
+	if info["name"] != "demo" || info["version"] != "1.0.0" {
+		t.Fatalf("ping server info = %v", meta)
+	}
+	if len(result) != 2 {
+		t.Fatalf("ping result should carry nothing but the envelope, got %v", result)
 	}
 }
 

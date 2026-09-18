@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"errors"
+	"math"
 	"sync"
 	"testing"
 
@@ -105,5 +107,111 @@ func TestContextCapabilitiesCopy(t *testing.T) {
 	caps["injected"] = true
 	if c.HasCapability("injected") {
 		t.Fatal("Capabilities should return a copy")
+	}
+}
+
+// TestNotifyWritesTheEncodedFrame asserts the frame a handler pushes is the
+// JSON-RPC 2.0 notification object the specification describes: the version,
+// the method, the params it was given, and no id, since a notification is the
+// message a peer never answers. The bytes are spelled out here rather than
+// rebuilt from the encoder, so a change in what goes on the wire has to be
+// stated.
+func TestNotifyWritesTheEncodedFrame(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		params any
+		want   string
+	}{
+		{
+			name: "params object", method: "notifications/subscriptions/acknowledged",
+			params: map[string]any{"notifications": map[string]any{}},
+			want:   `{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"notifications":{}}}`,
+		},
+		{
+			name: "no params", method: "notifications/cancelled", params: nil,
+			want: `{"jsonrpc":"2.0","method":"notifications/cancelled"}`,
+		},
+		{
+			name: "empty params object is still stated", method: "notifications/progress",
+			params: map[string]any{},
+			want:   `{"jsonrpc":"2.0","method":"notifications/progress","params":{}}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var frames [][]byte
+			c := newTestContext().withEmitter(func(msg []byte) error {
+				frames = append(frames, msg)
+				return nil
+			})
+
+			if err := c.Notify(tt.method, tt.params); err != nil {
+				t.Fatalf("Notify: %v", err)
+			}
+			if len(frames) != 1 {
+				t.Fatalf("emitted %d frames, want 1", len(frames))
+			}
+			if got := string(frames[0]); got != tt.want {
+				t.Fatalf("frame =\n%s\nwant\n%s", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNotifyRefusesParamsItCannotEncode asserts params no peer could be sent
+// are reported to the handler instead of reaching the transport. A partial or
+// empty frame on a stream the client is reading for notifications is worse than
+// a failed request: the client would take it for a message the server meant to
+// send.
+func TestNotifyRefusesParamsItCannotEncode(t *testing.T) {
+	cyclic := map[string]any{}
+	cyclic["self"] = cyclic
+
+	tests := []struct {
+		name   string
+		params any
+	}{
+		{"a channel", map[string]any{"ch": make(chan int)}},
+		{"a function", map[string]any{"fn": func() {}}},
+		{"a value that is not a number", map[string]any{"n": math.Inf(1)}},
+		{"a bag that holds itself", cyclic},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			emitted := 0
+			c := newTestContext().withEmitter(func([]byte) error {
+				emitted++
+				return nil
+			})
+
+			err := c.Notify("notifications/progress", tt.params)
+			if err == nil {
+				t.Fatal("params that cannot be encoded were accepted")
+			}
+			if emitted != 0 {
+				t.Fatalf("a refused notification still wrote %d frames", emitted)
+			}
+		})
+	}
+}
+
+// TestNotifyWithoutAStreamIsANoOp asserts a handler may push frames without
+// knowing whether the transport carrying it can deliver them.
+func TestNotifyWithoutAStreamIsANoOp(t *testing.T) {
+	if err := newTestContext().Notify("notifications/progress", map[string]any{"a": 1}); err != nil {
+		t.Fatalf("Notify without a sink: %v", err)
+	}
+}
+
+// TestNotifySurfacesTheWriteFailure asserts a sink that cannot write is
+// reported rather than swallowed, so a handler answers for a frame the client
+// never received.
+func TestNotifySurfacesTheWriteFailure(t *testing.T) {
+	want := errors.New("stream closed")
+	c := newTestContext().withEmitter(func([]byte) error { return want })
+
+	if err := c.Notify("notifications/progress", nil); !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
 	}
 }

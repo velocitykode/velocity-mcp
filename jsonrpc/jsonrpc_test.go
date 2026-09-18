@@ -3,6 +3,7 @@ package jsonrpc
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -289,5 +290,115 @@ func TestNewNotification(t *testing.T) {
 func TestNewNotification_MarshalError(t *testing.T) {
 	if _, err := NewNotification("x", make(chan int)); err == nil {
 		t.Fatalf("expected marshal error")
+	}
+}
+
+// TestEncodeNotification asserts the one-pass encoder writes the same frame the
+// two-step form does: a JSON-RPC 2.0 notification object carrying the version,
+// the method and the params, with no id, and with an absent params member when
+// there are none.
+func TestEncodeNotification(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		params any
+		want   string
+	}{
+		{"with params", "notifications/message", map[string]any{"level": "info"}, `{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info"}}`},
+		{"nil params omitted", "notifications/initialized", nil, `{"jsonrpc":"2.0","method":"notifications/initialized"}`},
+		{"empty params object is stated", "notifications/progress", map[string]any{}, `{"jsonrpc":"2.0","method":"notifications/progress","params":{}}`},
+		{"a raw params token travels verbatim", "notifications/message", json.RawMessage(`{"level":"warn"}`), `{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"warn"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			frame, err := EncodeNotification(tt.method, tt.params)
+			if err != nil {
+				t.Fatalf("EncodeNotification: %v", err)
+			}
+			if string(frame) != tt.want {
+				t.Fatalf("frame = %s, want %s", frame, tt.want)
+			}
+		})
+	}
+}
+
+// TestEncodeNotificationRefusesParamsItCannotWrite asserts params that cannot
+// be encoded are reported instead of yielding a half-written frame.
+func TestEncodeNotificationRefusesParamsItCannotWrite(t *testing.T) {
+	for _, params := range []any{make(chan int), map[string]any{"fn": func() {}}, math.Inf(-1)} {
+		frame, err := EncodeNotification("notifications/message", params)
+		if err == nil {
+			t.Fatalf("params %T were accepted as %s", params, frame)
+		}
+		if frame != nil {
+			t.Fatalf("a refused notification still produced %s", frame)
+		}
+	}
+}
+
+// TestIDRefusesATokenThatIsNotJSON asserts an id read straight off untrusted
+// bytes is refused there rather than carried until something tries to write it
+// back out. A transport recovers the id of a message it has not parsed this
+// way, so these are the bytes a peer controls.
+func TestIDRefusesATokenThatIsNotJSON(t *testing.T) {
+	tests := []struct {
+		name  string
+		token string
+	}{
+		{"empty", ``},
+		{"an unclosed object", `{`},
+		{"an unterminated string", `"abc`},
+		{"a bare word", `nope`},
+		{"a number with a leading zero", `01`},
+		{"two values", `1 2`},
+		{"a lone NUL byte", "\x00"},
+		{"an unpaired surrogate escape", `"\ud800`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := StringID("previous")
+			if err := id.UnmarshalJSON([]byte(tt.token)); err == nil {
+				t.Fatalf("token %q was accepted as %s", tt.token, id.Raw())
+			}
+			// The refused token leaves no id behind: a reply carrying it would
+			// otherwise correlate to the call the last one named.
+			if !id.IsNull() {
+				t.Fatalf("a refused token left the id %s", id.Raw())
+			}
+			if id.IsValidRequestID() {
+				t.Fatalf("a refused token left a usable request id %s", id.Raw())
+			}
+			b, err := json.Marshal(id)
+			if err != nil {
+				t.Fatalf("marshal a refused id: %v", err)
+			}
+			if string(b) != "null" {
+				t.Fatalf("json = %s, want null", b)
+			}
+		})
+	}
+}
+
+// TestIDKeepsAnAcceptedTokenVerbatim asserts the other half: a token that is
+// JSON is preserved byte for byte, including a numeric spelling Go would not
+// have written, and can always be written back out.
+func TestIDKeepsAnAcceptedTokenVerbatim(t *testing.T) {
+	for _, token := range []string{`1`, `1.50`, `12345678901234567890`, `"a"`, `""`, `null`, `{"not":"a request id"}`} {
+		t.Run(token, func(t *testing.T) {
+			var id ID
+			if err := id.UnmarshalJSON([]byte(token)); err != nil {
+				t.Fatalf("token %q refused: %v", token, err)
+			}
+			if got := string(id.Raw()); got != token {
+				t.Fatalf("raw = %s, want %s", got, token)
+			}
+			b, err := json.Marshal(id)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(b) != token {
+				t.Fatalf("json = %s, want %s", b, token)
+			}
+		})
 	}
 }

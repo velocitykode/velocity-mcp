@@ -35,7 +35,9 @@ func mcpHTTPServer(t *testing.T, onAuth func(string)) *httptest.Server {
 		switch req.Method {
 		case "initialize":
 			result = map[string]any{
-				"protocolVersion": server.LatestProtocolVersion,
+				// The initialize handshake negotiates only over the legacy
+				// revisions; the latest revision opens with server/discover.
+				"protocolVersion": server.InitializeSupportedVersions()[0],
 				"capabilities":    map[string]any{},
 				"serverInfo":      map[string]any{"name": "http-fake", "version": "1.0.0"},
 			}

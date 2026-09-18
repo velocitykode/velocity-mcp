@@ -61,6 +61,10 @@ func WithMaxBodyBytes(n int64) HandlerOption {
 //   - A notification (no id) yields no reply: HTTP 202 Accepted with an empty
 //     body, per the MCP spec
 //     (modelcontextprotocol.io/specification/.../transports#sending-messages-to-the-server).
+//   - A reply to a discovery-handshake request additionally carries the status
+//     its outcome maps to (see statusForResponse). A legacy request always gets
+//     HTTP 200, so a client that predates that rule still reads the JSON-RPC
+//     error object rather than treating the reply as a transport failure.
 //
 // Session semantics: the inbound "Mcp-Session-Id" header (if any) is supplied
 // to srv.Handle as the existing session id; an initialize response
@@ -85,7 +89,10 @@ func Handler(srv MCPServer, opts ...HandlerOption) func(*router.Context) error {
 		opt(&o)
 	}
 
-	return func(c *router.Context) error {
+	// Every served request passes through the MCP header validation middleware
+	// first, so a discovery-handshake request whose headers contradict its body
+	// is refused before it reaches a handler.
+	return ValidateHeaders(opts...)(func(c *router.Context) error {
 		raw, readErr := readBody(c, o.maxBodyBytes)
 		if readErr != nil {
 			// An oversized or unreadable body is a client error. Report a
@@ -99,13 +106,20 @@ func Handler(srv MCPServer, opts ...HandlerOption) func(*router.Context) error {
 
 		sessionID := inboundSessionID(c)
 
-		// Streaming path: when the client negotiated an event stream AND the
-		// message carries a progressToken, serve over SSE so the handler can
-		// emit notifications/progress frames before the final result. Gated on
-		// the progressToken (not just the Accept header) so initialize and other
+		// Streaming path: serve over SSE so the handler can emit frames before
+		// the final result.
+		//
+		// A progress-reporting request takes it only when the client asked for
+		// an event stream in preference to JSON, so initialize and other
 		// non-streaming requests keep the buffered path, which can still set the
 		// Mcp-Session-Id response header before the body is committed.
-		if wantsEventStream(c) && hasProgressToken(raw) {
+		//
+		// A subscription takes it whenever the client accepts an event stream at
+		// all, including the "application/json, text/event-stream" every
+		// conformant client sends: its acknowledgement notification precedes its
+		// result, and the buffered path can carry only the result, so gating on
+		// a preference would silently drop a frame the client is owed.
+		if streamable(c, raw) {
 			if ss, ok := srv.(streamingServer); ok {
 				return serveStream(c, ss, raw, sessionID)
 			}
@@ -124,21 +138,21 @@ func Handler(srv MCPServer, opts ...HandlerOption) func(*router.Context) error {
 		if err != nil {
 			// A response that cannot be marshalled is a server-side defect.
 			// Surface a generic JSON-RPC internal error with no detail; log the
-			// real cause server-side. HTTP stays 200 so the JSON-RPC error
-			// object (not an opaque transport status) reaches the client.
+			// real cause server-side.
 			logf(c, err)
-			return writeInternalError(c, res.Response)
+			return writeInternalError(c, raw, res.Response)
 		}
 
 		if res.SessionID != "" {
 			c.SetHeader(sessionHeader, res.SessionID)
 		}
 
+		status := replyStatus(c, raw, res.Response)
 		if wantsEventStream(c) {
-			return writeSSE(c, msg)
+			return writeSSE(c, status, msg)
 		}
-		return writeJSON(c, msg)
-	}
+		return writeJSON(c, status, msg)
+	})
 }
 
 // readBody reads the inbound request body, wrapped in http.MaxBytesReader so a
@@ -174,34 +188,73 @@ func inboundSessionID(c *router.Context) string {
 // accept application/json (nor the "*/*" wildcard) do we switch to the SSE
 // framing.
 func wantsEventStream(c *router.Context) bool {
+	a := parseAccept(c)
+	return a.sse && !a.plain && !a.any
+}
+
+// acceptsEventStream reports whether the client tolerates an SSE reply at all,
+// whether or not it also accepts JSON. A response that has to deliver more than
+// one frame can only be framed as an event stream, so this, not the preference
+// wantsEventStream expresses, is what gates the streamed path.
+func acceptsEventStream(c *router.Context) bool {
+	a := parseAccept(c)
+	return a.sse || a.any
+}
+
+// acceptSet records which of the reply framings an Accept header allows.
+type acceptSet struct {
+	// sse reports that text/event-stream was listed.
+	sse bool
+	// plain reports that application/json (or the application/* range) was
+	// listed.
+	plain bool
+	// any reports the */* wildcard, which allows either framing.
+	any bool
+}
+
+// parseAccept splits the Accept header into the framings it allows, ignoring
+// media type parameters such as a quality value.
+func parseAccept(c *router.Context) acceptSet {
+	var a acceptSet
 	accept := c.Request.Header.Get("Accept")
 	if accept == "" {
-		return false
+		return a
 	}
-	var sse, json bool
 	for _, part := range strings.Split(accept, ",") {
 		media := part
 		if i := strings.IndexByte(media, ';'); i >= 0 {
 			media = media[:i]
 		}
-		media = strings.ToLower(strings.TrimSpace(media))
-		switch media {
+		switch strings.ToLower(strings.TrimSpace(media)) {
 		case "text/event-stream":
-			sse = true
-		case contentTypeJSON, "application/*", "*/*":
-			json = true
+			a.sse = true
+		case contentTypeJSON, "application/*":
+			a.plain = true
+		case "*/*":
+			a.any = true
 		}
 	}
-	return sse && !json
+	return a
 }
 
-// writeJSON writes a JSON-RPC reply as a plain application/json body with HTTP
-// 200. The body is the already-encoded message frame; a trailing newline is
-// added for parity with line-oriented clients and curl readability.
-func writeJSON(c *router.Context, msg []byte) error {
+// streamable reports whether a request must be served over a streamed SSE
+// response: a subscription (which owes the client an acknowledgement frame
+// before its result) whenever an event stream is acceptable, or a
+// progress-reporting request when the client prefers an event stream to JSON.
+func streamable(c *router.Context, raw []byte) bool {
+	if wantsSubscriptionStream(c, raw) {
+		return acceptsEventStream(c)
+	}
+	return wantsEventStream(c) && hasProgressToken(raw)
+}
+
+// writeJSON writes a JSON-RPC reply as a plain application/json body with the
+// given status. The body is the already-encoded message frame; a trailing
+// newline is added for parity with line-oriented clients and curl readability.
+func writeJSON(c *router.Context, status int, msg []byte) error {
 	c.SetHeader("Content-Type", contentTypeJSON)
 	c.SetHeader("X-Content-Type-Options", "nosniff")
-	c.Response.WriteHeader(http.StatusOK)
+	c.Response.WriteHeader(status)
 	if _, err := c.Response.Write(msg); err != nil {
 		return err
 	}
@@ -210,45 +263,76 @@ func writeJSON(c *router.Context, msg []byte) error {
 }
 
 // writeSSE writes a JSON-RPC reply as a single Server-Sent Events "data:" frame
-// with Content-Type text/event-stream and HTTP 200. This is the buffered SSE
-// response mode (one message, no streamed intermediates); prepareSSE sets the
-// streaming headers and writeSSEFrame writes the frame.
-func writeSSE(c *router.Context, msg []byte) error {
-	prepareSSE(c)
+// with Content-Type text/event-stream and the given status. This is the
+// buffered SSE response mode (one message, no streamed intermediates);
+// prepareSSE sets the streaming headers and writeSSEFrame writes the frame.
+func writeSSE(c *router.Context, status int, msg []byte) error {
+	prepareSSE(c, status)
 	return writeSSEFrame(c, msg)
 }
 
-// serveStream serves a request over a streamed SSE response: it commits the SSE
-// headers up front, drives the message through the streaming server with an
-// emitter that writes each intermediate frame (e.g. notifications/progress) as
-// its own SSE event, then writes the final result as the last frame. Because
-// the headers are committed before handling, no Mcp-Session-Id header is set
-// here; only non-session-assigning methods (tools/call, resources/read) take
-// this path.
+// serveStream serves a request whose reply may need more than one frame: it
+// drives the message through the streaming server with an emitter that writes
+// each intermediate frame (e.g. notifications/progress) as its own SSE event,
+// then writes the final result as the last frame.
+//
+// The SSE headers are committed by the first streamed frame rather than up
+// front. A request the server refuses before the handler produces anything (a
+// subscription naming a protocol version the server does not speak, say) has
+// therefore streamed nothing, and is answered with the ordinary buffered reply
+// its Accept header asks for, carrying the status its error maps to. Only a
+// handler that actually streams commits the connection to the event-stream
+// framing, and once committed neither the framing nor the status can change.
 func serveStream(c *router.Context, ss streamingServer, raw []byte, sessionID string) error {
-	prepareSSE(c)
-	emit := func(msg []byte) error { return writeSSEFrame(c, msg) }
+	streamed := false
+	emit := func(msg []byte) error {
+		if !streamed {
+			streamed = true
+			prepareSSE(c, http.StatusOK)
+		}
+		return writeSSEFrame(c, msg)
+	}
 
 	res := ss.HandleStream(c.Request.Context(), raw, sessionID, emit)
 	if !res.HasResponse || res.Response == nil {
-		return nil
+		if streamed {
+			return nil
+		}
+		// Nothing was streamed and nothing is owed: the message produced no
+		// reply, which is acknowledged the same way on either path.
+		return c.Status(http.StatusAccepted)
 	}
+
 	msg, err := encodeResponse(res.Response)
 	if err != nil {
-		// The headers are already committed, so the framing cannot be changed;
-		// log the defect and end the stream without a final frame.
 		logf(c, err)
-		return nil
+		if streamed {
+			// The headers are already committed, so the framing cannot be
+			// changed; end the stream without a final frame.
+			return nil
+		}
+		return writeInternalError(c, raw, res.Response)
 	}
-	return writeSSEFrame(c, msg)
+	if streamed {
+		return writeSSEFrame(c, msg)
+	}
+
+	if res.SessionID != "" {
+		c.SetHeader(sessionHeader, res.SessionID)
+	}
+	status := replyStatus(c, raw, res.Response)
+	if wantsEventStream(c) {
+		return writeSSE(c, status, msg)
+	}
+	return writeJSON(c, status, msg)
 }
 
-// prepareSSE writes the Server-Sent Events response headers and the 200 status.
-// The framework's PrepareStreamHeaders sets the streaming headers (and
+// prepareSSE writes the Server-Sent Events response headers and the given
+// status. The framework's PrepareStreamHeaders sets the streaming headers (and
 // X-Accel-Buffering: no) so proxies do not buffer the stream.
-func prepareSSE(c *router.Context) {
+func prepareSSE(c *router.Context, status int) {
 	router.PrepareStreamHeaders(c.Response)
-	c.Response.WriteHeader(http.StatusOK)
+	c.Response.WriteHeader(status)
 }
 
 // writeSSEFrame writes one "data: <message>\n\n" SSE frame and flushes it so the
@@ -300,11 +384,11 @@ func writeParseError(c *router.Context, cause error) error {
 	return err
 }
 
-// writeInternalError writes a generic JSON-RPC internal-error response with
-// HTTP 200, preserving the id of the original response so a compliant client can
+// writeInternalError writes a generic JSON-RPC internal-error response,
+// preserving the id of the original response so a compliant client can
 // correlate it. No internal detail reaches the client. Used only on the
 // vanishingly rare path where an already-built response cannot be re-marshalled.
-func writeInternalError(c *router.Context, orig *jsonrpc.Response) error {
+func writeInternalError(c *router.Context, raw []byte, orig *jsonrpc.Response) error {
 	id := jsonrpc.NullID()
 	if orig != nil {
 		id = orig.ID
@@ -315,7 +399,7 @@ func writeInternalError(c *router.Context, orig *jsonrpc.Response) error {
 		// Even the canned error failed to marshal: fall back to a static body.
 		msg = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Something went wrong while processing the request."}}`)
 	}
-	return writeJSON(c, msg)
+	return writeJSON(c, replyStatus(c, raw, resp), msg)
 }
 
 // logf reports a transport-level error to the wired velocity logger when one is

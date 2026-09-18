@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 
+	"github.com/velocitykode/velocity-mcp/jsonrpc"
 	"github.com/velocitykode/velocity-mcp/schema"
 )
 
@@ -30,6 +31,12 @@ type Context struct {
 
 	maxPageSize     int
 	defaultPageSize int
+
+	// cacheHint is the server-wide caching advice, or nil when none was
+	// configured (the zero hint then applies). methodCacheHints overrides it
+	// per operation. Both are read-only once the Context is built.
+	cacheHint        *CacheHint
+	methodCacheHints map[string]CacheHint
 
 	// sessionID is the transport session id for the message being handled, or
 	// "" before a session is established (e.g. the initialize request itself).
@@ -105,6 +112,23 @@ func (c *Context) Emit(msg []byte) error {
 	return c.emit(msg)
 }
 
+// Notify encodes a server-initiated notification and sends it through the same
+// sink as Emit. It is what a method handler pushing a frame of its own uses:
+// the encoding and the write are one call, so a handler carries one failure to
+// answer for (the write) instead of a second one no message it could be handed
+// can reach. Params a peer could not be sent are reported without anything
+// being written.
+//
+// Like Emit it is a no-op returning nil when the transport supplies no
+// streaming sink, so a handler need not branch on streaming support.
+func (c *Context) Notify(method string, params any) error {
+	frame, err := jsonrpc.EncodeNotification(method, params)
+	if err != nil {
+		return err
+	}
+	return c.Emit(frame)
+}
+
 // withEmitter records the streaming sink on the Context. It is called by
 // Server.createContext for a streaming message; a nil emit leaves Emit a no-op.
 func (c *Context) withEmitter(emit func(msg []byte) error) *Context {
@@ -123,7 +147,8 @@ func (c *Context) Instructions() string { return c.instructions }
 func (c *Context) SessionID() string { return c.sessionID }
 
 // SupportedProtocolVersions returns the ordered list of protocol versions the
-// server supports, newest first. The first element is the negotiation fallback.
+// server advertises through server/discover and accepts in a request's
+// params._meta, newest first.
 func (c *Context) SupportedProtocolVersions() []ProtocolVersion {
 	return append([]ProtocolVersion(nil), c.supportedVersions...)
 }
@@ -148,6 +173,33 @@ func (c *Context) ResourceTemplates() []URITemplate { return c.templates }
 
 // Prompts returns the registered prompts.
 func (c *Context) Prompts() []Prompt { return c.prompts }
+
+// ResolveResource returns the registered resource addressed by uri, together
+// with the variables a template match extracted from it (nil for a plain
+// resource). The resource is nil when no registered resource matches.
+//
+// A non-template resource whose URI is exactly uri wins; otherwise a registered
+// template matches either as written (the template string itself) or against a
+// concrete uri.
+func (c *Context) ResolveResource(uri string) (Resource, map[string]string) {
+	if c == nil || uri == "" {
+		return nil, nil
+	}
+	for _, r := range c.resources {
+		if r.URI() == uri {
+			return r, nil
+		}
+	}
+	for _, t := range c.templates {
+		if t.URITemplate() == uri {
+			return t, nil
+		}
+		if vars, ok := MatchURITemplate(t.URITemplate(), uri); ok {
+			return t, vars
+		}
+	}
+	return nil, nil
+}
 
 // PerPage resolves the page size for a list request: the smaller of the
 // requested size and the server max, falling back to the default only when no

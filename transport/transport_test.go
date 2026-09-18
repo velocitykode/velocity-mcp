@@ -61,9 +61,35 @@ func newTestServer(t *testing.T) *server.Server {
 		HandleFunc(func(ctx context.Context, req *server.Request) (*server.Response, error) {
 			return server.Text(fmt.Sprintf("%v", req.Float("a")+req.Float("b"))), nil
 		})
-	srv := server.New("test", "1.0.0", server.WithTools(add))
+	srv := server.New("test", "1.0.0",
+		server.WithTools(add),
+		server.WithPrompts(reviewPrompt{}),
+		server.WithResources(textResource{}),
+	)
 	srv.SetSessionIDGenerator(func() string { return "fixed-session" })
 	return srv
+}
+
+// reviewPrompt and textResource give the fixture one primitive of each kind, so
+// a test driving prompts/get or resources/read exercises a request the server
+// can actually answer rather than one it refuses as unknown.
+type reviewPrompt struct{}
+
+func (reviewPrompt) Name() string                       { return "review" }
+func (reviewPrompt) Description() string                { return "Review something" }
+func (reviewPrompt) Arguments() []server.PromptArgument { return nil }
+func (reviewPrompt) Handle(context.Context, *server.Request) (*server.Response, error) {
+	return server.Text("please review"), nil
+}
+
+type textResource struct{}
+
+func (textResource) Name() string        { return "a" }
+func (textResource) Description() string { return "A text file" }
+func (textResource) URI() string         { return "file://a.txt" }
+func (textResource) MimeType() string    { return "text/plain" }
+func (textResource) Read(context.Context, *server.Request) (*server.Response, error) {
+	return server.Text("contents"), nil
 }
 
 // Compile-time checks that the concrete transports satisfy the contract.

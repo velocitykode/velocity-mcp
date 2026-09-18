@@ -10,6 +10,7 @@ package jsonrpc
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -35,8 +36,21 @@ const (
 // MCP specification.
 const (
 	// CodeResourceNotFound indicates the requested resource (URI) could not be
-	// resolved. Used by resources/read.
+	// resolved. It is what a resources/read is answered with under the
+	// revisions preceding 2026-07-28, which report an unresolvable URI this way
+	// so a client can tell it from malformed parameters; 2026-07-28 reports it
+	// as CodeInvalidParams instead.
 	CodeResourceNotFound = -32002
+	// CodeHeaderMismatch indicates an MCP HTTP header (MCP-Protocol-Version,
+	// Mcp-Method, Mcp-Name) is absent or contradicts the request body.
+	CodeHeaderMismatch = -32020
+	// CodeMissingRequiredClientCapability indicates the client did not declare a
+	// capability the requested operation requires.
+	CodeMissingRequiredClientCapability = -32021
+	// CodeUnsupportedProtocolVersion indicates the protocol version the request
+	// declared is not one the server speaks. The error data carries the
+	// "supported" list and the "requested" value.
+	CodeUnsupportedProtocolVersion = -32022
 )
 
 // ID represents a JSON-RPC request identifier. Per the specification an id MUST
@@ -128,7 +142,20 @@ func (id ID) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON implements json.Unmarshaler, preserving the raw token.
+//
+// The token is required to be JSON, and an id left over from a previous message
+// is dropped rather than kept beside a refused one. Decoding a whole message
+// hands this method nothing else, but reading an id straight off untrusted
+// bytes is how a transport recovers the id to answer a message it has not
+// parsed, and MarshalJSON writes the token back out as it came: a token that is
+// not JSON would then fail no earlier than the encoding of the reply that
+// carries it, far from the bytes that caused it. An ID that reports no error
+// always holds a token its own Marshaler can write.
 func (id *ID) UnmarshalJSON(b []byte) error {
+	if !json.Valid(b) {
+		id.raw = nil
+		return errors.New("jsonrpc: id is not a JSON value")
+	}
 	id.raw = append(id.raw[:0], b...)
 	return nil
 }
@@ -232,6 +259,30 @@ func marshalResult(result any) (json.RawMessage, error) {
 		return nil, fmt.Errorf("jsonrpc: marshal result: %w", err)
 	}
 	return b, nil
+}
+
+// EncodeNotification encodes an outbound notification straight to the frame a
+// transport writes. Building the message and encoding it are one step, so a
+// caller that only ever sends the frame answers for a single failure: params a
+// peer could not be sent. Splitting the two leaves the second step unable to
+// fail, since the value it encodes is one this package has already encoded
+// once, and a branch no input can reach is a branch nothing can hold to its
+// behaviour.
+func EncodeNotification(method string, params any) ([]byte, error) {
+	frame, err := json.Marshal(notificationFrame{JSONRPC: Version, Method: method, Params: params})
+	if err != nil {
+		return nil, fmt.Errorf("jsonrpc: marshal notification: %w", err)
+	}
+	return frame, nil
+}
+
+// notificationFrame is the wire shape EncodeNotification writes. It holds the
+// caller's params value as it came, so the whole frame is encoded in one pass;
+// a nil params value is omitted, exactly as Notification omits an empty one.
+type notificationFrame struct {
+	JSONRPC string `json:"jsonrpc"`
+	Method  string `json:"method"`
+	Params  any    `json:"params,omitempty"`
 }
 
 // NewNotification builds an outbound Notification with the given method and

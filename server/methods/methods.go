@@ -1,6 +1,7 @@
-// Package methods implements the MCP protocol method handlers: initialize,
-// ping, tools/list, tools/call, resources/list, resources/read,
-// resources/templates/list, prompts/list, prompts/get, completion/complete.
+// Package methods implements the MCP protocol method handlers: server/discover,
+// initialize, ping, tools/list, tools/call, resources/list, resources/read,
+// resources/templates/list, prompts/list, prompts/get, completion/complete,
+// subscriptions/listen.
 //
 // Each handler implements server.Method. Importing this package installs the
 // full method set on every server.Server via server.SetMethodFactory (called in
@@ -29,6 +30,8 @@ func init() {
 func defaultMethods() map[string]server.Method {
 	return map[string]server.Method{
 		"initialize":               InitializeMethod{},
+		"server/discover":          Discover{},
+		"subscriptions/listen":     Listen{},
 		"ping":                     Ping{},
 		"tools/list":               ListTools{},
 		"tools/call":               CallTool{},

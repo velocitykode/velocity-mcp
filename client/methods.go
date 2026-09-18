@@ -10,8 +10,11 @@ import (
 // initialize performs the initialize request directly on the transport (used
 // during connect, before the connected flag is set) and parses the result.
 func (p *protocol) initialize(ctx context.Context) (*InitializeResult, error) {
+	// initialize is the legacy handshake, so it may only ask for a version that
+	// handshake negotiates over. The newest revision opens with server/discover
+	// instead and is deliberately never requested here.
 	params := map[string]any{
-		"protocolVersion": server.LatestProtocolVersion,
+		"protocolVersion": server.InitializeSupportedVersions()[0],
 		"capabilities":    map[string]any{},
 		"clientInfo":      p.clientInfo.ToMap(),
 	}
@@ -19,7 +22,17 @@ func (p *protocol) initialize(ctx context.Context) (*InitializeResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseInitializeResult(raw)
+	result, err := parseInitializeResult(raw)
+	if err != nil {
+		return nil, err
+	}
+	// Later requests must advertise the version that was actually settled on,
+	// not the newest one this package knows: a server that negotiated an older
+	// revision rejects a request stamped with a version it does not speak.
+	if pinner, ok := p.transport.(protocolPinner); ok {
+		pinner.useProtocol(result.ProtocolVersion)
+	}
+	return result, nil
 }
 
 // list fetches every entry of a paginated list method (tools/list, etc.),

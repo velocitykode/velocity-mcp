@@ -14,7 +14,6 @@ import (
 	"github.com/velocitykode/velocity/httpclient"
 
 	"github.com/velocitykode/velocity-mcp/client/oauth"
-	"github.com/velocitykode/velocity-mcp/server"
 )
 
 // sessionHeader is the case-insensitive header carrying the MCP session id.
@@ -37,8 +36,26 @@ type HTTPTransport struct {
 	token       func() string
 	sessionID   string
 	initialized bool
-	queue       []string
-	client      *httpclient.Client
+	// protocolVersion is the version settled by the handshake. It is empty
+	// until the handshake completes, and is what the MCP-Protocol-Version
+	// header carries on every request made afterwards.
+	protocolVersion string
+	queue           []string
+	client          *httpclient.Client
+}
+
+// protocolPinner is implemented by a transport that stamps the negotiated
+// protocol version onto later requests. The handshake tells it which version
+// was settled on once the server has answered.
+type protocolPinner interface {
+	useProtocol(version string)
+}
+
+// useProtocol records the negotiated protocol version for later requests.
+func (t *HTTPTransport) useProtocol(version string) {
+	t.mu.Lock()
+	t.protocolVersion = version
+	t.mu.Unlock()
 }
 
 // Compile-time assertion that *HTTPTransport satisfies Transport.
@@ -193,8 +210,8 @@ func (t *HTTPTransport) applyHeaders(req *http.Request) {
 	if t.sessionID != "" {
 		req.Header.Set(sessionHeader, t.sessionID)
 	}
-	if t.initialized {
-		req.Header.Set(protocolVersionHeader, server.LatestProtocolVersion)
+	if t.initialized && t.protocolVersion != "" {
+		req.Header.Set(protocolVersionHeader, t.protocolVersion)
 	}
 	if t.token != nil {
 		if tok := t.token(); tok != "" {
@@ -280,6 +297,7 @@ func (t *HTTPTransport) reset() {
 	t.mu.Lock()
 	t.sessionID = ""
 	t.initialized = false
+	t.protocolVersion = ""
 	t.queue = nil
 	t.mu.Unlock()
 }

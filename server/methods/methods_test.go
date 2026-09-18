@@ -386,20 +386,80 @@ func TestReadResourceTemplate(t *testing.T) {
 	}
 }
 
-func TestReadResourceMissingURI(t *testing.T) {
-	c := ctxWith(server.WithResources(docResource{}))
-	resp, _ := ReadResource{}.Handle(c, req(t, 1, "resources/read", map[string]any{}))
-	if resp.Error == nil || resp.Error.Code != jsonrpc.CodeResourceNotFound {
-		t.Fatalf("expected resource not found, got %+v", resp.Error)
+// TestReadResourceUnresolvedURIFollowsTheRequestedRevision asserts the code a
+// resources/read naming no readable resource is answered with follows the
+// revision the request declares. The discovery revision reports the uri as a
+// parameter it could not make sense of; a client of an earlier revision reads
+// ResourceNotFound to tell a resource that is not there from parameters it got
+// wrong, so that code is what it keeps receiving.
+func TestReadResourceUnresolvedURIFollowsTheRequestedRevision(t *testing.T) {
+	discovery := map[string]any{
+		"_meta": map[string]any{
+			server.MetaKeyProtocolVersion:    server.ProtocolV20260728,
+			server.MetaKeyClientCapabilities: map[string]any{},
+		},
+	}
+
+	tests := []struct {
+		name    string
+		params  map[string]any
+		want    int
+		wantMsg string
+	}{
+		{
+			name:    "missing uri under the initialize handshake",
+			params:  map[string]any{},
+			want:    jsonrpc.CodeResourceNotFound,
+			wantMsg: "Missing [uri] parameter.",
+		},
+		{
+			name:    "unregistered uri under the initialize handshake",
+			params:  map[string]any{"uri": "file://nope"},
+			want:    jsonrpc.CodeResourceNotFound,
+			wantMsg: "Resource [file://nope] not found.",
+		},
+		{
+			name:    "missing uri under the discovery handshake",
+			params:  discovery,
+			want:    jsonrpc.CodeInvalidParams,
+			wantMsg: "Missing [uri] parameter.",
+		},
+		{
+			name:    "unregistered uri under the discovery handshake",
+			params:  merge(discovery, map[string]any{"uri": "file://nope"}),
+			want:    jsonrpc.CodeInvalidParams,
+			wantMsg: "Resource [file://nope] not found.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := ctxWith(server.WithResources(docResource{}))
+			resp, _ := ReadResource{}.Handle(c, req(t, 1, "resources/read", tt.params))
+			if resp.Error == nil {
+				t.Fatalf("resp = %+v, want an error", resp)
+			}
+			if resp.Error.Code != tt.want {
+				t.Fatalf("code = %d, want %d", resp.Error.Code, tt.want)
+			}
+			if resp.Error.Message != tt.wantMsg {
+				t.Fatalf("message = %q, want %q", resp.Error.Message, tt.wantMsg)
+			}
+		})
 	}
 }
 
-func TestReadResourceNotFound(t *testing.T) {
-	c := ctxWith(server.WithResources(docResource{}))
-	resp, _ := ReadResource{}.Handle(c, req(t, 1, "resources/read", map[string]any{"uri": "file://nope"}))
-	if resp.Error == nil || resp.Error.Code != jsonrpc.CodeResourceNotFound {
-		t.Fatalf("expected resource not found, got %+v", resp.Error)
+// merge returns the union of two params maps, with the second winning on a
+// shared key. It leaves both inputs untouched so a table can share one base.
+func merge(base, extra map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(extra))
+	for k, v := range base {
+		out[k] = v
 	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
 }
 
 func TestListResources(t *testing.T) {
@@ -701,7 +761,8 @@ func TestInitializeMethodHandler(t *testing.T) {
 func TestDefaultMethodsComplete(t *testing.T) {
 	m := defaultMethods()
 	want := []string{
-		"initialize", "ping", "tools/list", "tools/call",
+		"initialize", "server/discover", "subscriptions/listen",
+		"ping", "tools/list", "tools/call",
 		"resources/list", "resources/read", "resources/templates/list",
 		"prompts/list", "prompts/get", "completion/complete",
 	}

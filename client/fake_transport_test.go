@@ -39,7 +39,9 @@ func newFakeTransport() *fakeTransport {
 	}
 	f.handlers["initialize"] = func(id jsonrpc.ID, _ json.RawMessage) *jsonrpc.Response {
 		resp, _ := jsonrpc.NewResult(id, map[string]any{
-			"protocolVersion": server.LatestProtocolVersion,
+			// The initialize handshake negotiates only over the legacy
+			// revisions; the latest revision opens with server/discover.
+			"protocolVersion": server.InitializeSupportedVersions()[0],
 			"capabilities":    map[string]any{},
 			"serverInfo":      map[string]any{"name": "fake", "version": "1.0.0"},
 			"instructions":    "be helpful",

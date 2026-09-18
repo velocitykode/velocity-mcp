@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 )
 
 // errTrailingData is returned by strictUnmarshal when content follows the first
@@ -19,6 +20,8 @@ const (
 	msgMissingMethodReq = "Invalid Request: The [method] member is required and must be a string."
 	msgMissingMethodNtf = "Invalid Request: Invalid or missing [method]. Must be a string."
 	msgInvalidNtfVer    = "Invalid Request: Invalid JSON-RPC version. Must be [2.0]."
+	msgInvalidParams    = "Invalid params: The [params] member must be an object."
+	msgResultWithoutID  = "Invalid Response: A [result] must carry the [id] of the request it answers."
 )
 
 // envelope is the permissive shape used to inspect any incoming JSON-RPC
@@ -100,6 +103,10 @@ func ParseRequest(data []byte) (*Request, ID, *Error) {
 		return nil, id, NewError(CodeInvalidRequest, msgMissingMethodReq)
 	}
 
+	if env.has("params") && !isParamsObject(env.raw("params")) {
+		return nil, id, NewError(CodeInvalidParams, msgInvalidParams)
+	}
+
 	return &Request{
 		JSONRPC: Version,
 		ID:      id,
@@ -125,6 +132,10 @@ func ParseNotification(data []byte) (*Notification, *Error) {
 	method, ok := stringValue(env.raw("method"))
 	if !ok {
 		return nil, NewError(CodeInvalidRequest, msgMissingMethodNtf)
+	}
+
+	if env.has("params") && !isParamsObject(env.raw("params")) {
+		return nil, NewError(CodeInvalidParams, msgInvalidParams)
 	}
 
 	return &Notification{
@@ -160,6 +171,16 @@ func ParseResponse(data []byte) (*Response, *Error) {
 		return nil, NewError(CodeInvalidRequest, "Invalid Response: exactly one of [result] or [error] must be present.")
 	}
 
+	// A reply names the call it answers. The specification requires the id of
+	// the request on every response and allows it to be absent only where the
+	// id could not be read at all, which is to say on a failure correlated to
+	// nothing. A result stating none answers no call a caller made, so it is
+	// refused here rather than handed on under a null id that a caller matching
+	// on ids could take for an uncorrelated reply it may act on.
+	if hasResult && !env.has("id") {
+		return nil, NewError(CodeInvalidRequest, msgResultWithoutID)
+	}
+
 	resp := &Response{JSONRPC: Version, Result: cloneRaw(env.raw("result")), Error: rpcErr}
 	if env.has("id") {
 		resp.ID = ID{raw: cloneRaw(env.raw("id"))}
@@ -177,8 +198,14 @@ func strictUnmarshal(data []byte, v any) error {
 	if err := dec.Decode(v); err != nil {
 		return err
 	}
-	// Reject any non-whitespace trailing content (e.g. a second JSON value).
-	if dec.More() {
+	// Reject any non-whitespace trailing content, whether it is a second JSON
+	// value or a stray token. Decoding again is what settles it: only an input
+	// that ends after the first value reports io.EOF. Asking the decoder
+	// whether there is More would not do, because it answers no for a trailing
+	// "]" or "}" (the tokens that end a value it is not inside), leaving those
+	// bodies to parse as if the garbage were not there.
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return errTrailingData
 	}
 	return nil
@@ -196,17 +223,44 @@ func versionIs20(raw json.RawMessage) bool {
 	return s == Version
 }
 
+// isParamsObject reports whether a present [params] member carries a structured
+// value the protocol accepts. The MCP specification models params as an object,
+// so a JSON object is the canonical form; an empty JSON array is also accepted
+// because some encoders render an empty map that way, and it decodes to the
+// same empty parameter set. Any other value (null, a string, a number, a
+// non-empty array) is rejected.
+func isParamsObject(raw json.RawMessage) bool {
+	t := bytes.TrimSpace(raw)
+	switch {
+	case bytes.HasPrefix(t, []byte("{")):
+		return json.Valid(t)
+	case bytes.HasPrefix(t, []byte("[")):
+		// A lone "[" is not valid JSON, so the slice below is only reached for a
+		// token carrying both brackets.
+		return json.Valid(t) && len(bytes.TrimSpace(t[1:len(t)-1])) == 0
+	default:
+		return false
+	}
+}
+
 // stringValue extracts a non-null JSON string from raw, reporting ok=false when
 // the member is absent, null, or any other JSON type.
+//
+// The token is decoded as a free-form value and then required to be a string.
+// Decoding straight into a string would report success for a JSON null, which
+// encoding/json leaves the destination untouched for, so a message stating
+// "method": null would be read as a request naming the empty method instead of
+// the invalid request it is.
 func stringValue(raw json.RawMessage) (string, bool) {
 	if len(raw) == 0 {
 		return "", false
 	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
 		return "", false
 	}
-	return s, true
+	s, ok := value.(string)
+	return s, ok
 }
 
 // cloneRaw returns an independent copy of a raw JSON token, or nil when empty.

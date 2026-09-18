@@ -78,6 +78,11 @@ type Server struct {
 	maxPageSize     int
 	defaultPageSize int
 
+	// cacheHint is the server-wide caching advice (nil means the zero hint) and
+	// methodCacheHints overrides it per cacheable operation. See caching.go.
+	cacheHint        *CacheHint
+	methodCacheHints map[string]CacheHint
+
 	logger contract.Logger
 
 	// dispatcher holds the framework event dispatcher func. Stored atomically
@@ -92,6 +97,11 @@ type Server struct {
 	// methods is the resolved per-server method set, built once at construction
 	// from the installed factory plus the directly-implemented methods.
 	methods map[string]Method
+
+	// customMethods holds the handlers registered with WithMethod. They are
+	// overlaid on the factory set, so a custom handler replaces a built-in of
+	// the same name.
+	customMethods map[string]Method
 }
 
 // dispatcherHolder boxes the dispatcher func so atomic.Pointer can store the
@@ -122,6 +132,7 @@ func New(name, version string, opts ...Option) *Server {
 			opt(s)
 		}
 	}
+	s.detectUICapability()
 	s.methods = s.buildMethods()
 	return s
 }
@@ -147,6 +158,11 @@ func (s *Server) buildMethods() map[string]Method {
 		for name, m := range (*p)() {
 			out[name] = m
 		}
+	}
+	// Handlers registered with WithMethod are overlaid last so they replace a
+	// built-in of the same name.
+	for name, m := range s.customMethods {
+		out[name] = m
 	}
 	return out
 }
@@ -200,6 +216,8 @@ func (s *Server) createContext(ctx context.Context, sessionID string, emit func(
 	c.prompts = s.prompts
 	c.maxPageSize = s.maxPageSize
 	c.defaultPageSize = s.defaultPageSize
+	c.cacheHint = s.cacheHint
+	c.methodCacheHints = s.methodCacheHints
 	c.sessionID = sessionID
 	c.withRequestContext(ctx)
 	c.withEmitter(emit)

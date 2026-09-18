@@ -82,6 +82,22 @@ func (s *Server) handle(ctx context.Context, raw []byte, sessionID string, emit 
 
 	sc := s.createContext(ctx, sessionID, emit)
 
+	// A discovery-handshake request restates the protocol version and the
+	// client capabilities in its own params._meta; a legacy request carries
+	// neither and is exempt. The check precedes method dispatch so a request
+	// made under a version the server does not speak never reaches a handler.
+	if perr := validateProtocolMeta(sc, req); perr != nil {
+		return HandleResult{Response: jsonrpc.NewErrorResponse(req.ID, perr), HasResponse: true}
+	}
+
+	return applyResultEnvelope(sc, req, s.route(ctx, sc, req, sessionID))
+}
+
+// route dispatches a parsed request to its handler: the special initialize path
+// (which assigns a session id and dispatches SessionInitialized), the
+// tools/call path (which dispatches the tool events), or a plain method
+// lookup. An unknown method is a MethodNotFound error response.
+func (s *Server) route(ctx context.Context, sc *Context, req *jsonrpc.Request, sessionID string) HandleResult {
 	if req.Method == "initialize" {
 		return s.handleInitialize(ctx, sc, req)
 	}
@@ -92,6 +108,13 @@ func (s *Server) handle(ctx context.Context, raw []byte, sessionID string, emit 
 			Response:    jsonrpc.NewErrorResponseCode(req.ID, jsonrpc.CodeMethodNotFound, "The method ["+req.Method+"] was not found."),
 			HasResponse: true,
 		}
+	}
+
+	// The argument bag is shaped once here, after the method is known and before
+	// it runs, so every primitive handler that reads one is reached with an
+	// object or not at all.
+	if aerr := validateArguments(req); aerr != nil {
+		return HandleResult{Response: jsonrpc.NewErrorResponse(req.ID, aerr), HasResponse: true}
 	}
 
 	if req.Method == "tools/call" {
@@ -149,11 +172,14 @@ func (s *Server) handleInitialize(ctx context.Context, sc *Context, req *jsonrpc
 		res.SessionID = sessionID
 
 		params := decodeParams(req.Params)
-		sc.SetNegotiatedVersion(stringParam(params, "protocolVersion"))
+		// The version reported is the one the handler settled on, read back from
+		// the context it recorded it in, not the one the client asked for: the
+		// two differ whenever the request names a version the handshake does not
+		// offer, and the event documents the negotiated version.
 		s.dispatch(ctx, event.SessionInitialized{
 			SessionID:          sessionID,
 			ClientInfo:         clientInfoFromParams(params),
-			ProtocolVersion:    stringParam(params, "protocolVersion"),
+			ProtocolVersion:    sc.NegotiatedVersion(),
 			ClientCapabilities: mapParam(params, "capabilities"),
 		})
 	}

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -22,11 +23,10 @@ func TestNewDefaults(t *testing.T) {
 			t.Fatalf("default capability %q missing", cap)
 		}
 	}
-	if len(c.SupportedProtocolVersions()) != 4 {
-		t.Fatalf("default versions = %v", c.SupportedProtocolVersions())
-	}
-	if c.SupportedProtocolVersions()[0] != LatestProtocolVersion {
-		t.Fatal("first supported version should be the latest")
+	// The advertised set is what server/discover publishes and what a request's
+	// protocol metadata is checked against: the current revision only.
+	if got := c.SupportedProtocolVersions(); len(got) != 1 || got[0] != LatestProtocolVersion {
+		t.Fatalf("default versions = %v, want [%s]", got, LatestProtocolVersion)
 	}
 }
 
@@ -107,19 +107,27 @@ func TestHandleFallbackInitialize(t *testing.T) {
 	}
 }
 
-func TestHandleUnsupportedVersion(t *testing.T) {
+// TestHandleInitializeUnknownVersion asserts that the legacy handshake never
+// fails on the requested version: a client asking for a revision the handshake
+// does not offer is answered with the newest one it does offer, and the session
+// is established anyway.
+func TestHandleInitializeUnknownVersion(t *testing.T) {
 	s := New("demo", "1.0.0")
+	s.SetSessionIDGenerator(func() string { return "sess-1" })
 	raw := []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}`)
 	res := s.Handle(context.Background(), raw, "")
-	if res.Response.Error == nil {
-		t.Fatal("expected an error for unsupported version")
+	if res.Response.Error != nil {
+		t.Fatalf("unexpected error: %+v", res.Response.Error)
 	}
-	if res.Response.Error.Code != jsonrpc.CodeInvalidParams {
-		t.Fatalf("error code = %d", res.Response.Error.Code)
+	var result map[string]any
+	if err := json.Unmarshal(res.Response.Result, &result); err != nil {
+		t.Fatalf("decode result: %v", err)
 	}
-	// No session is assigned on a failed initialize.
-	if res.SessionID != "" {
-		t.Fatalf("session id should be empty on failure, got %q", res.SessionID)
+	if want := InitializeSupportedVersions()[0]; result["protocolVersion"] != want {
+		t.Fatalf("protocolVersion = %v, want %q", result["protocolVersion"], want)
+	}
+	if res.SessionID != "sess-1" {
+		t.Fatalf("session id = %q", res.SessionID)
 	}
 }
 

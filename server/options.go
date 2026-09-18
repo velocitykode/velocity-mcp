@@ -119,14 +119,40 @@ func WithCapability(key string, value ...bool) Option {
 	}
 }
 
-// WithProtocolVersions overrides the supported protocol version list. The order
-// is significant: the first element is the negotiation fallback. An empty list
-// is ignored (the defaults are retained).
+// WithProtocolVersions overrides the protocol versions the server advertises
+// through server/discover and accepts in a request's params._meta (a version
+// outside the list is answered with CodeUnsupportedProtocolVersion). It does
+// not narrow the legacy initialize handshake, which negotiates over the fixed
+// InitializeSupportedVersions set. An empty list is ignored (the defaults are
+// retained).
 func WithProtocolVersions(versions ...ProtocolVersion) Option {
 	return func(s *Server) {
 		if len(versions) > 0 {
 			s.versions = append([]ProtocolVersion(nil), versions...)
 		}
+	}
+}
+
+// WithCacheHint sets the caching advice the server attaches to the results of
+// every cacheable operation ("server/discover", "tools/list", "prompts/list",
+// "resources/list", "resources/templates/list", "resources/read"). Without it a
+// server advertises the conservative zero hint: no lifetime, private scope.
+//
+// Use WithMethodCacheHint to override one operation, and implement Cacheable on
+// a resource to override the read of that resource.
+func WithCacheHint(hint CacheHint) Option {
+	return func(s *Server) { s.cacheHint = &hint }
+}
+
+// WithMethodCacheHint sets the caching advice for one operation, overriding
+// WithCacheHint for it. A method that carries no caching hints at all (anything
+// but the six cacheable operations) is unaffected.
+func WithMethodCacheHint(method string, hint CacheHint) Option {
+	return func(s *Server) {
+		if s.methodCacheHints == nil {
+			s.methodCacheHints = map[string]CacheHint{}
+		}
+		s.methodCacheHints[method] = hint
 	}
 }
 

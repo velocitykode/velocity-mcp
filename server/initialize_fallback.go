@@ -18,30 +18,22 @@ func (initializeMethod) Handle(c *Context, req *jsonrpc.Request) (*jsonrpc.Respo
 }
 
 // Initialize is the shared initialize negotiation used by both the fallback and
-// the methods package, so the two never drift. An explicit unsupported version
-// is an InvalidParams (-32602) error with {supported, requested} data; otherwise the
-// negotiated version is the requested one (when supported) or the server's
-// first supported version.
+// the methods package, so the two never drift.
+//
+// The initialize handshake is the legacy opening exchange, so it negotiates
+// only over InitializeSupportedVersions: a client asking for one of those
+// versions is answered with it, and any other request (an unknown version, a
+// non-string value, or no version at all) is answered with the newest version
+// the handshake offers. The negotiation never fails, because a client that
+// cannot speak an offered version simply closes the connection; a client that
+// speaks the discovery revision opens with server/discover instead.
 func Initialize(c *Context, req *jsonrpc.Request) (*jsonrpc.Response, error) {
 	params := decodeParams(req.Params)
-	supported := c.SupportedProtocolVersions()
+	offered := InitializeSupportedVersions()
 
-	requested, hasRequested := params["protocolVersion"].(string)
-	if hasRequested && !containsVersion(supported, requested) {
-		return jsonrpc.NewErrorResponse(req.ID,
-			jsonrpc.NewError(jsonrpc.CodeInvalidParams, "Unsupported protocol version").
-				WithData(map[string]any{
-					"supported": supported,
-					"requested": requested,
-				}),
-		), nil
-	}
-
-	negotiated := requested
-	if !hasRequested {
-		if len(supported) > 0 {
-			negotiated = supported[0]
-		}
+	negotiated := offered[0]
+	if requested, ok := params["protocolVersion"].(string); ok && containsVersion(offered, requested) {
+		negotiated = requested
 	}
 	c.SetNegotiatedVersion(negotiated)
 
