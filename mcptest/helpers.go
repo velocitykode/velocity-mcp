@@ -60,28 +60,31 @@ func dedupeNonEmpty(in []string) []string {
 	return out
 }
 
-// jsonEqual reports whether a and b are equal once normalised through JSON
-// (so an int literal and the float64 a JSON decode produces compare equal).
+// jsonEqual reports whether a and b are the same JSON document once both are
+// serialized (so an int literal and the float64 a JSON decode produces compare
+// equal). Either side may be a json.RawMessage, in which case the bytes the
+// server wrote are what is compared: see comparableJSON in jsonvalue.go for how
+// numbers are judged.
 func jsonEqual(a, b any) bool {
-	ab, err := json.Marshal(a)
-	if err != nil {
-		return false
-	}
-	bb, err := json.Marshal(b)
-	if err != nil {
-		return false
-	}
-	var an, bn any
-	if json.Unmarshal(ab, &an) != nil || json.Unmarshal(bb, &bn) != nil {
-		return false
-	}
-	xb, _ := json.Marshal(an)
-	yb, _ := json.Marshal(bn)
-	return string(xb) == string(yb)
+	an, aok := comparableJSON(a)
+	bn, bok := comparableJSON(b)
+	return aok && bok && an == bn
 }
 
 // jsonUnmarshal is a thin alias so response.go does not import encoding/json
 // directly (keeping the JSON dependency localised to this helpers file).
 func jsonUnmarshal(data []byte, v any) error {
 	return json.Unmarshal(data, v)
+}
+
+// jsonString renders a value as compact JSON for a failure message. A value that
+// cannot be encoded (never produced by a decoded reply, but possible for a
+// caller-supplied expectation) renders as a fixed marker so an assertion still
+// reports something deterministic instead of panicking.
+func jsonString(v any) string {
+	b, err := encodeJSON(v)
+	if err != nil {
+		return "<unencodable value>"
+	}
+	return string(b)
 }

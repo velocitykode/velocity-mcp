@@ -23,6 +23,13 @@ type Response struct {
 	// result is the decoded "result" object of a success reply, or nil for an
 	// error reply or a reply with no result. Decoded once at construction.
 	result map[string]any
+	// raw holds the same result object with its members in their wire form, so
+	// value assertions compare exactly what the server wrote (see jsonvalue.go).
+	raw rawFields
+	// notifications are the server-initiated frames the handler emitted while
+	// the message was being processed, in order. Populated by
+	// Server.withNotifications (see notifications.go).
+	notifications []*jsonrpc.Notification
 }
 
 // newResponse builds a Response, decoding the reply's result object once.
@@ -32,6 +39,7 @@ func newResponse(t testing.TB, method string, resp *jsonrpc.Response) *Response 
 		method: method,
 		resp:   resp,
 		result: decodeResultObject(resp),
+		raw:    decodeResultFields(resp),
 	}
 }
 
@@ -59,8 +67,8 @@ func (r *Response) AssertOk() *Response {
 	if r.t != nil {
 		r.t.Helper()
 	}
-	if errs := r.errors(); len(errs) > 0 {
-		r.fatalf("mcptest: %s: expected no errors, got: %s", r.method, strings.Join(errs, "; "))
+	if r.hasError() {
+		r.fatalf("mcptest: %s: expected no errors, got: %s", r.method, describeErrors(r.errors()))
 	}
 	return r
 }
@@ -72,14 +80,14 @@ func (r *Response) AssertError(messages ...string) *Response {
 	if r.t != nil {
 		r.t.Helper()
 	}
-	errs := r.errors()
-	if len(errs) == 0 {
+	if !r.hasError() {
 		r.fatalf("mcptest: %s: expected an error, but the reply has none", r.method)
 		return r
 	}
+	errs := r.errors()
 	for _, want := range messages {
 		if !containsAny(errs, want) {
-			r.fatalf("mcptest: %s: expected error containing %q, got: %s", r.method, want, strings.Join(errs, "; "))
+			r.fatalf("mcptest: %s: expected error containing %q, got: %s", r.method, want, describeErrors(errs))
 		}
 	}
 	return r
@@ -167,13 +175,13 @@ func (r *Response) AssertResult(key string, want any) *Response {
 		r.fatalf("mcptest: %s: expected a result object with key %q, but the reply has no result", r.method, key)
 		return r
 	}
-	got, ok := r.result[key]
+	got, ok := r.rawResultPath(key)
 	if !ok {
 		r.fatalf("mcptest: %s: result is missing key %q", r.method, key)
 		return r
 	}
 	if !jsonEqual(got, want) {
-		r.fatalf("mcptest: %s: result[%q] = %#v, want %#v", r.method, key, got, want)
+		r.fatalf("mcptest: %s: result[%q] = %s, want %s", r.method, key, describeJSON(got), jsonString(want))
 	}
 	return r
 }
@@ -200,28 +208,24 @@ func (r *Response) AssertServerName(name string) *Response {
 	return r
 }
 
-// AssertToolListed asserts a tools/list reply includes a tool with the given
-// name.
-func (r *Response) AssertToolListed(name string) *Response {
+// AssertToolListed asserts a tools/list reply includes a tool with each of the
+// given names. Called with no names it asserts only that the reply carries a
+// tool list, which an error reply or another method's reply does not.
+func (r *Response) AssertToolListed(names ...string) *Response {
 	if r.t != nil {
 		r.t.Helper()
 	}
-	if !r.listContainsName("tools", name) {
-		r.fatalf("mcptest: %s: tool %q was not listed; listed: %s", r.method, name, strings.Join(r.listedNames("tools"), ", "))
-	}
-	return r
+	return r.assertListed("tools", "tool", names)
 }
 
 // AssertToolNotListed asserts a tools/list reply does NOT include a tool with
-// the given name.
-func (r *Response) AssertToolNotListed(name string) *Response {
+// any of the given names. Called with no names it asserts only that the reply
+// carries a tool list.
+func (r *Response) AssertToolNotListed(names ...string) *Response {
 	if r.t != nil {
 		r.t.Helper()
 	}
-	if r.listContainsName("tools", name) {
-		r.fatalf("mcptest: %s: tool %q was listed but should not have been", r.method, name)
-	}
-	return r
+	return r.assertNotListed("tools", "tool", names)
 }
 
 // AssertToolCount asserts a tools/list reply lists exactly n tools.
@@ -229,39 +233,63 @@ func (r *Response) AssertToolCount(n int) *Response {
 	if r.t != nil {
 		r.t.Helper()
 	}
-	if got := len(r.listItems("tools")); got != n {
-		r.fatalf("mcptest: %s: listed %d tools, want %d", r.method, got, n)
-	}
-	return r
+	return r.assertListCount("tools", "tools", n)
 }
 
 // AssertResourceListed asserts a resources/list reply includes a resource with
-// the given name.
-func (r *Response) AssertResourceListed(name string) *Response {
+// each of the given names. Called with no names it asserts only that the reply
+// carries a resource list.
+func (r *Response) AssertResourceListed(names ...string) *Response {
 	if r.t != nil {
 		r.t.Helper()
 	}
-	if !r.listContainsName("resources", name) {
-		r.fatalf("mcptest: %s: resource %q was not listed; listed: %s", r.method, name, strings.Join(r.listedNames("resources"), ", "))
-	}
-	return r
+	return r.assertListed("resources", "resource", names)
 }
 
-// AssertPromptListed asserts a prompts/list reply includes a prompt with the
-// given name.
-func (r *Response) AssertPromptListed(name string) *Response {
+// AssertPromptListed asserts a prompts/list reply includes a prompt with each of
+// the given names. Called with no names it asserts only that the reply carries a
+// prompt list.
+func (r *Response) AssertPromptListed(names ...string) *Response {
 	if r.t != nil {
 		r.t.Helper()
 	}
-	if !r.listContainsName("prompts", name) {
-		r.fatalf("mcptest: %s: prompt %q was not listed; listed: %s", r.method, name, strings.Join(r.listedNames("prompts"), ", "))
+	return r.assertListed("prompts", "prompt", names)
+}
+
+// hasError reports whether the reply carries an error at all: a protocol-level
+// JSON-RPC error object, or a success result flagged isError:true. It is read
+// from the envelope alone, never from the messages errors() can extract: the
+// MCP specification makes the isError flag the statement that the call failed,
+// and a failing tool is free to return it with no content, or with content
+// whose text is empty. Deriving presence from the message set would read such a
+// reply as untroubled.
+func (r *Response) hasError() bool {
+	if r.resp != nil && r.resp.Error != nil {
+		return true
 	}
-	return r
+	if r.result != nil {
+		isErr, _ := r.result["isError"].(bool)
+		return isErr
+	}
+	return false
+}
+
+// describeErrors renders an error message set for a failure message, naming the
+// message-less case explicitly rather than printing an empty string: a reply
+// flagged isError:true with no usable content still failed, and the report has
+// to say so.
+func describeErrors(errs []string) string {
+	if len(errs) == 0 {
+		return "(no message)"
+	}
+	return strings.Join(errs, "; ")
 }
 
 // errors returns the human-readable error messages for the reply: a
 // protocol-level error message, or (when the tool result carries isError:true)
-// the tool content messages.
+// the tool content messages. It reports what can be shown, not whether the reply
+// failed: hasError settles that. Every return builds a fresh slice, which is
+// what lets the exported Errors hand its result to a caller to keep.
 func (r *Response) errors() []string {
 	if r.resp != nil && r.resp.Error != nil {
 		return []string{r.resp.Error.Message}

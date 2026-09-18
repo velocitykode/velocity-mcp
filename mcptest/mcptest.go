@@ -111,21 +111,37 @@ func (s *Server) CallTool(name string, arguments map[string]any) *Response {
 }
 
 // ListTools requests the tool catalogue (tools/list) and returns the reply for
-// assertions (AssertToolListed, ...).
+// assertions (AssertToolListed, ...). Pagination is followed to the end, so the
+// reply carries every registered tool and not just the first page (see list.go).
+// A reply that carries no result at all (an error reply, or a method the server
+// does not serve) ends the walk and is handed back as it arrived, so the error
+// assertions read it while the registration assertions refuse it rather than
+// reading it as an empty catalogue.
 func (s *Server) ListTools() *Response {
-	return s.call("tools/list", map[string]any{})
+	if s.t != nil {
+		s.t.Helper()
+	}
+	return s.listAll("tools/list", "tools")
 }
 
-// ListResources requests the resource catalogue (resources/list) and returns
-// the reply for assertions (AssertResourceListed, ...).
+// ListResources requests the resource catalogue (resources/list), following
+// pagination, and returns the merged reply for assertions
+// (AssertResourceListed, ...).
 func (s *Server) ListResources() *Response {
-	return s.call("resources/list", map[string]any{})
+	if s.t != nil {
+		s.t.Helper()
+	}
+	return s.listAll("resources/list", "resources")
 }
 
-// ListPrompts requests the prompt catalogue (prompts/list) and returns the
-// reply for assertions (AssertPromptListed, ...).
+// ListPrompts requests the prompt catalogue (prompts/list), following
+// pagination, and returns the merged reply for assertions (AssertPromptListed,
+// ...).
 func (s *Server) ListPrompts() *Response {
-	return s.call("prompts/list", map[string]any{})
+	if s.t != nil {
+		s.t.Helper()
+	}
+	return s.listAll("prompts/list", "prompts")
 }
 
 // ReadResource reads a resource by uri (resources/read) and returns the reply
@@ -179,6 +195,7 @@ func (s *Server) Notify(method string, params map[string]any) *Response {
 		s.fatalf("mcptest: marshal notification %q: %v", method, err)
 		return newResponse(s.t, method, nil)
 	}
+	sentBefore := s.sentCount()
 	reply, err := s.fake.Inject(s.ctx, raw)
 	if err != nil {
 		s.fatalf("mcptest: drive notification %q through fake transport: %v", method, err)
@@ -189,7 +206,7 @@ func (s *Server) Notify(method string, params map[string]any) *Response {
 		s.fatalf("mcptest: decode reply for notification %q: %v", method, err)
 		return newResponse(s.t, method, nil)
 	}
-	return newResponse(s.t, method, resp)
+	return s.withNotifications(sentBefore, newResponse(s.t, method, resp))
 }
 
 // call marshals a JSON-RPC request for method/params, drives it through the Fake
@@ -222,6 +239,7 @@ func (s *Server) call(method string, params map[string]any) *Response {
 		return newResponse(s.t, method, nil)
 	}
 
+	sentBefore := s.sentCount()
 	reply, err := s.fake.Inject(s.ctx, raw)
 	if err != nil {
 		s.fatalf("mcptest: drive %q through fake transport: %v", method, err)
@@ -233,7 +251,7 @@ func (s *Server) call(method string, params map[string]any) *Response {
 		s.fatalf("mcptest: decode reply for %q: %v", method, err)
 		return newResponse(s.t, method, nil)
 	}
-	return newResponse(s.t, method, resp)
+	return s.withNotifications(sentBefore, newResponse(s.t, method, resp))
 }
 
 // fatalf reports a harness failure through t when present, falling back to a
