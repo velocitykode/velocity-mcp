@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/velocitykode/velocity/validation"
 
@@ -16,6 +17,16 @@ import (
 // messages) is wrapped; recover it with errors.As. Methods turn this into a
 // tool-level error result rather than a transport error.
 var ErrValidation = errors.New("mcp: request validation failed")
+
+// ErrRuleField is returned by Request.Validate when a rule names a field the
+// validation engine and the argument accessors do not resolve to the same
+// value, which the engine's narrower addressing makes possible (see
+// ruleFieldFault). Running such a rule would report a check the handler did not
+// get: the value it then reads is one no rule inspected. The fault is in the
+// server's own rules rather than in the arguments, so this is not a validation
+// failure and does not wrap ErrValidation; the handler surfaces it like any
+// other error.
+var ErrRuleField = errors.New("mcp: validation rule field is not addressable")
 
 // Request carries the arguments of a tool, resource, or prompt invocation: a
 // typed view over the decoded "arguments" object plus session metadata. The
@@ -32,6 +43,12 @@ type Request struct {
 	meta      map[string]any
 	uri       string
 	emit      func(msg []byte) error
+
+	// uriVars names the arguments a resource template bound out of the concrete
+	// uri. The server derived those values from the uri it resolved, so they are
+	// read under exactly the name the template declared and never as a path (see
+	// Request.lookup). Nil for every request that is not a templated read.
+	uriVars map[string]struct{}
 
 	// ctx is the inbound request context threaded from the transport. It backs
 	// User, which reads the authenticated identity off the serving router
@@ -92,6 +109,28 @@ func (r *Request) WithMeta(meta map[string]any) *Request {
 // resources/read).
 func (r *Request) WithURI(uri string) *Request {
 	r.uri = uri
+	return r
+}
+
+// WithURIVariables merges the variables a resource template matched out of the
+// concrete uri into the arguments, and records their names as uri-bound. Those
+// names are then read under exactly the name the template declared: a variable
+// name may carry a dot (RFC 6570 section 2.3), and resolving it as a path would
+// let caller-supplied arguments spelling that path answer in its place. An
+// empty map is a no-op.
+func (r *Request) WithURIVariables(vars map[string]string) *Request {
+	if len(vars) == 0 {
+		return r
+	}
+	values := make(map[string]any, len(vars))
+	if r.uriVars == nil {
+		r.uriVars = make(map[string]struct{}, len(vars))
+	}
+	for name, value := range vars {
+		values[name] = value
+		r.uriVars[name] = struct{}{}
+	}
+	r.merge(values)
 	return r
 }
 
@@ -156,14 +195,45 @@ func (r *Request) All() map[string]any {
 	return out
 }
 
-// Has reports whether the named argument is present (even if null).
+// Has reports whether the named argument is present (even if null). key is an
+// argument name, or a dot path into nested arguments (see Get). It answers
+// exactly when Get finds a value, so an argument Has reports is always
+// readable.
 func (r *Request) Has(key string) bool {
-	_, ok := r.args[key]
-	return ok
+	return r.has(key)
 }
 
-// Get returns the raw argument value for key, or nil when absent.
-func (r *Request) Get(key string) any { return r.args[key] }
+// Get returns the raw argument value for key, or nil when absent. key is an
+// argument name, or a dot path addressing a value inside a nested argument
+// ("user.name", "items.0", "items.*.id"). Dots are separators and a "*" segment
+// is a wildcard; a key that addresses nothing that way is read as the plain
+// name of a top-level argument, so a property an inputSchema declares as
+// "limit.items" is read as it arrived. The path wins when both spellings
+// arrive, so what a handler reads for a path never depends on a peer adding a
+// property whose name spells it; Arg reads the exact name. A variable a
+// resource template bound out of the uri is itself always read under its exact
+// name, so no caller-supplied argument can answer in its place.
+//
+// A key that passed its rules reads back the value those rules saw, because
+// Validate refuses a rule field it would not resolve the same way (see
+// Request.lookup).
+func (r *Request) Get(key string) any {
+	v, _ := r.lookup(key)
+	return v
+}
+
+// Arg returns the argument declared with exactly this name, and whether it was
+// present. The name is never read as a path: dots and "*" are part of it, which
+// is how a property an inputSchema declares as "limit.items" is read when the
+// arguments also carry a nested "limit" object, and how a resource template
+// variable named "user.id" (legal under RFC 6570 section 2.3) is read once the
+// read has merged it into the arguments. A rule field is a path and cannot
+// address such a property, so a value read here is one Validate never checked
+// and the handler checks itself.
+func (r *Request) Arg(name string) (any, bool) {
+	v, ok := r.args[name]
+	return v, ok
+}
 
 // merge adds the given values into the request arguments, used by templated
 // resource reads to inject extracted URI variables. A nil map is a no-op.
@@ -180,9 +250,9 @@ func (r *Request) merge(values map[string]any) {
 }
 
 // StringOK returns the named argument as a string and whether it was present
-// and string-typed.
+// and string-typed. key may be a dot path (see Get).
 func (r *Request) StringOK(key string) (string, bool) {
-	v, ok := r.args[key]
+	v, ok := r.lookup(key)
 	if !ok {
 		return "", false
 	}
@@ -199,9 +269,9 @@ func (r *Request) String(key string) string {
 
 // FloatOK returns the named argument as a float64 and whether it was present
 // and numeric. JSON numbers decode to float64; an integer-valued json.Number or
-// other numeric forms are also accepted.
+// other numeric forms are also accepted. key may be a dot path (see Get).
 func (r *Request) FloatOK(key string) (float64, bool) {
-	v, ok := r.args[key]
+	v, ok := r.lookup(key)
 	if !ok {
 		return 0, false
 	}
@@ -236,9 +306,9 @@ func (r *Request) Int(key string) int64 {
 }
 
 // BoolOK returns the named argument as a bool and whether it was present and
-// boolean-typed.
+// boolean-typed. key may be a dot path (see Get).
 func (r *Request) BoolOK(key string) (bool, bool) {
-	v, ok := r.args[key]
+	v, ok := r.lookup(key)
 	if !ok {
 		return false, false
 	}
@@ -273,7 +343,33 @@ func (r *Request) Bind(dst any) error {
 // ORM stays out of the import graph). On failure it returns an error that wraps
 // ErrValidation and the concrete *validation.ValidationErrors; on success it
 // returns nil.
+//
+// A rule field is a dot path into nested argument objects. The engine walks
+// nested objects only, so it reaches neither an array element ("items.0"), nor
+// the elements a "*" segment collects, nor an argument whose own name spells
+// the field, while the accessors reach all three. A field where that difference
+// shows is refused with an error wrapping ErrRuleField before any rule runs, so
+// a field whose rules passed always reads back the value those rules saw;
+// collections and arguments read by their own name are checked by the handler
+// itself, after reading them.
+//
+// The guarantee covers the field a rule is written for. A rule that names a
+// second field as a parameter (Same, RequiredIf and their kind) resolves that
+// name through the validation engine, on the engine's own terms.
 func (r *Request) Validate(rules validation.Rules) error {
+	// Fields are checked in a stable order: a rule set with more than one
+	// faulty field must name the same one every run.
+	fields := make([]string, 0, len(rules))
+	for field := range rules {
+		fields = append(fields, field)
+	}
+	sort.Strings(fields)
+	for _, field := range fields {
+		if fault := r.ruleFieldFault(field); fault != "" {
+			return fmt.Errorf("%w: %q: %s", ErrRuleField, field, fault)
+		}
+	}
+
 	v := validation.NewValidator()
 	if _, err := v.Validate(r.args, rules); err != nil {
 		return fmt.Errorf("%w: %w", ErrValidation, err)

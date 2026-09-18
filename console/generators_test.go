@@ -30,6 +30,7 @@ func TestGeneratorsScaffold(t *testing.T) {
 		wantType string
 		wantPkg  string
 	}{
+		{"server", "internal/servers/weather_forecast_server.go", "WeatherForecastServer", "servers"},
 		{"tool", "internal/tools/weather_forecast_tool.go", "WeatherForecastTool", "tools"},
 		{"resource", "internal/resources/weather_forecast_resource.go", "WeatherForecastResource", "resources"},
 		{"prompt", "internal/prompts/weather_forecast_prompt.go", "WeatherForecastPrompt", "prompts"},
@@ -73,6 +74,34 @@ func TestGeneratorsScaffold(t *testing.T) {
 	}
 }
 
+// The server generator scaffolds the container the other generators' output is
+// registered on, so its file must name the constructor, the server identity,
+// and the registration entry points a user then fills in.
+func TestServerGeneratorScaffoldsRegistrationEntryPoints(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := genByKind(t, "server").Handle(nil, []string{"WeatherForecast"}); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	src, err := os.ReadFile("internal/servers/weather_forecast_server.go")
+	if err != nil {
+		t.Fatalf("expected generated server: %v", err)
+	}
+	got := string(src)
+	for _, want := range []string{
+		"func NewWeatherForecastServer() *server.Server",
+		`server.New("weather-forecast", "0.0.1",`,
+		"server.WithInstructions(",
+		"server.WithTools(",
+		"server.WithResources(",
+		"server.WithPrompts(",
+		`"github.com/velocitykode/velocity-mcp/server"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("generated server missing %q\n---\n%s", want, got)
+		}
+	}
+}
+
 func TestGeneratorDirOverride(t *testing.T) {
 	t.Chdir(t.TempDir())
 	if err := genByKind(t, "tool").Handle(nil, []string{"Weather", "--dir", "internal/mcp/tools"}); err != nil {
@@ -97,6 +126,37 @@ func TestGeneratorRefusesOverwrite(t *testing.T) {
 	}
 	if err := g.Handle(nil, []string{"Weather"}); err == nil {
 		t.Fatal("second Handle overwrote an existing file, want error")
+	}
+}
+
+// A symlink at the target, dangling or not, must never be written through:
+// the generated source would land wherever it points.
+func TestGeneratorRefusesSymlinkAtTarget(t *testing.T) {
+	for _, dangling := range []bool{false, true} {
+		t.Chdir(t.TempDir())
+		outside := filepath.Join(t.TempDir(), "outside.go")
+		if !dangling {
+			if err := os.WriteFile(outside, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.MkdirAll("internal/tools", 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, "internal/tools/weather_tool.go"); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+
+		if err := genByKind(t, "tool").Handle(nil, []string{"Weather"}); err == nil {
+			t.Fatalf("dangling=%v: generator wrote through a symlink, want error", dangling)
+		}
+		got, err := os.ReadFile(outside)
+		if dangling && !os.IsNotExist(err) {
+			t.Fatalf("dangling=%v: the link's destination was created: %q", dangling, got)
+		}
+		if !dangling && string(got) != "keep" {
+			t.Fatalf("dangling=%v: the link's destination was changed to %q", dangling, got)
+		}
 	}
 }
 
@@ -161,5 +221,35 @@ func TestStubsEmbedded(t *testing.T) {
 			t.Fatalf("stub %s missing template fields", g.stubPath)
 		}
 		_ = filepath.Base(g.stubPath)
+	}
+}
+
+// Every generator must be invocable: a unique name and a description for the
+// help output.
+func TestGeneratorsExposeUniqueNamesAndDescriptions(t *testing.T) {
+	want := map[string]bool{
+		"make:mcp-server":   false,
+		"make:mcp-tool":     false,
+		"make:mcp-resource": false,
+		"make:mcp-prompt":   false,
+	}
+	for _, c := range Generators() {
+		name := c.Name()
+		seen, known := want[name]
+		if !known {
+			t.Fatalf("unexpected generator %q", name)
+		}
+		if seen {
+			t.Fatalf("generator %q registered twice", name)
+		}
+		want[name] = true
+		if c.Description() == "" {
+			t.Fatalf("generator %q has no description", name)
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Fatalf("generator %q not registered", name)
+		}
 	}
 }

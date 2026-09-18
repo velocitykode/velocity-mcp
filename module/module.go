@@ -154,11 +154,12 @@ func (m *Module) Routes(r *chain.Routing) {
 }
 
 // Commands implements chain.CommandModule: it registers the MCP code
-// generators (make:mcp-tool, make:mcp-resource, make:mcp-prompt) plus the
-// runtime commands bound to the served server (mcp:start to serve over stdio,
-// mcp:inspect to list registered primitives), so an app that adds this module
-// gets all of them under `vel run ...`. The generators are server-independent;
-// the runtime commands operate on m.srv.
+// generators (make:mcp-server, make:mcp-tool, make:mcp-resource,
+// make:mcp-prompt) plus the runtime commands bound to the served server
+// (mcp:start to serve over stdio, mcp:inspect to list registered primitives,
+// mcp:inspector to open the MCP Inspector against it), so an app that adds this
+// module gets all of them under `vel run ...`. The generators are
+// server-independent; the runtime commands operate on m.srv.
 func (m *Module) Commands(r *chain.Commands) {
 	r.Add(console.Generators()...)
 	r.Add(console.ServerCommands(m.srv)...)

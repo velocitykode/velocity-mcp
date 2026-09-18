@@ -39,14 +39,11 @@ func (ReadResource) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Re
 		return jsonrpc.NewErrorResponseCode(req.ID, unresolved, "Resource ["+uri+"] not found."), nil
 	}
 
-	args := p.arguments()
-	for k, v := range vars {
-		args[k] = v
-	}
-	request := server.NewRequest(args).
+	request := server.NewRequest(p.arguments()).
 		WithSessionID(c.SessionID()).
 		WithMeta(p.mapValue("_meta")).
 		WithURI(uri).
+		WithURIVariables(vars).
 		WithEmitter(c.Emit).
 		WithRequestContext(c.RequestContext())
 

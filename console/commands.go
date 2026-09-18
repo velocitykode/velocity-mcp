@@ -16,13 +16,15 @@ import (
 )
 
 // ServerCommands returns the runtime MCP commands bound to srv: mcp:start (serve
-// over stdio) and mcp:inspect (list the registered primitives). They need a live
-// server, so a module builds them from the server it serves (see
-// module.Module.Commands). srv must be non-nil.
+// over stdio), mcp:inspect (list the registered primitives), and mcp:inspector
+// (open the MCP Inspector against the server). They need a live server, so a
+// module builds them from the server it serves (see module.Module.Commands).
+// srv must be non-nil.
 func ServerCommands(srv *server.Server) []chain.Command {
 	return []chain.Command{
 		startCommand{srv: srv},
 		inspectCommand{srv: srv, out: os.Stdout},
+		inspectorCommand{srv: srv, out: os.Stdout, run: runInspectorProcess, ask: promptForValue, binary: projectBinary},
 	}
 }
 

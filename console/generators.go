@@ -22,7 +22,7 @@ var stubFS embed.FS
 type generator struct {
 	command     string // invoked as: vel run <command>
 	description string
-	kind        string // "tool" | "resource" | "prompt"
+	kind        string // "server" | "tool" | "resource" | "prompt"
 	defaultDir  string // default output directory, overridable with --dir
 	stubPath    string // embedded stub file
 	typeSuffix  string // appended to the derived Pascal name (e.g. "Tool")
@@ -33,6 +33,14 @@ type generator struct {
 // module.Module.Commands), after which they run as `vel run make:mcp-...`.
 func Generators() []chain.Command {
 	return []chain.Command{
+		generator{
+			command:     "make:mcp-server",
+			description: "Generate an MCP server",
+			kind:        "server",
+			defaultDir:  "internal/servers",
+			stubPath:    "stubs/server.go.stub",
+			typeSuffix:  "Server",
+		},
 		generator{
 			command:     "make:mcp-tool",
 			description: "Generate an MCP tool",

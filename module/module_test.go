@@ -174,6 +174,7 @@ func TestModule_CommandsRegistersGenerators(t *testing.T) {
 	New(newTestServer()).Commands(r)
 
 	want := map[string]bool{
+		"make:mcp-server":   false,
 		"make:mcp-tool":     false,
 		"make:mcp-resource": false,
 		"make:mcp-prompt":   false,
@@ -187,5 +188,33 @@ func TestModule_CommandsRegistersGenerators(t *testing.T) {
 		if !found {
 			t.Fatalf("generator %q not registered", name)
 		}
+	}
+}
+
+// The endpoint speaks POST only. A client probing it with GET (to open a
+// stream) or DELETE (to end a session) must be told the method is wrong,
+// not that the endpoint does not exist: 404 on this endpoint means the
+// session is gone, and a client acts on that.
+func TestModule_EndpointRefusesOtherMethodsWith405(t *testing.T) {
+	r := router.NewV2()
+	routing := chain.NewRouting(r, chain.NewMiddlewareStack(&velapp.Services{}))
+	New(newTestServer()).Routes(routing)
+
+	for _, method := range []string{http.MethodGet, http.MethodDelete, http.MethodPut} {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(method, DefaultPath, nil))
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s: status = %d, want 405", method, DefaultPath, rec.Code)
+		}
+		if got := rec.Header().Get("Allow"); got != http.MethodPost {
+			t.Errorf("%s %s: Allow = %q, want %q", method, DefaultPath, got, http.MethodPost)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, DefaultPath+"/nope", nil))
+	if rec.Code != http.StatusNotFound || rec.Header().Get("Allow") != "" {
+		t.Errorf("unknown path: status = %d Allow=%q, want 404 without Allow", rec.Code, rec.Header().Get("Allow"))
 	}
 }

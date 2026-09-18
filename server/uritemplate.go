@@ -16,6 +16,12 @@ import "strings"
 // 6570 implementation: MCP resource templates in practice use only simple {var}
 // expansion, and pulling a heavyweight URI-template library would violate the
 // leaf/light dependency goals of this package.
+//
+// RFC 6570 section 2.3 allows a dot inside a variable name, so a template may
+// declare "users://{user.id}". The read merges the extracted variables into the
+// request arguments under their declared names, and an argument named that way
+// is read with Request.Arg: the typed accessors take a path, in which a dot is
+// a separator, so they answer for a nested "user" object instead.
 func MatchURITemplate(template, uri string) (vars map[string]string, ok bool) {
 	literals, names := parseTemplate(template)
 	if len(names) == 0 {

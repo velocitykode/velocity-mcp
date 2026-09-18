@@ -1,0 +1,18 @@
+package {{.Package}}
+
+import (
+	"github.com/velocitykode/velocity-mcp/server"
+)
+
+// New{{.Type}} builds the "{{.PrimitiveName}}" MCP server. Wire it into the
+// application with module.New(New{{.Type}}()), which registers the server,
+// mounts the streamable-HTTP transport, and adds the mcp:* commands.
+func New{{.Type}}() *server.Server {
+	return server.New("{{.PrimitiveName}}", "0.0.1",
+		server.WithInstructions("TODO: describe what the {{.PrimitiveName}} server offers and how a client should use it."),
+		// Register the server's primitives here, for example:
+		// server.WithTools(tools.NewExampleTool()),
+		// server.WithResources(resources.NewExampleResource()),
+		// server.WithPrompts(prompts.NewExamplePrompt()),
+	)
+}
