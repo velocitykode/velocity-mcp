@@ -12,19 +12,67 @@ import (
 	"github.com/velocitykode/velocity/httpclient"
 )
 
+// hostPosture names what the endpoint client may open a connection to. Every
+// URL it is handed was advertised by the protected resource or by the
+// authorization server the resource named, so the posture is what stands
+// between a hostile one of those and the network this application runs in.
+type hostPosture int
+
+const (
+	// publicHosts is the default. velocity's dial-time guard resolves the host
+	// of every connection, refuses it when any address it resolves to is
+	// loopback, private, link-local or otherwise internal, and connects to the
+	// address it checked. A name that resolves inward is therefore refused
+	// however it is spelled, and an answer that changes between the check and
+	// the connection (DNS rebinding) has nothing to change.
+	publicHosts hostPosture = iota
+	// loopbackHosts keeps that guard and exempts the loopback names alone. It
+	// applies when the protected resource the application configured is itself
+	// on the loopback interface, the development arrangement in which the
+	// authorization server is another port of the same machine.
+	loopbackHosts
+	// privateHosts lifts the guard. It is Config.AllowPrivateHosts, the opt-in
+	// of a consumer that vouches for endpoints on a private network.
+	privateHosts
+)
+
+// loopbackNames are the hosts recognised as the loopback interface: the names
+// isLocalhost answers for, and the ones the loopbackHosts posture exempts from
+// the dial-time guard. They are compared exactly, so a name that merely
+// resolves to the loopback interface is not one of them.
+var loopbackNames = []string{"localhost", "127.0.0.1", "::1"}
+
+// postureFor picks the posture of a flow against resourceURL. The resource URL
+// is the one address in a flow the application supplied itself, which is why it
+// alone may widen what the flow connects to.
+func postureFor(allowPrivate bool, resourceURL string) hostPosture {
+	if allowPrivate {
+		return privateHosts
+	}
+	if u, err := url.Parse(resourceURL); err == nil && isLocalhost(normalizedHost(u.Hostname())) {
+		return loopbackHosts
+	}
+	return publicHosts
+}
+
 // endpointClient builds the velocity httpclient used for OAuth metadata,
 // registration, and token requests. Redirects are not followed (max redirects
 // 0) and timeouts are short, matching the conservative posture expected of
-// authorization-server interactions. Private-IP denial is disabled here because
-// discovery applies its own RFC-aligned internal-host checks (which permit a
-// localhost authorization server during development); the token and
-// registration endpoints it then calls have already been validated.
-func endpointClient() *httpclient.Client {
-	return httpclient.New(
-		httpclient.WithTimeout(5*time.Second),
+// authorization-server interactions. What it may connect to is decided by
+// posture, and enforced by velocity's guard where the connection is opened
+// rather than by inspecting the URL beforehand: only there is the address known.
+func endpointClient(posture hostPosture) *httpclient.Client {
+	opts := []httpclient.Option{
+		httpclient.WithTimeout(5 * time.Second),
 		httpclient.WithMaxRedirects(0),
-		httpclient.WithoutPrivateIPDeny(),
-	)
+	}
+	switch posture {
+	case loopbackHosts:
+		opts = append(opts, httpclient.WithAllowedHosts(loopbackNames...))
+	case privateHosts:
+		opts = append(opts, httpclient.WithoutPrivateIPDeny())
+	}
+	return httpclient.New(opts...)
 }
 
 // getJSON performs a GET expecting a JSON object body, returning the HTTP status
@@ -40,6 +88,12 @@ func getJSON(ctx context.Context, c *httpclient.Client, endpoint string) (int, m
 
 // postForm performs an application/x-www-form-urlencoded POST expecting a JSON
 // object body. When basicAuth is non-nil it is applied as HTTP Basic credentials.
+//
+// The client id and the secret are each encoded with the
+// application/x-www-form-urlencoded algorithm before they become the user name
+// and the password (RFC 6749 2.3.1). The server decodes them the same way after
+// splitting at the first colon, so credentials sent as they stand reach it
+// altered as soon as they hold a colon, a plus or percent sign, or a space.
 func postForm(ctx context.Context, c *httpclient.Client, endpoint string, form url.Values, basicAuth *[2]string) (int, map[string]any, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -48,7 +102,7 @@ func postForm(ctx context.Context, c *httpclient.Client, endpoint string, form u
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	if basicAuth != nil {
-		req.SetBasicAuth(basicAuth[0], basicAuth[1])
+		req.SetBasicAuth(url.QueryEscape(basicAuth[0]), url.QueryEscape(basicAuth[1]))
 	}
 	return doJSON(c, req, endpoint)
 }

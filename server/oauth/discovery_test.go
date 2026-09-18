@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -120,6 +121,68 @@ func TestDiscovery_RoundTripsThroughTheClient(t *testing.T) {
 						t.Errorf("scopes_supported = %v, want [%s]", result.ScopesSupported, DefaultScope)
 					}
 				})
+			}
+		})
+	}
+}
+
+// What this package advertises about the authorization server is only worth
+// something if the client half of this SDK reads it as it was meant, because
+// that is what makes the client act on it: it refuses an authorization response
+// without iss once the server says it sends one (RFC 9207 2.4), and it prefers
+// its client ID metadata document over registering once the server says it
+// takes one. The declaration is therefore driven through a real discovery.
+func TestDiscovery_AdvertisedCapabilitiesReachTheClient(t *testing.T) {
+	tests := []struct {
+		name          string
+		issuer        bool
+		documents     bool
+		methods       []string
+		registration  bool
+		wantMethods   []string
+		wantRegistrar bool
+	}{
+		{name: "nothing declared"},
+		{name: "iss on authorization responses", issuer: true},
+		{name: "client id metadata documents", documents: true},
+		{name: "both, with confidential clients", issuer: true, documents: true, methods: []string{"client_secret_post", "none"}, wantMethods: []string{"client_secret_post", "none"}},
+		{name: "dynamic registration of public clients", registration: true, wantMethods: []string{"none"}, wantRegistrar: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				AuthorizationEndpoint:       "/oauth/authorize",
+				TokenEndpoint:               "/oauth/token",
+				AuthorizationResponseIssuer: tt.issuer,
+				ClientIDMetadataDocuments:   tt.documents,
+				TokenEndpointAuthMethods:    tt.methods,
+				RedirectDomains:             []string{"*"},
+			}
+			if tt.registration {
+				cfg.Clients = &stubStore{id: "client-1"}
+			}
+			r := router.NewV2()
+			Routes(r, cfg)
+			srv := httptest.NewServer(r)
+			t.Cleanup(srv.Close)
+
+			result, err := clientoauth.NewDiscovery().Discover(context.Background(), srv.URL+"/mcp", "")
+			if err != nil {
+				t.Fatalf("discovery: %v", err)
+			}
+			server := result.Server
+			if server.AuthorizationResponseIssParameterSupported != tt.issuer {
+				t.Errorf("iss parameter supported = %v, want %v", server.AuthorizationResponseIssParameterSupported, tt.issuer)
+			}
+			if server.ClientIDMetadataDocumentSupported != tt.documents {
+				t.Errorf("client id metadata documents supported = %v, want %v", server.ClientIDMetadataDocumentSupported, tt.documents)
+			}
+			if !slices.Equal(server.TokenEndpointAuthMethodsSupported, tt.wantMethods) {
+				t.Errorf("token endpoint auth methods = %v, want %v", server.TokenEndpointAuthMethodsSupported, tt.wantMethods)
+			}
+			if (server.RegistrationEndpoint != "") != tt.wantRegistrar {
+				t.Errorf("registration endpoint = %q, want one: %v", server.RegistrationEndpoint, tt.wantRegistrar)
 			}
 		})
 	}

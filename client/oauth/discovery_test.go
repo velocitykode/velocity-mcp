@@ -172,6 +172,26 @@ func TestDiscoveryAcceptsOnlyTheEmptyPathEquivalenceOfTheResource(t *testing.T) 
 			declared: "/#/",
 			wantErr:  true,
 		},
+		{
+			// A fragment stated as empty is still a fragment, and it parses to
+			// none: a comparison made on the parsed value would not see it.
+			name:     "a document that appends an empty fragment to the root",
+			resource: "/",
+			declared: "/#",
+			wantErr:  true,
+		},
+		{
+			name:     "a document that appends an empty fragment to the root spelled without a slash",
+			resource: "",
+			declared: "/#",
+			wantErr:  true,
+		},
+		{
+			name:     "a document that appends an empty fragment to a path",
+			resource: "/mcp",
+			declared: "/mcp#",
+			wantErr:  true,
+		},
 		{name: "a path described with a trailing slash it did not have", resource: "/mcp", declared: "/mcp/", wantErr: true},
 		{name: "a path described without the trailing slash it had", resource: "/mcp/", declared: "/mcp", wantErr: true},
 		{name: "a path described as a sibling", resource: "/mcp", declared: "/other", wantErr: true},

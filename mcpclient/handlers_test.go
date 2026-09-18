@@ -53,7 +53,7 @@ func TestHandlersFullFlow(t *testing.T) {
 	as := fakeAS(t)
 	RegisterClient("flow", as.URL+"/mcp")
 	mem := NewMemoryStore()
-	p := OAuthRoutesFor("flow", oauth.Config{ClientID: "cid", Scope: "mcp:use"},
+	p := OAuthRoutesFor("flow", oauth.Config{ClientID: "cid", Issuer: as.URL, Scope: "mcp:use"},
 		WithStore(mem), WithSuccessRedirect("/ok"))
 
 	// --- redirect leg ---
@@ -101,7 +101,7 @@ func TestHandlersFullFlow(t *testing.T) {
 func TestHandlerCallbackUnknownState(t *testing.T) {
 	as := fakeAS(t)
 	RegisterClient("flow2", as.URL+"/mcp")
-	p := OAuthRoutesFor("flow2", oauth.Config{ClientID: "cid"}, WithStore(NewMemoryStore()))
+	p := OAuthRoutesFor("flow2", oauth.Config{ClientID: "cid", Issuer: as.URL}, WithStore(NewMemoryStore()))
 
 	req := httptest.NewRequest(http.MethodGet, "http://localhost:4000/mcp/oauth/flow2/callback?code=x&state=bogus", nil)
 	rec := httptest.NewRecorder()

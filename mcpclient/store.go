@@ -3,8 +3,8 @@ package mcpclient
 import (
 	"encoding/json"
 	"errors"
-	"net/http"
 	"sync"
+	"time"
 
 	"github.com/velocitykode/velocity/auth"
 	"github.com/velocitykode/velocity/router"
@@ -104,33 +104,65 @@ func (s SessionStore) Token(c *router.Context, name string) (string, error) {
 	return str, nil
 }
 
+// pendingLifetime is how long MemoryStore keeps a pending authorization. It
+// covers the time a user spends at the authorization server plus the life of
+// the code that comes back, which RFC 6749 4.1.2 recommends capping at ten
+// minutes. A callback arriving later than this belongs to a flow that was
+// abandoned, and the PKCE verifier and client secret kept for it have no
+// business outliving it.
+const pendingLifetime = 15 * time.Minute
+
+// maxPendingAuthorizations bounds how many pending authorizations MemoryStore
+// holds at once. Starting a flow costs a visitor one request and nothing else,
+// so without a bound the redirect route is a way to grow this process's memory
+// for as long as pendingLifetime allows. The oldest record makes room.
+const maxPendingAuthorizations = 1024
+
 // MemoryStore is a self-contained, process-local Store for apps without
 // velocity sessions. It keys tokens to a browser via its own cookie. Suitable
 // for single-process development; use a session- or cache-backed Store in
 // production (tokens are lost on restart and not shared across instances).
+//
+// A pending authorization is dropped once it is taken, once pendingLifetime has
+// passed, or when maxPendingAuthorizations newer ones have arrived.
 type MemoryStore struct {
 	cookieName string
+	now        func() time.Time
 	mu         sync.Mutex
-	pending    map[string]string // state -> pending JSON
-	tokens     map[string]string // sid/name -> token
+	pending    map[string]pendingEntry // sid/state -> pending authorization
+	tokens     map[string]string       // sid/name -> token
+}
+
+// pendingEntry is one stored pending authorization and the moment it lapses.
+type pendingEntry struct {
+	encoded   string
+	expiresAt time.Time
 }
 
 // NewMemoryStore builds an empty in-memory store.
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		cookieName: "mcp_oauth_sid",
-		pending:    map[string]string{},
+		now:        time.Now,
+		pending:    map[string]pendingEntry{},
 		tokens:     map[string]string{},
 	}
 }
 
 // sid returns the browser session id, minting and setting the cookie if absent.
+// The cookie is velocity's canonical one (Path=/, HttpOnly, SameSite=Lax) and
+// carries the Secure attribute on the framework's own terms: always, unless the
+// application's validated session-cookie configuration opted out, which
+// velocity permits in development and test profiles only. The id is all that
+// stands between another party and this browser's token, so it is not sent over
+// a connection anyone on the path can read.
 func (m *MemoryStore) sid(c *router.Context) string {
 	if ck, err := c.Cookie(m.cookieName); err == nil && ck.Value != "" {
 		return ck.Value
 	}
 	id := newID()
-	c.SetCookie(&http.Cookie{Name: m.cookieName, Value: id, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	s := c.ServicesIfSet()
+	c.SetCookie(router.FlashCookie(m.cookieName, id, 0, s == nil || !s.InsecureFlashCookies))
 	return id
 }
 
@@ -147,10 +179,33 @@ func (m *MemoryStore) SavePending(c *router.Context, p *oauth.PendingAuthorizati
 	}
 	// Bind the pending entry to this browser (sid) so only the browser that
 	// began the flow can complete it, not just anyone presenting the state.
+	key := m.sid(c) + "/" + p.State
+	now := m.now()
 	m.mu.Lock()
-	m.pending[m.sid(c)+"/"+p.State] = string(b)
+	m.dropLapsed(now)
+	m.pending[key] = pendingEntry{encoded: string(b), expiresAt: now.Add(pendingLifetime)}
 	m.mu.Unlock()
 	return nil
+}
+
+// dropLapsed removes the pending authorizations whose lifetime has passed and,
+// when the store is still full, the oldest of the rest, so that adding one more
+// never takes it past maxPendingAuthorizations. The caller holds mu.
+func (m *MemoryStore) dropLapsed(now time.Time) {
+	for key, entry := range m.pending {
+		if !now.Before(entry.expiresAt) {
+			delete(m.pending, key)
+		}
+	}
+	for len(m.pending) >= maxPendingAuthorizations {
+		oldest, found := "", false
+		for key, entry := range m.pending {
+			if !found || entry.expiresAt.Before(m.pending[oldest].expiresAt) {
+				oldest, found = key, true
+			}
+		}
+		delete(m.pending, oldest)
+	}
 }
 
 func (m *MemoryStore) TakePending(c *router.Context, state string) (*oauth.PendingAuthorization, error) {
@@ -159,15 +214,16 @@ func (m *MemoryStore) TakePending(c *router.Context, state string) (*oauth.Pendi
 		return nil, nil
 	}
 	key := ck.Value + "/" + state
+	now := m.now()
 	m.mu.Lock()
-	str, ok := m.pending[key]
+	entry, ok := m.pending[key]
 	delete(m.pending, key)
 	m.mu.Unlock()
-	if !ok {
+	if !ok || !now.Before(entry.expiresAt) {
 		return nil, nil
 	}
 	var p oauth.PendingAuthorization
-	if err := json.Unmarshal([]byte(str), &p); err != nil {
+	if err := json.Unmarshal([]byte(entry.encoded), &p); err != nil {
 		return nil, err
 	}
 	return &p, nil

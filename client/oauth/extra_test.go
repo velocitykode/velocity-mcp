@@ -126,7 +126,7 @@ func TestTokenRequestFailure(t *testing.T) {
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 	})
-	c := NewClient(Config{ClientID: "cid"}, srv.URL, "", "")
+	c := NewClient(Config{ClientID: "cid", Issuer: srv.URL}, srv.URL, "", "")
 	if _, err := c.ClientCredentials(context.Background()); err == nil {
 		t.Fatal("expected token request failure")
 	}
@@ -137,7 +137,7 @@ func TestTokenResponseMissingAccessToken(t *testing.T) {
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"token_type": "Bearer"})
 	})
-	c := NewClient(Config{ClientID: "cid"}, srv.URL, "", "")
+	c := NewClient(Config{ClientID: "cid", Issuer: srv.URL}, srv.URL, "", "")
 	if _, err := c.ClientCredentials(context.Background()); err == nil {
 		t.Fatal("expected missing access_token error")
 	}
@@ -157,7 +157,7 @@ func TestDynamicRegistrationFailure(t *testing.T) {
 func TestAuthorizationURLRejectsMissingS256(t *testing.T) {
 	// Server advertises only "plain" PKCE: the client requires S256.
 	_, srv := metadataMux(t, []string{"plain"})
-	c := NewClient(Config{ClientID: "cid", RedirectURI: "http://localhost/cb"}, srv.URL, "", "")
+	c := NewClient(Config{ClientID: "cid", Issuer: srv.URL, RedirectURI: "http://localhost/cb"}, srv.URL, "", "")
 	if _, _, err := c.AuthorizationURL(context.Background(), ""); err == nil {
 		t.Fatal("expected S256 requirement error")
 	}

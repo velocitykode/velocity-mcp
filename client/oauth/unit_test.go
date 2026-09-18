@@ -97,18 +97,48 @@ func TestRequireSecure(t *testing.T) {
 	}
 }
 
+// requireNotInternal reads the URL and nothing else: it answers for a host
+// written as a loopback name or as an internal address, ahead of any request,
+// and it is the only check the authorization endpoint gets, since this client
+// never connects to it. A name that merely resolves inward is refused where the
+// connection is opened (TestDiscoveryNeverConnectsToAnInternalHost).
 func TestRequireNotInternal(t *testing.T) {
-	// Private host with a public resource is rejected.
-	if err := requireNotInternal("https://10.0.0.1/token", "https://example.com/mcp"); err == nil {
-		t.Fatal("expected private host rejection")
+	const public = "https://mcp.example.com/mcp"
+
+	tests := []struct {
+		name     string
+		endpoint string
+		resource string
+		wantOK   bool
+	}{
+		{name: "a public host", endpoint: "https://as.example.com/token", resource: public, wantOK: true},
+		{name: "localhost for a localhost resource", endpoint: "http://localhost/token", resource: "http://localhost/mcp", wantOK: true},
+		{name: "the loopback address for a localhost resource", endpoint: "http://127.0.0.1:9000/token", resource: "http://localhost:8080/mcp", wantOK: true},
+		{name: "the IPv6 loopback address for a loopback resource", endpoint: "http://[::1]:9000/token", resource: "http://127.0.0.1:8080/mcp", wantOK: true},
+		{name: "localhost for a public resource", endpoint: "http://localhost/token", resource: public},
+		{name: "localhost in upper case for a public resource", endpoint: "https://LOCALHOST/token", resource: public},
+		{name: "the loopback address for a public resource", endpoint: "https://127.0.0.1/token", resource: public},
+		{name: "the IPv6 loopback address for a public resource", endpoint: "https://[::1]/token", resource: public},
+		{name: "the loopback address mapped into IPv6", endpoint: "https://[::ffff:127.0.0.1]/token", resource: public},
+		{name: "another address of the loopback block", endpoint: "https://127.0.0.2/token", resource: public},
+		{name: "a private address", endpoint: "https://10.0.0.1/token", resource: public},
+		{name: "a private address for a localhost resource", endpoint: "https://10.0.0.1/token", resource: "http://localhost/mcp"},
+		{name: "another private block", endpoint: "https://192.168.1.10/token", resource: public},
+		{name: "the cloud metadata address", endpoint: "https://169.254.169.254/latest/meta-data", resource: public},
+		{name: "a link-local IPv6 address", endpoint: "https://[fe80::1]/token", resource: public},
+		{name: "a unique local IPv6 address", endpoint: "https://[fd00::1]/token", resource: public},
+		{name: "the unspecified address", endpoint: "https://0.0.0.0/token", resource: public},
+		{name: "an endpoint that does not parse", endpoint: "https://%zz/token", resource: public},
+		{name: "a resource that does not parse", endpoint: "https://as.example.com/token", resource: "https://%zz/mcp"},
 	}
-	// Localhost endpoint with a localhost resource is allowed (dev).
-	if err := requireNotInternal("http://localhost/token", "http://localhost/mcp"); err != nil {
-		t.Fatalf("localhost-to-localhost should be allowed: %v", err)
-	}
-	// Public host is allowed.
-	if err := requireNotInternal("https://as.example.com/token", "https://example.com/mcp"); err != nil {
-		t.Fatalf("public host should be allowed: %v", err)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := requireNotInternal(tt.endpoint, tt.resource)
+			if (err == nil) != tt.wantOK {
+				t.Fatalf("requireNotInternal(%q, %q) err=%v, wantOK=%v", tt.endpoint, tt.resource, err, tt.wantOK)
+			}
+		})
 	}
 }
 

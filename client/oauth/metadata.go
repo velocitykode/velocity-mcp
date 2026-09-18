@@ -18,6 +18,11 @@ type AuthServerMetadata struct {
 	CodeChallengeMethodsSupported              []string
 	AuthorizationResponseIssParameterSupported bool
 	TokenEndpointAuthMethodsSupported          []string
+	// ClientIDMetadataDocumentSupported reports whether the server accepts an
+	// HTTPS URL pointing at a client ID metadata document as the client_id,
+	// which the MCP authorization specification prefers over dynamic client
+	// registration.
+	ClientIDMetadataDocumentSupported bool
 }
 
 // authServerMetadataFromMap parses a decoded metadata document, requiring the
@@ -37,6 +42,7 @@ func authServerMetadataFromMap(data map[string]any) (*AuthServerMetadata, error)
 		CodeChallengeMethodsSupported: stringSlice(data, "code_challenge_methods_supported"),
 		AuthorizationResponseIssParameterSupported: boolField(data, "authorization_response_iss_parameter_supported"),
 		TokenEndpointAuthMethodsSupported:          stringSlice(data, "token_endpoint_auth_methods_supported"),
+		ClientIDMetadataDocumentSupported:          boolField(data, "client_id_metadata_document_supported"),
 	}, nil
 }
 

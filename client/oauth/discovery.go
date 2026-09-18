@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -13,10 +14,17 @@ import (
 // Discovery resolves the authorization server for a protected MCP resource by
 // fetching protected-resource metadata (RFC 9728) and then authorization-server
 // metadata (RFC 8414 / OpenID Provider Metadata). Every URL it follows is
-// required to be HTTPS (localhost excepted) and to resolve to a non-internal
-// host, guarding against server-advertised SSRF targets.
+// advertised by the server being discovered, so each is required to be HTTPS
+// (localhost excepted) and is fetched through a client that refuses, as the
+// connection is opened, any host resolving to a private or internal address:
+// a server cannot use discovery to reach into the network this application
+// runs in, whatever name it gives the target.
 type Discovery struct {
-	client *httpclient.Client
+	// client carries the posture every resource gets, and loopback the one a
+	// resource on the loopback interface gets instead (see hostPosture). With
+	// allowPrivate set there is a single posture and loopback is unused.
+	client   *httpclient.Client
+	loopback *httpclient.Client
 	// allowPrivate relaxes the HTTPS + non-internal-host requirements for
 	// consumers that vouch for a private or plain-HTTP deployment (see
 	// Config.AllowPrivateHosts). SSRF guards stay on by default.
@@ -25,13 +33,21 @@ type Discovery struct {
 
 // NewDiscovery builds a Discovery with the default OAuth endpoint client.
 func NewDiscovery() *Discovery {
-	return &Discovery{client: endpointClient()}
+	return &Discovery{client: endpointClient(publicHosts), loopback: endpointClient(loopbackHosts)}
 }
 
 // NewDiscoveryAllowingPrivateHosts builds a Discovery that accepts plain-HTTP
 // and private/internal endpoints (Config.AllowPrivateHosts semantics).
 func NewDiscoveryAllowingPrivateHosts() *Discovery {
-	return &Discovery{client: endpointClient(), allowPrivate: true}
+	return &Discovery{client: endpointClient(privateHosts), allowPrivate: true}
+}
+
+// clientFor returns the endpoint client for a discovery of resourceURL.
+func (d *Discovery) clientFor(resourceURL string) *httpclient.Client {
+	if postureFor(d.allowPrivate, resourceURL) == loopbackHosts {
+		return d.loopback
+	}
+	return d.client
 }
 
 // requireSecureURL applies requireSecure unless private hosts are allowed.
@@ -58,29 +74,15 @@ func (d *Discovery) requireExternalURL(rawURL, resourceURL string) error {
 // Discover resolves the authorization-server metadata for resourceURL. When
 // resourceMetadataURL is non-empty it is treated as the explicit
 // protected-resource metadata location (and a fetch failure is fatal);
-// otherwise the well-known location is derived from resourceURL.
+// otherwise the well-known locations are derived from resourceURL and asked in
+// the order the MCP authorization specification sets: the one built from the
+// resource path, then the one at the root.
 func (d *Discovery) Discover(ctx context.Context, resourceURL, resourceMetadataURL string) (*DiscoveryResult, error) {
 	resourceURL = beforeFragment(resourceURL)
+	client := d.clientFor(resourceURL)
 
-	metadataURL := resourceMetadataURL
-	if metadataURL == "" {
-		mu, err := wellKnown(resourceURL, "oauth-protected-resource")
-		if err != nil {
-			return nil, err
-		}
-		metadataURL = mu
-	}
-
-	if err := d.requireFetchable(metadataURL, resourceURL); err != nil {
-		return nil, err
-	}
-
-	resourceMetadata, err := d.fetchResourceMetadata(ctx, metadataURL, resourceMetadataURL != "")
+	resourceMetadata, err := d.resourceMetadata(ctx, client, resourceURL, resourceMetadataURL)
 	if err != nil {
-		return nil, err
-	}
-
-	if err := requireResourceMatches(resourceMetadata, resourceURL); err != nil {
 		return nil, err
 	}
 
@@ -99,7 +101,7 @@ func (d *Discovery) Discover(ctx context.Context, resourceURL, resourceMetadataU
 		return nil, err
 	}
 
-	serverMetadata, err := d.fetchMetadata(ctx, issuer)
+	serverMetadata, err := fetchMetadata(ctx, client, issuer)
 	if err != nil {
 		return nil, err
 	}
@@ -131,35 +133,121 @@ func (d *Discovery) Discover(ctx context.Context, resourceURL, resourceMetadataU
 	}, nil
 }
 
-// fetchResourceMetadata fetches protected-resource metadata. When the fetch was
-// not explicitly requested, failures degrade to an empty document so discovery
-// can fall back to the resource origin as the issuer.
-func (d *Discovery) fetchResourceMetadata(ctx context.Context, metadataURL string, explicit bool) (map[string]any, error) {
-	status, data, err := getJSON(ctx, d.client, metadataURL)
+// metadataLocation is one place a protected-resource metadata document may be
+// published. A document found there has to declare the resource being
+// discovered, or one of the alternatives the location allows.
+type metadataLocation struct {
+	url          string
+	alternatives []string
+}
+
+// metadataLocations lists where the metadata for resourceURL is looked for. A
+// URL the resource advertised in its challenge is the only location when there
+// is one. Otherwise the well-known URL built from the resource path comes
+// first and the one at the root second, which is where a server whose MCP
+// endpoint lives under a path may publish instead.
+//
+// RFC 9728 3.3 has the document declare the identifier its URL was derived
+// from, and the root URL is derived from the origin alone. A document found
+// there may therefore describe the origin as a whole as well as the resource
+// itself; one found anywhere else has to name the resource exactly. Either way
+// the token a flow ends in is requested for resourceURL and nothing else, so
+// what a document declares never widens where that token is good.
+func metadataLocations(resourceURL, advertisedURL string) ([]metadataLocation, error) {
+	if advertisedURL != "" {
+		return []metadataLocation{{url: advertisedURL}}, nil
+	}
+	inserted, err := wellKnown(resourceURL, "oauth-protected-resource")
 	if err != nil {
-		if explicit {
+		return nil, err
+	}
+	root, err := origin(resourceURL)
+	if err != nil {
+		return nil, err
+	}
+	locations := []metadataLocation{{url: inserted}}
+	if atRoot := root + "/.well-known/oauth-protected-resource"; atRoot != inserted {
+		locations = append(locations, metadataLocation{url: atRoot, alternatives: []string{root}})
+	}
+	return locations, nil
+}
+
+// resourceMetadata finds the protected-resource metadata document describing
+// resourceURL. The first location that holds a document decides: the document
+// is used, or discovery fails because it describes something else. Only a
+// location that answers that it holds none moves discovery on to the next.
+//
+// When no location holds one the result is an empty document, which leaves the
+// resource origin as the issuer: the arrangement of a server that publishes
+// authorization-server metadata and no protected-resource metadata. That is
+// reached only through answers, never through a failure to get one. A request
+// that went unanswered says nothing about what the resource declares, and
+// reading it as "declares nothing" would let an outage move a flow from the
+// authorization server the resource names to a different one.
+func (d *Discovery) resourceMetadata(ctx context.Context, client *httpclient.Client, resourceURL, advertisedURL string) (map[string]any, error) {
+	locations, err := metadataLocations(resourceURL, advertisedURL)
+	if err != nil {
+		return nil, err
+	}
+	for _, location := range locations {
+		if err := d.requireFetchable(location.url, resourceURL); err != nil {
 			return nil, err
 		}
-		return map[string]any{}, nil
+		document, status, err := fetchResourceMetadata(ctx, client, location.url)
+		if err != nil {
+			return nil, err
+		}
+		if document == nil {
+			// A location the resource advertised itself has no next one to try.
+			if advertisedURL != "" {
+				return nil, newError("protected resource metadata request to [%s] yielded no metadata document (status [%d])", location.url, status)
+			}
+			continue
+		}
+		if err := requireResourceMatches(document, resourceURL, location.alternatives...); err != nil {
+			return nil, err
+		}
+		return document, nil
+	}
+	return map[string]any{}, nil
+}
+
+// fetchResourceMetadata asks one location for a protected-resource metadata
+// document. It returns the document, or a nil document with the status when the
+// location answered that it has none to give: any answer that is not a JSON
+// object under a 2xx status (RFC 9728 3.2) and is not inconclusive. A request
+// that failed, or was answered inconclusively, is an error.
+func fetchResourceMetadata(ctx context.Context, client *httpclient.Client, metadataURL string) (map[string]any, int, error) {
+	status, data, err := getJSON(ctx, client, metadataURL)
+	if err != nil {
+		return nil, 0, err
+	}
+	if inconclusive(status) {
+		return nil, status, newError("protected resource metadata request to [%s] failed with status [%d]", metadataURL, status)
 	}
 	if !successful(status) || data == nil {
-		if explicit {
-			return nil, newError("protected resource metadata request to [%s] failed with status [%d]", metadataURL, status)
-		}
-		return map[string]any{}, nil
+		return nil, status, nil
 	}
-	return data, nil
+	return data, status, nil
+}
+
+// inconclusive reports whether a status says the server could not answer this
+// time, as opposed to answering that there is nothing to serve: a server error,
+// a timeout, or a rate limit. The same request may well succeed later, so
+// nothing can be concluded from it about what the server publishes.
+func inconclusive(status int) bool {
+	return status >= 500 || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests
 }
 
 // fetchMetadata tries the candidate well-known metadata URLs for issuer and
 // returns the first that yields a valid metadata document.
-func (d *Discovery) fetchMetadata(ctx context.Context, issuer string) (*AuthServerMetadata, error) {
+func fetchMetadata(ctx context.Context, client *httpclient.Client, issuer string) (*AuthServerMetadata, error) {
 	urls, err := metadataURLs(issuer)
 	if err != nil {
 		return nil, err
 	}
 	for _, metadataURL := range urls {
-		status, data, err := getJSON(ctx, d.client, metadataURL)
+		status, data, err := getJSON(ctx, client, metadataURL)
 		if err != nil || !successful(status) || data == nil {
 			continue
 		}
@@ -176,22 +264,29 @@ func (d *Discovery) requireFetchable(u, resourceURL string) error {
 	return d.requireExternalURL(u, resourceURL)
 }
 
-// requireResourceMatches asserts that, when the resource metadata declares a
-// resource, it is the resource the metadata was requested for (RFC 9728 3.3).
+// requireResourceMatches asserts that the resource metadata declares one of the
+// identifiers the document may describe, in practice the resource the metadata
+// was requested for (RFC 9728 3.3). A document that declares none is refused
+// like one that declares another: resource is a required member (RFC 9728 2),
+// and without it nothing ties the authorization server the document names to
+// the resource this client is about to send a token to.
 //
 // The comparison is exact but for the one difference RFC 3986 6.2.3 defines
 // away: on http and https an empty path and "/" are the same URI, and a request
 // line always carries at least a slash, so a server cannot tell which of the
 // two a client used. A trailing slash anywhere else names a different resource
 // and is not tolerated.
-func requireResourceMatches(metadata map[string]any, resourceURL string) error {
+func requireResourceMatches(metadata map[string]any, resourceURL string, alternatives ...string) error {
 	resource := stringField(metadata, "resource")
 	if resource == "" {
-		return nil
+		return newError("protected resource metadata does not declare the resource it describes")
 	}
-	expected := withoutEmptyPath(resourceURL)
 	declared := withoutEmptyPath(resource)
-	if subtle.ConstantTimeCompare([]byte(expected), []byte(declared)) != 1 {
+	matched := subtle.ConstantTimeCompare([]byte(withoutEmptyPath(resourceURL)), []byte(declared))
+	for _, alternative := range alternatives {
+		matched |= subtle.ConstantTimeCompare([]byte(withoutEmptyPath(alternative)), []byte(declared))
+	}
+	if matched != 1 {
 		return newError("protected resource metadata resource [%s] did not match the expected resource [%s]", resource, resourceURL)
 	}
 	return nil
@@ -205,7 +300,15 @@ func requireResourceMatches(metadata map[string]any, resourceURL string) error {
 // text, because the slash the equivalence covers is the whole path and a slash
 // that ends a query or a fragment is content: dropping that one would equate
 // two identifiers that differ.
+//
+// A URL that carries a fragment delimiter is left alone for the same reason. A
+// fragment stated as empty parses to no fragment at all, so reassembling
+// "https://host/#" would yield "https://host" and pass off an identifier that
+// RFC 9728 2 forbids as the one that was asked about.
 func withoutEmptyPath(rawURL string) string {
+	if strings.Contains(rawURL, "#") {
+		return rawURL
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Path != "/" || u.Host == "" {
 		return rawURL
@@ -304,8 +407,16 @@ func requireSecure(rawURL string) error {
 	return newError("OAuth endpoint [%s] must be served over HTTPS", rawURL)
 }
 
-// requireNotInternal rejects URLs that resolve to a private or internal host,
-// except when both the endpoint and the resource are themselves localhost.
+// requireNotInternal rejects a URL whose host is written as a loopback name or
+// as a private or internal address, except when both the endpoint and the
+// resource are themselves localhost.
+//
+// It reads the URL and nothing else, so it is not what keeps a flow out of the
+// internal network: a name says nothing about the address it resolves to. That
+// is settled where the connection is opened, by the guard of the endpoint
+// client (see hostPosture). What this adds is an answer before any request is
+// made, and the only answer there is for the authorization endpoint, which the
+// user's browser is sent to and this client never connects to.
 func requireNotInternal(rawURL, resourceURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -338,12 +449,7 @@ func isInternalHost(host string) bool {
 
 // isLocalhost reports whether a host is a recognised loopback name or address.
 func isLocalhost(host string) bool {
-	switch host {
-	case "localhost", "127.0.0.1", "::1":
-		return true
-	default:
-		return false
-	}
+	return contains(loopbackNames, host)
 }
 
 // normalizedHost lowercases a host and strips any IPv6 brackets.
