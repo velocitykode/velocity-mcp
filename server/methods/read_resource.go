@@ -47,7 +47,8 @@ func (ReadResource) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Re
 		WithSessionID(c.SessionID()).
 		WithMeta(p.mapValue("_meta")).
 		WithURI(uri).
-		WithEmitter(c.Emit)
+		WithEmitter(c.Emit).
+		WithRequestContext(c.RequestContext())
 
 	resp, err := resource.Read(c.RequestContext(), request)
 	if err != nil {

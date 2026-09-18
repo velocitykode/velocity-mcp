@@ -34,7 +34,8 @@ func (GetPrompt) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Respo
 	request := server.NewRequest(p.arguments()).
 		WithSessionID(c.SessionID()).
 		WithMeta(p.mapValue("_meta")).
-		WithEmitter(c.Emit)
+		WithEmitter(c.Emit).
+		WithRequestContext(c.RequestContext())
 
 	resp, err := prompt.Handle(c.RequestContext(), request)
 	if err != nil {

@@ -37,7 +37,8 @@ func (CallTool) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Respon
 	request := server.NewRequest(p.arguments()).
 		WithSessionID(c.SessionID()).
 		WithMeta(p.mapValue("_meta")).
-		WithEmitter(c.Emit)
+		WithEmitter(c.Emit).
+		WithRequestContext(c.RequestContext())
 
 	resp, err := tool.Handle(c.RequestContext(), request)
 	if err != nil {

@@ -29,6 +29,7 @@ import (
 
 	"github.com/velocitykode/velocity-mcp/console"
 	"github.com/velocitykode/velocity-mcp/server"
+	"github.com/velocitykode/velocity-mcp/server/oauth"
 	"github.com/velocitykode/velocity-mcp/transport"
 )
 
@@ -44,6 +45,7 @@ type Module struct {
 	path        string
 	middleware  []router.MiddlewareFunc
 	handlerOpts []transport.HandlerOption
+	oauth       *oauth.Config
 }
 
 // Option customises the module.
@@ -73,6 +75,23 @@ func WithMiddleware(mw ...router.MiddlewareFunc) Option {
 func WithHandlerOptions(opts ...transport.HandlerOption) Option {
 	return func(m *Module) {
 		m.handlerOpts = append(m.handlerOpts, opts...)
+	}
+}
+
+// WithOAuth turns the MCP endpoint into an OAuth protected resource: the
+// discovery documents a client needs are mounted alongside it (see
+// oauth.Routes), and the bearer challenge every MCP route carries starts naming
+// the protected-resource document instead of only reporting an invalid token,
+// so a 401 from the app's own auth middleware tells the client where to
+// authorize.
+//
+// The challenge runs outermost on the route, ahead of any middleware added with
+// WithMiddleware, because it has to observe the refusal those produce. A guard
+// that sets its own WWW-Authenticate keeps it. It authenticates nothing on its
+// own: attach the guard with WithMiddleware.
+func WithOAuth(cfg oauth.Config) Option {
+	return func(m *Module) {
+		m.oauth = &cfg
 	}
 }
 
@@ -110,11 +129,28 @@ func (m *Module) Shutdown(ctx context.Context) error { return nil }
 // deliberately NOT placed in the web middleware group: MCP clients are
 // programs, not browsers, and the web stack's CSRF/session middleware would
 // reject every request. Attach auth via WithMiddleware instead.
+//
+// Every mounted MCP route carries the bearer challenge, outermost so it sees
+// the 401 every inner guard produces. Which challenge it is follows the
+// configuration: with WithOAuth it names the protected-resource document a
+// client discovers the authorization server from, and without it the route can
+// only name the realm and the scope it requires, which is still more than a
+// bare 401 tells a client. Either way a request whose bearer token was refused
+// is told error="invalid_token" and one that sent none is not (RFC 6750 3), and
+// the challenge applies only to a 401 that carries none of its own, so a guard
+// attached with WithMiddleware keeps whatever it advertises. The challenge
+// authenticates nothing on its own.
 func (m *Module) Routes(r *chain.Routing) {
-	route := r.Router().Post(m.path, transport.Handler(m.srv, m.handlerOpts...))
-	if len(m.middleware) > 0 {
-		route.Use(m.middleware...)
+	// No OAuth configuration means no discovery documents to advertise, which
+	// is exactly the posture Config.WithoutResourceMetadata describes.
+	cfg := oauth.Config{WithoutResourceMetadata: true}
+	if m.oauth != nil {
+		cfg = *m.oauth
+		oauth.Routes(r.Router(), cfg)
 	}
+	middleware := append([]router.MiddlewareFunc{oauth.Challenge(cfg)}, m.middleware...)
+
+	r.Router().Post(m.path, transport.Handler(m.srv, m.handlerOpts...)).Use(middleware...)
 }
 
 // Commands implements chain.CommandModule: it registers the MCP code

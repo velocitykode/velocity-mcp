@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
+	"github.com/velocitykode/velocity-mcp/server"
 	"github.com/velocitykode/velocity/router"
 )
 
@@ -106,6 +108,10 @@ func Handler(srv MCPServer, opts ...HandlerOption) func(*router.Context) error {
 
 		sessionID := inboundSessionID(c)
 
+		// Carry the caller's identity on the request context so handlers can
+		// read it back through server.Request.User.
+		ctx := server.WithIdentityResolver(c.Request.Context(), identityResolver(c))
+
 		// Streaming path: serve over SSE so the handler can emit frames before
 		// the final result.
 		//
@@ -121,11 +127,11 @@ func Handler(srv MCPServer, opts ...HandlerOption) func(*router.Context) error {
 		// a preference would silently drop a frame the client is owed.
 		if streamable(c, raw) {
 			if ss, ok := srv.(streamingServer); ok {
-				return serveStream(c, ss, raw, sessionID)
+				return serveStream(ctx, c, ss, raw, sessionID)
 			}
 		}
 
-		res := srv.Handle(c.Request.Context(), raw, sessionID)
+		res := srv.Handle(ctx, raw, sessionID)
 
 		// A notification (or any message that produces no reply) is acknowledged
 		// with 202 Accepted and an empty body (the MCP spec mandates 202 for a
@@ -283,7 +289,7 @@ func writeSSE(c *router.Context, status int, msg []byte) error {
 // its Accept header asks for, carrying the status its error maps to. Only a
 // handler that actually streams commits the connection to the event-stream
 // framing, and once committed neither the framing nor the status can change.
-func serveStream(c *router.Context, ss streamingServer, raw []byte, sessionID string) error {
+func serveStream(ctx context.Context, c *router.Context, ss streamingServer, raw []byte, sessionID string) error {
 	streamed := false
 	emit := func(msg []byte) error {
 		if !streamed {
@@ -293,7 +299,7 @@ func serveStream(c *router.Context, ss streamingServer, raw []byte, sessionID st
 		return writeSSEFrame(c, msg)
 	}
 
-	res := ss.HandleStream(c.Request.Context(), raw, sessionID, emit)
+	res := ss.HandleStream(ctx, raw, sessionID, emit)
 	if !res.HasResponse || res.Response == nil {
 		if streamed {
 			return nil

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,11 @@ type Request struct {
 	meta      map[string]any
 	uri       string
 	emit      func(msg []byte) error
+
+	// ctx is the inbound request context threaded from the transport. It backs
+	// User, which reads the authenticated identity off the serving router
+	// context the HTTP transport stores on it. Never nil after NewRequest.
+	ctx context.Context
 }
 
 // ProgressUpdate is a single progress report for a long-running tool or
@@ -55,7 +61,19 @@ func NewRequest(args map[string]any) *Request {
 	if args == nil {
 		args = map[string]any{}
 	}
-	return &Request{args: args}
+	return &Request{args: args, ctx: context.Background()}
+}
+
+// WithRequestContext returns the request with the transport's inbound request
+// context set. The method handlers wire it from the serving server Context so
+// User can reach the request-scoped auth state; an empty ctx defaults to
+// context.Background(), keeping User nil-safe.
+func (r *Request) WithRequestContext(ctx context.Context) *Request {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.ctx = ctx
+	return r
 }
 
 // WithSessionID returns the request with its session id set.

@@ -177,13 +177,45 @@ func (d *Discovery) requireFetchable(u, resourceURL string) error {
 }
 
 // requireResourceMatches asserts that, when the resource metadata declares a
-// resource, it matches the expected resource URL.
+// resource, it is the resource the metadata was requested for (RFC 9728 3.3).
+//
+// The comparison is exact but for the one difference RFC 3986 6.2.3 defines
+// away: on http and https an empty path and "/" are the same URI, and a request
+// line always carries at least a slash, so a server cannot tell which of the
+// two a client used. A trailing slash anywhere else names a different resource
+// and is not tolerated.
 func requireResourceMatches(metadata map[string]any, resourceURL string) error {
 	resource := stringField(metadata, "resource")
-	if resource != "" && subtle.ConstantTimeCompare([]byte(resourceURL), []byte(resource)) != 1 {
+	if resource == "" {
+		return nil
+	}
+	expected := withoutEmptyPath(resourceURL)
+	declared := withoutEmptyPath(resource)
+	if subtle.ConstantTimeCompare([]byte(expected), []byte(declared)) != 1 {
 		return newError("protected resource metadata resource [%s] did not match the expected resource [%s]", resource, resourceURL)
 	}
 	return nil
+}
+
+// withoutEmptyPath drops the path of an http(s) URL whose path is a bare slash,
+// the empty-path equivalence of RFC 3986 6.2.3. Every other URL is returned as
+// it stands.
+//
+// The URL is reassembled from its parsed components rather than trimmed as
+// text, because the slash the equivalence covers is the whole path and a slash
+// that ends a query or a fragment is content: dropping that one would equate
+// two identifiers that differ.
+func withoutEmptyPath(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Path != "/" || u.Host == "" {
+		return rawURL
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return rawURL
+	}
+	u.Path = ""
+	u.RawPath = ""
+	return u.String()
 }
 
 // issuerFrom returns the first advertised authorization server, or "".
@@ -219,13 +251,23 @@ func metadataURLs(issuer string) ([]string, error) {
 }
 
 // wellKnown derives a well-known metadata URL of the given type from a resource
-// URL, preserving the resource path component per RFC 9728.
+// URL by inserting the well-known path between the host and the path of the
+// resource identifier (RFC 9728 3.1).
+//
+// The path is carried over exactly as it stands, because a trailing slash names
+// a different resource and dropping one asks the server to describe something
+// else. The single exception is a bare slash, which is not a path a client can
+// have meant differently (RFC 3986 6.2.3) and which would otherwise ask for a
+// document at a different URL than an identifier with no path at all.
 func wellKnown(rawURL, kind string) (string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return "", newError("unable to parse URL [%s] during OAuth discovery", rawURL)
 	}
-	path := strings.TrimSuffix(u.Path, "/")
+	path := u.EscapedPath()
+	if path == "/" {
+		path = ""
+	}
 	return u.Scheme + "://" + u.Host + "/.well-known/" + kind + path, nil
 }
 
