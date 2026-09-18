@@ -22,13 +22,19 @@ type fakeTransport struct {
 	handlers map[string]fakeHandler
 	queue    []string
 	sent     []string
+	headers  []map[string]string
+	versions []ProtocolVersion
 	connects int
 
 	expireOnce   map[string]bool
 	framesBefore map[string][]string
 }
 
-var _ Transport = (*fakeTransport)(nil)
+var (
+	_ Transport     = (*fakeTransport)(nil)
+	_ ProtocolAware = (*fakeTransport)(nil)
+	_ HeaderSender  = (*fakeTransport)(nil)
+)
 
 // newFakeTransport builds a fakeTransport with a default initialize handler.
 func newFakeTransport() *fakeTransport {
@@ -61,6 +67,14 @@ func (f *fakeTransport) on(method string, fn fakeHandler) {
 	f.handlers[method] = fn
 }
 
+// without drops a method from the server, which then rejects it the way a
+// server that does not implement it does: with a method-not-found.
+func (f *fakeTransport) without(method string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.handlers, method)
+}
+
 func (f *fakeTransport) Connect(context.Context) error {
 	f.mu.Lock()
 	f.connects++
@@ -74,6 +88,21 @@ func (f *fakeTransport) Disconnect() error { return nil }
 func (f *fakeTransport) SetTimeout(time.Duration) {}
 
 func (f *fakeTransport) Recipe() Recipe { return Recipe{Driver: "fake"} }
+
+// UseProtocol records the protocol version of each frame the client sends.
+func (f *fakeTransport) UseProtocol(version ProtocolVersion) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.versions = append(f.versions, version)
+}
+
+// SendWithHeaders records the protocol headers alongside the frame.
+func (f *fakeTransport) SendWithHeaders(ctx context.Context, message string, headers map[string]string) error {
+	f.mu.Lock()
+	f.headers = append(f.headers, headers)
+	f.mu.Unlock()
+	return f.Send(ctx, message)
+}
 
 func (f *fakeTransport) Send(_ context.Context, message string) error {
 	f.mu.Lock()
@@ -129,6 +158,22 @@ func (f *fakeTransport) Receive(context.Context) (string, error) {
 func marshalResp(r *jsonrpc.Response) string {
 	b, _ := json.Marshal(r)
 	return string(b)
+}
+
+// sentMethods returns the JSON-RPC method of each frame the client sent, in
+// order.
+func sentMethods(f *fakeTransport) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	methods := make([]string, 0, len(f.sent))
+	for _, frame := range f.sent {
+		var probe struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal([]byte(frame), &probe)
+		methods = append(methods, probe.Method)
+	}
+	return methods
 }
 
 func extractParams(message string) json.RawMessage {

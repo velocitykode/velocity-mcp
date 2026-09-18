@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os/exec"
 	"strings"
@@ -130,7 +131,12 @@ func (t *StdioTransport) Send(ctx context.Context, message string) error {
 		return newError("transport is not connected")
 	}
 	if _, err := io.WriteString(stdin, message+"\n"); err != nil {
-		return wrapError(err, "unable to write to subprocess")
+		// A pipe that will not take the frame is the subprocess having gone
+		// away, not a server refusing the request, so it is reported as the
+		// channel failure it is and the subprocess is torn down: the next
+		// Connect has to start a new one rather than adopt the dead one.
+		_ = t.Disconnect()
+		return NewTransportError("unable to write to subprocess ["+t.command+"]", err)
 	}
 	return nil
 }
@@ -160,13 +166,42 @@ func (t *StdioTransport) Receive(ctx context.Context) (string, error) {
 		}
 		return "", t.closedError(err)
 	case <-ctx.Done():
-		return "", wrapError(ctx.Err(), "timed out while waiting for server response")
+		return "", t.abandonedError(ctx.Err())
 	case <-timer.C:
-		return "", newError("timed out while waiting for server response")
+		return "", t.timeoutError(nil)
 	}
 }
 
-// closedError annotates an early stream close with any captured stderr.
+// abandonedError reports a wait the context ended. A deadline that elapsed is a
+// timeout like any other; a cancelled context is the caller withdrawing the
+// request, which is neither a timeout nor a failure of the channel, so it is a
+// plain client error that no other handshake would do better with.
+func (t *StdioTransport) abandonedError(cause error) error {
+	if errors.Is(cause, context.Canceled) {
+		_ = t.Disconnect()
+		return wrapError(cause, "the wait for a response from subprocess ["+t.command+"] was cancelled")
+	}
+	return t.timeoutError(cause)
+}
+
+// timeoutError tears the subprocess down and reports the timeout. The
+// subprocess is stopped because a server that owes a reply and has not sent it
+// cannot be trusted to keep the stream in step: the next frame read would
+// belong to the abandoned exchange.
+func (t *StdioTransport) timeoutError(cause error) error {
+	_ = t.Disconnect()
+	return NewTimeoutError("timed out while waiting for server response", cause)
+}
+
+// closedError annotates an early stream close with any captured stderr. The
+// subprocess is torn down first, because a server whose output has ended is
+// gone and Connect is idempotent: left in place, the exec state would have the
+// next connect adopt the dead process instead of starting a new one.
+//
+// It is a transport failure. A subprocess that ends on a request it does not
+// know is a server that predates that request answering it the only way it can,
+// and classifying it as such is what lets the connection probe start the server
+// again and negotiate with the handshake it does speak.
 func (t *StdioTransport) closedError(err error) error {
 	if err == io.EOF {
 		err = nil
@@ -177,14 +212,13 @@ func (t *StdioTransport) closedError(err error) error {
 		stderr = strings.TrimSpace(t.stderr.String())
 	}
 	t.mu.Unlock()
+	_ = t.Disconnect()
+
 	msg := "subprocess [" + t.command + "] closed its output before sending a complete response"
 	if stderr != "" {
 		msg += "; stderr: " + stderr
 	}
-	if err != nil {
-		return wrapError(err, msg)
-	}
-	return newError(msg)
+	return NewTransportError(msg, err)
 }
 
 // Disconnect closes stdin and stops the subprocess. It is safe to call when not

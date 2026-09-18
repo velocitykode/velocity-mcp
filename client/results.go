@@ -5,17 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/velocitykode/velocity-mcp/schema"
-	"github.com/velocitykode/velocity-mcp/server"
 )
-
-// supportedProtocolVersions is the set of protocol versions this client accepts
-// in an initialize result, mirroring the server's supported list.
-var supportedProtocolVersions = map[string]bool{
-	server.ProtocolV20251125: true,
-	server.ProtocolV20250618: true,
-	server.ProtocolV20250326: true,
-	server.ProtocolV20241105: true,
-}
 
 // InitializeResult is the negotiated outcome of the initialize handshake.
 type InitializeResult struct {
@@ -25,46 +15,75 @@ type InitializeResult struct {
 	Instructions    string
 }
 
-// parseInitializeResult decodes and validates an initialize result.
+// parseInitializeResult decodes and validates an initialize result. The version
+// the server chose has to be one this client speaks through the initialize
+// handshake: a client that carried on regardless would be sending a wire shape
+// neither peer agreed on. A version that is not a string settled on nothing, so
+// it is reported as none rather than as a malformed payload.
 func parseInitializeResult(raw json.RawMessage) (*InitializeResult, error) {
 	var payload struct {
-		ProtocolVersion string         `json:"protocolVersion"`
-		Capabilities    map[string]any `json:"capabilities"`
-		ServerInfo      struct {
-			Name        string `json:"name"`
-			Version     string `json:"version"`
-			Title       string `json:"title"`
-			Description string `json:"description"`
-			WebsiteURL  string `json:"websiteUrl"`
-		} `json:"serverInfo"`
-		Instructions string `json:"instructions"`
+		ProtocolVersion json.RawMessage `json:"protocolVersion"`
+		Capabilities    json.RawMessage `json:"capabilities"`
+		ServerInfo      json.RawMessage `json:"serverInfo"`
+		Instructions    json.RawMessage `json:"instructions"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, newError("invalid initialize response from server")
 	}
-	if !supportedProtocolVersions[payload.ProtocolVersion] || payload.ServerInfo.Name == "" || payload.ServerInfo.Version == "" {
+
+	var chosen string
+	_ = decodeMember(payload.ProtocolVersion, &chosen)
+	if !supportsInitializeVersion(chosen) {
+		reported := chosen
+		if reported == "" {
+			reported = "none"
+		}
+		return nil, newError("the server chose protocol version [" + reported +
+			"]; this client supports [" + joinVersions(initializeSupportedVersions()) + "]")
+	}
+
+	var capabilities map[string]any
+	if err := decodeMember(payload.Capabilities, &capabilities); err != nil || capabilities == nil {
+		return nil, newError("invalid initialize response from server")
+	}
+	info, ok := parseImplementation(payload.ServerInfo)
+	if !ok {
 		return nil, newError("invalid initialize response from server")
 	}
 
-	info := schema.NewImplementation(payload.ServerInfo.Name, payload.ServerInfo.Version)
-	info.Title = payload.ServerInfo.Title
-	info.Description = payload.ServerInfo.Description
-	info.WebsiteURL = payload.ServerInfo.WebsiteURL
-
-	return &InitializeResult{
-		ProtocolVersion: payload.ProtocolVersion,
-		Capabilities:    payload.Capabilities,
+	// Instructions are optional: a payload that carries them in another shape is
+	// read as if it carried none.
+	result := &InitializeResult{
+		ProtocolVersion: chosen,
+		Capabilities:    capabilities,
 		ServerInfo:      info,
-		Instructions:    payload.Instructions,
-	}, nil
+	}
+	_ = decodeMember(payload.Instructions, &result.Instructions)
+	return result, nil
 }
 
 // ToolResult is the result of a tools/call request.
 type ToolResult struct {
-	Content           []map[string]any
-	IsError           bool
-	StructuredContent map[string]any
-	Meta              map[string]any
+	Content []map[string]any
+	IsError bool
+	// StructuredContent is the machine-readable result the tool returned,
+	// decoded as whatever JSON value it is: an object, an array, a string, a
+	// number, or a boolean. A tool's outputSchema may describe any of them, so
+	// reading it as an object alone would refuse results the protocol permits.
+	// It is nil when the result carries none and when it carries an explicit
+	// null; HasStructuredContent tells the two apart.
+	StructuredContent any
+	// HasStructuredContent reports whether the result carried the member at all.
+	HasStructuredContent bool
+	Meta                 map[string]any
+}
+
+// StructuredObject returns the structured content as an object, reporting false
+// when the tool returned another JSON type or none at all. It is the common
+// case of StructuredContent, spelled so a caller need not assert the type.
+func (r ToolResult) StructuredObject() (map[string]any, bool) {
+	object, ok := r.StructuredContent.(map[string]any)
+	return object, ok
 }
 
 // Text concatenates the text of every text content block, ignoring other types.
@@ -77,18 +96,24 @@ func parseToolResult(raw json.RawMessage) (*ToolResult, error) {
 	var payload struct {
 		Content           []map[string]any `json:"content"`
 		IsError           bool             `json:"isError"`
-		StructuredContent map[string]any   `json:"structuredContent"`
+		StructuredContent json.RawMessage  `json:"structuredContent"`
 		Meta              map[string]any   `json:"_meta"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return nil, newError("invalid tools/call result from server")
 	}
-	return &ToolResult{
-		Content:           payload.Content,
-		IsError:           payload.IsError,
-		StructuredContent: payload.StructuredContent,
-		Meta:              payload.Meta,
-	}, nil
+	result := &ToolResult{
+		Content: payload.Content,
+		IsError: payload.IsError,
+		Meta:    payload.Meta,
+	}
+	if len(payload.StructuredContent) > 0 {
+		if err := json.Unmarshal(payload.StructuredContent, &result.StructuredContent); err != nil {
+			return nil, newError("invalid tools/call result from server")
+		}
+		result.HasStructuredContent = true
+	}
+	return result, nil
 }
 
 // ResourceReadResult is the result of a resources/read request.

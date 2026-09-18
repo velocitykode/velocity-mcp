@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -29,9 +30,10 @@ func TestConnectInitialize(t *testing.T) {
 	if res == nil || res.ServerInfo.Name != "fake" || res.Instructions != "be helpful" {
 		t.Fatalf("initialize result = %+v", res)
 	}
-	// The handshake sends initialize then the initialized notification.
-	if len(f.sent) != 2 {
-		t.Fatalf("expected 2 frames sent during connect, got %d", len(f.sent))
+	// The probe offers discovery first; this server does not implement it, so
+	// the handshake falls back to initialize and announces it.
+	if got := sentMethods(f); !slices.Equal(got, []string{"server/discover", "initialize", "notifications/initialized"}) {
+		t.Fatalf("handshake frames = %v", got)
 	}
 }
 

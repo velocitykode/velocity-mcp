@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/velocitykode/velocity-mcp/client/oauth"
+	"github.com/velocitykode/velocity-mcp/jsonrpc"
 	"github.com/velocitykode/velocity-mcp/server"
 )
 
@@ -28,6 +29,19 @@ func mcpHTTPServer(t *testing.T, onAuth func(string)) *httptest.Server {
 
 		if len(req.ID) == 0 { // notification
 			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+
+		// A server that predates the discovery handshake answers the probe with
+		// method-not-found, which sends the client back to initialize.
+		if req.Method == "server/discover" {
+			w.Header().Set("Content-Type", "application/json")
+			out, _ := json.Marshal(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      req.ID,
+				"error":   map[string]any{"code": jsonrpc.CodeMethodNotFound, "message": "Method not found."},
+			})
+			_, _ = w.Write(out)
 			return
 		}
 

@@ -13,12 +13,24 @@ type WebClient struct {
 }
 
 // WithToken sets a static bearer token sent on every request.
+//
+// The token is the authorization context of everything fetched with it. The
+// specification forbids reusing a result scoped to one context in another, and
+// a different access token is a different context, so nothing the client keeps
+// outlives a change of token: the connection is negotiated again under the new
+// one by the next request, the session the old one opened is released with the
+// old one, and what the server advertised, the tool definitions it stated, and
+// the tools the client refused are all read again rather than carried across.
 func (w *WebClient) WithToken(token string) *WebClient {
 	w.transport.WithToken(token)
 	return w
 }
 
-// WithTokenFunc sets a callback resolving the bearer token per request.
+// WithTokenFunc sets a callback resolving the bearer token. It is asked once
+// for each request the client makes, and every frame of that request presents
+// the token it gave. A token that differs from the one before is another
+// authorization context, exactly as one set through WithToken is, whether the
+// callback rotates the token of one caller or answers for a different one.
 func (w *WebClient) WithTokenFunc(fn func() string) *WebClient {
 	w.transport.WithTokenFunc(fn)
 	return w

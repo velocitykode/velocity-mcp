@@ -3,8 +3,10 @@ package client
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -153,6 +155,56 @@ func TestHTTPServerEventStream(t *testing.T) {
 	}
 	if msg != `{"jsonrpc":"2.0","id":1,"result":{}}` {
 		t.Fatalf("sse frame = %q", msg)
+	}
+}
+
+// TestHTTPServerEventStreamJoinsDataLines asserts the event stream
+// interpretation rules: the values of the data fields of one event are joined
+// with a line feed and dispatched as a single frame, so a server writing its
+// response as pretty-printed JSON is read as the one response it sent rather
+// than as a line of malformed frames.
+func TestHTTPServerEventStreamJoinsDataLines(t *testing.T) {
+	frame := "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"result\": {}\n}"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: message\n")
+		for _, line := range strings.Split(frame, "\n") {
+			_, _ = io.WriteString(w, "data: "+line+"\n")
+		}
+		_, _ = io.WriteString(w, "\n")
+	}))
+	defer srv.Close()
+
+	tr := NewHTTPTransport(srv.URL)
+	ctx := context.Background()
+	if err := tr.Send(ctx, `{"id":1}`); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	msg, err := tr.Receive(ctx)
+	if err != nil {
+		t.Fatalf("receive: %v", err)
+	}
+	if msg != frame {
+		t.Fatalf("sse frame = %q, want %q", msg, frame)
+	}
+	if _, err := tr.Receive(ctx); err == nil {
+		t.Fatal("the one event was queued as more than one frame")
+	}
+}
+
+// TestHTTPServerStreamRequestRejectedAcrossDataLines asserts a server-initiated
+// request is recognised from the whole event rather than from one of its lines:
+// a request spread over several data fields must be refused just the same.
+func TestHTTPServerStreamRequestRejectedAcrossDataLines(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"jsonrpc\": \"2.0\",\ndata: \"id\": 7,\ndata: \"method\": \"sampling/createMessage\"}\n\n")
+	}))
+	defer srv.Close()
+
+	tr := NewHTTPTransport(srv.URL)
+	if err := tr.Send(context.Background(), `{"id":1}`); err == nil {
+		t.Fatal("expected error for server-initiated stream request")
 	}
 }
 
