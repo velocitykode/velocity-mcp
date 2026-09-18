@@ -151,7 +151,7 @@ func (r HandleResult) withError(id jsonrpc.ID, err error) HandleResult {
 		r.Response = jsonrpc.NewErrorResponse(id, rpcErr)
 		return r
 	}
-	r.Response = jsonrpc.NewErrorResponseCode(id, jsonrpc.CodeInternalError, "Something went wrong while processing the request.")
+	r.Response = jsonrpc.NewErrorResponseCode(id, jsonrpc.CodeInternalError, internalErrorMessage)
 	return r
 }
 

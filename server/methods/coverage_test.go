@@ -270,3 +270,70 @@ func TestValidationMessageFallback(t *testing.T) {
 		t.Fatalf("fallback = %q", got)
 	}
 }
+
+// metaPrompt returns a prompt response carrying _meta, which prompts/get must
+// merge into its result.
+type metaPrompt struct{}
+
+func (metaPrompt) Name() string                       { return "meta-prompt" }
+func (metaPrompt) Description() string                { return "carries meta" }
+func (metaPrompt) Arguments() []server.PromptArgument { return nil }
+func (metaPrompt) Handle(context.Context, *server.Request) (*server.Response, error) {
+	return server.Text("body").WithMeta("trace", "abc"), nil
+}
+
+// metaResource returns a resource response carrying _meta, which
+// resources/read must merge into its result.
+type metaResource struct{ docResource }
+
+func (metaResource) Name() string     { return "meta-doc" }
+func (metaResource) URI() string      { return "file://meta.txt" }
+func (metaResource) MimeType() string { return "text/plain" }
+func (metaResource) Read(context.Context, *server.Request) (*server.Response, error) {
+	return server.Text("body").WithMeta("trace", "xyz"), nil
+}
+
+func TestPromptAndResourceResultsMergeMeta(t *testing.T) {
+	tests := []struct {
+		name   string
+		result map[string]any
+		want   string
+	}{
+		{
+			name: "prompts/get",
+			result: decodeResult(t, mustHandle(t, GetPrompt{},
+				ctxWith(server.WithPrompts(metaPrompt{})),
+				req(t, 1, "prompts/get", map[string]any{"name": "meta-prompt"}))),
+			want: "abc",
+		},
+		{
+			name: "resources/read",
+			result: decodeResult(t, mustHandle(t, ReadResource{},
+				ctxWith(server.WithResources(metaResource{})),
+				req(t, 2, "resources/read", map[string]any{"uri": "file://meta.txt"}))),
+			want: "xyz",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			meta, ok := tc.result["_meta"].(map[string]any)
+			if !ok {
+				t.Fatalf("result carries no _meta: %v", tc.result)
+			}
+			if got := meta["trace"]; got != tc.want {
+				t.Errorf("_meta.trace = %v, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// mustHandle runs a method handler and fails the test on an unexpected error.
+func mustHandle(t *testing.T, m server.Method, c *server.Context, r *jsonrpc.Request) *jsonrpc.Response {
+	t.Helper()
+	resp, err := m.Handle(c, r)
+	if err != nil {
+		t.Fatalf("handle %s: %v", r.Method, err)
+	}
+	return resp
+}

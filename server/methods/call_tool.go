@@ -1,8 +1,6 @@
 package methods
 
 import (
-	"errors"
-
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
 	"github.com/velocitykode/velocity-mcp/server"
 )
@@ -40,24 +38,14 @@ func (CallTool) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Respon
 		WithEmitter(c.Emit).
 		WithRequestContext(c.RequestContext())
 
-	resp, err := tool.Handle(c.RequestContext(), request)
+	// The shared invocation path (also used by the tool catalog) validates,
+	// runs and serializes the call; a validation failure and unrepresentable
+	// content already come back as tool-level error results.
+	result, err := server.InvokeTool(c.RequestContext(), tool, request)
 	if err != nil {
-		// A validation failure is a client-facing error result, not a protocol
-		// error, surfaced to the client as a tool-level error response.
-		if errors.Is(err, server.ErrValidation) {
-			resp = server.Error(validationMessage(err))
-		} else {
-			// Unexpected failure: propagate so the server returns a generic
-			// internal error without leaking detail.
-			return nil, err
-		}
-	}
-
-	result, serr := toolResult(resp)
-	if serr != nil {
-		// A content type that cannot be represented in a tool result is a
-		// client-facing error result, not an internal failure.
-		result, _ = toolResult(server.Error("The tool returned content that cannot be represented in a tool result."))
+		// Unexpected failure: propagate so the server returns a generic
+		// internal error without leaking detail.
+		return nil, err
 	}
 	return jsonrpc.NewResult(req.ID, result)
 }

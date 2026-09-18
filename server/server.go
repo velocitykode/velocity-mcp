@@ -75,6 +75,10 @@ type Server struct {
 	templates []URITemplate
 	prompts   []Prompt
 
+	// catalog is the searchable tool catalog configured by the tool catalog
+	// options, or nil when none was configured (see tool_catalog.go).
+	catalog *toolCatalog
+
 	maxPageSize     int
 	defaultPageSize int
 
@@ -134,6 +138,7 @@ func New(name, version string, opts ...Option) *Server {
 	}
 	s.detectUICapability()
 	s.methods = s.buildMethods()
+	finalizeToolCatalog(s)
 	return s
 }
 

@@ -4,32 +4,6 @@ import (
 	"github.com/velocitykode/velocity-mcp/server"
 )
 
-// toolResult builds the tools/call result map from a response: a "content"
-// array of per-item tool shapes, an "isError" flag, and any merged _meta /
-// structuredContent. A
-// content item that cannot be represented in a tool context (e.g. a Blob)
-// surfaces as a tool-level error result rather than failing the call.
-func toolResult(resp *server.Response) (map[string]any, error) {
-	if resp == nil {
-		return map[string]any{"content": []any{}, "isError": false}, nil
-	}
-
-	items := make([]any, 0, len(resp.Contents()))
-	for _, c := range resp.Contents() {
-		shape, err := c.ToTool()
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, shape)
-	}
-
-	result := map[string]any{
-		"content": items,
-		"isError": resp.IsError(),
-	}
-	return mergeResponseMeta(resp, result), nil
-}
-
 // promptResult builds the prompts/get result map from a response: a
 // "description" and a "messages" array, each message carrying a role and a
 // single content shape. A response with
