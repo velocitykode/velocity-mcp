@@ -11,6 +11,7 @@ import (
 	velapp "github.com/velocitykode/velocity/app"
 	"github.com/velocitykode/velocity/auth"
 	"github.com/velocitykode/velocity/chain"
+	"github.com/velocitykode/velocity/contract"
 	"github.com/velocitykode/velocity/router"
 
 	"github.com/velocitykode/velocity-mcp/server"
@@ -54,7 +55,7 @@ func requireAuth(next router.HandlerFunc) router.HandlerFunc {
 	return func(c *router.Context) error {
 		manager := auth.FromContext(c)
 		if manager == nil || manager.User(c.Request) == nil {
-			return router.NewHTTPError(http.StatusUnauthorized)
+			return contract.NewHTTPError(http.StatusUnauthorized)
 		}
 		return next(c)
 	}
@@ -438,7 +439,7 @@ func TestModuleOAuth_NamedSchemeResolvesItsOwnIdentity(t *testing.T) {
 		return func(c *router.Context) error {
 			manager := auth.FromContext(c)
 			if manager == nil {
-				return router.NewHTTPError(http.StatusUnauthorized)
+				return contract.NewHTTPError(http.StatusUnauthorized)
 			}
 			for _, name := range []string{"web", "api"} {
 				scheme, err := manager.Scheme(name)
@@ -446,7 +447,7 @@ func TestModuleOAuth_NamedSchemeResolvesItsOwnIdentity(t *testing.T) {
 					return next(c)
 				}
 			}
-			return router.NewHTTPError(http.StatusUnauthorized)
+			return contract.NewHTTPError(http.StatusUnauthorized)
 		}
 	}
 

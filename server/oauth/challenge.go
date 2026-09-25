@@ -2,10 +2,12 @@ package oauth
 
 import (
 	"bufio"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
 
+	"github.com/velocitykode/velocity/contract"
 	"github.com/velocitykode/velocity/router"
 )
 
@@ -163,11 +165,16 @@ func quoteEscape(v string) string {
 //   - by writing the response itself (c.Status(401), c.JSON(401, ...)), which
 //     is intercepted as the status is committed, while the headers are still
 //     mutable. The interception stays installed on the context for the rest of
-//     the request, so a 401 an application's own router.ErrorHandler renders
-//     after this middleware has returned is covered too;
-//   - by returning an *router.HTTPError with code 401, which the router's
-//     default error rendering writes past the context, so the header is set on
-//     the way out instead.
+//     the request, so a 401 that an error renderer on an enclosing group
+//     (router.ErrorHandlerMiddleware) writes through the context after this
+//     middleware has returned is covered too;
+//   - by returning an error whose status is 401 (contract.NewHTTPError(401),
+//     problem.Unauthorized(), velocity's auth errors, or any error wrapping
+//     one), which the router's error boundary renders after every middleware
+//     has returned and through its own response writer, past the context, so
+//     the header is set on the way out instead. That covers the router's
+//     default rendering, the application's error pipeline and a handler
+//     installed with SetErrorHandler alike.
 //
 // The resource_metadata URL is derived per request from the path being served,
 // so one instance mounted on several MCP routes advertises the right document
@@ -197,8 +204,10 @@ func Challenge(cfg Config) router.MiddlewareFunc {
 			cw := &challengeWriter{ResponseWriter: original, challenge: value}
 			// Deliberately not restored on the way out: the router resets the
 			// context before returning it to its pool, and leaving the wrapper
-			// in place is what lets a custom error renderer writing through the
-			// context still be intercepted.
+			// in place is what lets an error renderer on an enclosing group,
+			// writing through the context, still be intercepted. The router's
+			// own error boundary puts its writer back before it renders, so
+			// what it writes never passes through here.
 			c.Response = cw
 
 			err := next(c)
@@ -212,13 +221,14 @@ func Challenge(cfg Config) router.MiddlewareFunc {
 			}
 
 			// Nothing has been committed yet when the guard reports the refusal
-			// as an error and the router renders it with its default handler,
-			// which writes to its own response writer rather than the context.
-			// The header goes on now, while it can still be changed, and the
-			// wrapper takes it back off should the response turn out not to be a
-			// 401 after all (an application's own renderer answering through the
-			// context, which happens after this returns). A guard that set its
-			// own challenge before returning the error keeps it.
+			// as an error: the router's error boundary renders it later, through
+			// its own response writer rather than the context. The header goes
+			// on now, while it can still be changed. Should an error renderer on
+			// an enclosing group answer through the context with something other
+			// than a 401, the wrapper takes it back off; the boundary's own
+			// answer never passes through the wrapper, so there the error's
+			// status is the whole decision (see isUnauthorized). A guard that
+			// set its own challenge before returning the error keeps it.
 			if !cw.committed && isUnauthorized(err) && original.Header().Get(HeaderWWWAuthenticate) == "" {
 				original.Header().Set(HeaderWWWAuthenticate, value)
 				cw.speculative = true
@@ -245,23 +255,33 @@ func (cfg Config) challengeMetadataURL(c *router.Context) string {
 	return metadataURLFor(origin, requestPath(c))
 }
 
-// isUnauthorized reports whether err is a handler-returned 401 that the
-// router's default error rendering will turn into one.
+// isUnauthorized reports whether err is a handler-returned error the router's
+// error boundary answers with a 401.
 //
-// The test is a direct type assertion, deliberately not errors.As: the default
-// rendering answers an *HTTPError it is handed directly and turns anything
-// else, including a wrapped one, into a 500. Unwrapping here would advertise a
-// bearer challenge on a response that is not a 401. A guard that wants the
-// challenge returns the *HTTPError unwrapped, which is also what gets it the
-// status it asked for.
+// The status is resolved the way the boundary resolves it: the first
+// contract.StatusError in err's chain names it (contract.StatusOf), so an error
+// wrapping a 401, or joined with one, is a 401 too. The boundary writes nothing
+// for an error marking the response already written (contract.Handled), and
+// answers a recovered panic with a 500 whatever its value carries, so neither
+// counts.
 //
-// This path is only for errors the default rendering writes past the context.
-// An application that installs its own router.ErrorHandler renders through the
-// context, where the status is intercepted as it is written and the shape of
-// the error no longer matters.
+// This path is only for errors the boundary renders past the context, which is
+// all of them: it puts the router's own writer back before rendering. The
+// decision rests on the status the error names, so an error handler that
+// answers such an error with another status (a map rule, a render rule, a
+// handler installed with SetErrorHandler) still carries the challenge, which
+// RFC 9110 11.6.1 allows on any response; one that turns an error naming no
+// 401 into a 401 carries none.
 func isUnauthorized(err error) bool {
-	he, ok := err.(*router.HTTPError)
-	return ok && he.Code == http.StatusUnauthorized
+	if err == nil || contract.IsResponseWritten(err) {
+		return false
+	}
+	var recovered contract.RecoveredPanic
+	if errors.As(err, &recovered) {
+		return false
+	}
+	status, _, named := contract.StatusOf(err)
+	return named && status == http.StatusUnauthorized
 }
 
 // challengeWriter wraps the response writer for the duration of one MCP request

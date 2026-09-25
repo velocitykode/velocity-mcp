@@ -153,7 +153,7 @@ func TestModule_WithMiddlewareWrapsRoute(t *testing.T) {
 func TestModule_MiddlewareCanRejectBeforeTransport(t *testing.T) {
 	deny := func(next router.HandlerFunc) router.HandlerFunc {
 		return func(c *router.Context) error {
-			return router.NewHTTPError(http.StatusUnauthorized, "no token")
+			return contract.NewHTTPError(http.StatusUnauthorized, "no token")
 		}
 	}
 	m := New(newTestServer(), WithMiddleware(deny))

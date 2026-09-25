@@ -16,7 +16,8 @@ import (
 	"time"
 
 	clientoauth "github.com/velocitykode/velocity-mcp/client/oauth"
-	"github.com/velocitykode/velocity/exceptions"
+	"github.com/velocitykode/velocity/contract"
+	"github.com/velocitykode/velocity/problem"
 	"github.com/velocitykode/velocity/router"
 )
 
@@ -40,15 +41,21 @@ func rejectJSON(next router.HandlerFunc) router.HandlerFunc {
 // rejectError is a guard that refuses by returning an error, which the router
 // renders after the challenge middleware has already returned.
 func rejectError(next router.HandlerFunc) router.HandlerFunc {
-	return func(c *router.Context) error { return router.NewHTTPError(http.StatusUnauthorized) }
+	return func(c *router.Context) error { return contract.NewHTTPError(http.StatusUnauthorized) }
 }
 
 // rejectWrappedError returns a 401 buried inside another error, which the
-// router does not unwrap and therefore renders as a 500.
+// router resolves through the chain and renders as the 401 it wraps.
 func rejectWrappedError(next router.HandlerFunc) router.HandlerFunc {
 	return func(c *router.Context) error {
-		return &wrapped{inner: router.NewHTTPError(http.StatusUnauthorized)}
+		return &wrapped{inner: contract.NewHTTPError(http.StatusUnauthorized)}
 	}
+}
+
+// failPlain returns an error naming no status, which the router renders as a
+// 500.
+func failPlain(next router.HandlerFunc) router.HandlerFunc {
+	return func(c *router.Context) error { return errors.New("the guard broke") }
 }
 
 type wrapped struct{ inner error }
@@ -216,10 +223,21 @@ func TestChallenge_AttachedToUnauthorized(t *testing.T) {
 			want:   `Bearer realm="mcp", resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:use"`,
 		},
 		{
-			// The router renders a wrapped error as a 500, so no challenge may
-			// be advertised: the header always agrees with the status sent.
-			name:   "a wrapped http error the router renders as 500 gets no challenge",
+			// The router resolves a wrapped error's status through the chain,
+			// so the 401 it wraps is what is sent, and it is challenged like
+			// any other.
+			name:   "a wrapped http error the router renders as 401 is challenged",
 			guards: []router.MiddlewareFunc{rejectWrappedError},
+			path:   "/mcp",
+			cfg:    Config{BaseURL: base},
+			status: http.StatusUnauthorized,
+			want:   `Bearer realm="mcp", resource_metadata="https://mcp.example.test/.well-known/oauth-protected-resource/mcp", scope="mcp:use"`,
+		},
+		{
+			// An error naming no status is rendered as a 500, so no challenge
+			// may be advertised: the header always agrees with the status sent.
+			name:   "an error the router renders as 500 gets no challenge",
+			guards: []router.MiddlewareFunc{failPlain},
 			path:   "/mcp",
 			cfg:    Config{BaseURL: base},
 			status: http.StatusInternalServerError,
@@ -420,7 +438,7 @@ func TestInsufficientScope_ChallengesA403(t *testing.T) {
 		"written": func(c *router.Context) error {
 			return c.JSON(http.StatusForbidden, map[string]string{"error": "insufficient_scope"})
 		},
-		"returned": func(c *router.Context) error { return router.NewHTTPError(http.StatusForbidden) },
+		"returned": func(c *router.Context) error { return contract.NewHTTPError(http.StatusForbidden) },
 	}
 
 	tests := []struct {
@@ -594,38 +612,30 @@ func TestChallenge_OriginDerivedFromRequest(t *testing.T) {
 	}
 }
 
-// An application that installs its own error renderer (velocity's exceptions
-// handler is the idiomatic one) turns a guard's refusal into a response long
-// after this middleware has returned, and writes it through the router context.
-// The challenge has to survive that, or every application with a custom error
-// handler silently loses it.
+// An application that installs its own error renderer (velocity's error
+// pipeline is the idiomatic one) turns a guard's refusal into a response long
+// after this middleware has returned, and writes it through the router's own
+// writer, past the context. The challenge has to survive that, or every
+// application with a custom error handler silently loses it.
 func TestChallenge_SurvivesACustomErrorRenderer(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
 	}{
-		{"an http error the renderer maps itself", router.NewHTTPError(http.StatusUnauthorized)},
-		{"an unauthorized exception", exceptions.NewUnauthorizedHttpException()},
-		{"a wrapped unauthorized exception", errors.Join(exceptions.NewUnauthorizedHttpException())},
+		{"an http error the renderer maps itself", contract.NewHTTPError(http.StatusUnauthorized)},
+		{"an unauthorized problem", problem.Unauthorized()},
+		{"a wrapped unauthorized problem", errors.Join(problem.Unauthorized())},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := router.NewV2()
 			// A renderer that reads the status off the error and answers
-			// through the context, the shape an exceptions handler takes.
-			r.ErrorHandler = func(c *router.Context, err error) {
-				status := http.StatusInternalServerError
-				var httpErr *router.HTTPError
-				var coded interface{ GetStatusCode() int }
-				switch {
-				case errors.As(err, &httpErr):
-					status = httpErr.Code
-				case errors.As(err, &coded):
-					status = coded.GetStatusCode()
-				}
+			// through the context, the shape an error handler takes.
+			r.SetErrorHandler(func(c *router.Context, err error, info router.ErrorInfo) {
+				status, _, _ := contract.StatusOf(err)
 				_ = c.JSON(status, map[string]string{"message": "Unauthenticated."})
-			}
+			})
 			reject := func(next router.HandlerFunc) router.HandlerFunc {
 				return func(c *router.Context) error { return tt.err }
 			}
@@ -649,14 +659,20 @@ func TestChallenge_SurvivesACustomErrorRenderer(t *testing.T) {
 }
 
 // A custom renderer that answers something other than a 401 must not pick up a
-// challenge on the way: the header always agrees with the status sent.
+// challenge on the way: the header always agrees with the status sent. That
+// holds for a renderer writing through the context (router.ErrorHandlerMiddleware
+// on an enclosing group or the router), whose status is seen as it is written.
+// The router's own error boundary renders past the context, so a handler
+// installed with SetErrorHandler is judged by the status the error names
+// instead (see isUnauthorized).
 func TestChallenge_CustomRendererNon401GetsNoChallenge(t *testing.T) {
 	r := router.NewV2()
-	r.ErrorHandler = func(c *router.Context, err error) {
+	r.Use(router.ErrorHandlerMiddleware(func(c *router.Context, err error) bool {
 		_ = c.JSON(http.StatusServiceUnavailable, map[string]string{"message": "later"})
-	}
+		return true
+	}))
 	reject := func(next router.HandlerFunc) router.HandlerFunc {
-		return func(c *router.Context) error { return router.NewHTTPError(http.StatusUnauthorized) }
+		return func(c *router.Context) error { return contract.NewHTTPError(http.StatusUnauthorized) }
 	}
 	r.Post("/mcp", ok).Use(Challenge(Config{BaseURL: "https://mcp.example.test"}), reject)
 
@@ -696,7 +712,7 @@ func TestChallenge_PreservesAGuardsOwnValue(t *testing.T) {
 			guard: func(next router.HandlerFunc) router.HandlerFunc {
 				return func(c *router.Context) error {
 					c.SetHeader(HeaderWWWAuthenticate, guardValue)
-					return router.NewHTTPError(http.StatusUnauthorized)
+					return contract.NewHTTPError(http.StatusUnauthorized)
 				}
 			},
 		},
@@ -726,10 +742,10 @@ func TestChallenge_PreservesACustomRenderersOwnValue(t *testing.T) {
 	const rendered = `Bearer realm="other", error="insufficient_scope", scope="admin"`
 
 	r := router.NewV2()
-	r.ErrorHandler = func(c *router.Context, err error) {
+	r.SetErrorHandler(func(c *router.Context, err error, info router.ErrorInfo) {
 		c.SetHeader(HeaderWWWAuthenticate, rendered)
 		_ = c.JSON(http.StatusUnauthorized, map[string]string{"message": "Unauthenticated."})
-	}
+	})
 	r.Post("/mcp", ok).Use(Challenge(Config{BaseURL: "https://mcp.example.test"}), rejectError)
 
 	w := httptest.NewRecorder()
