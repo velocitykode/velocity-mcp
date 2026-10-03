@@ -434,9 +434,13 @@ func TestACallIntoAServerThatStoppedReadingEndsWithTheTimeout(t *testing.T) {
 			}()
 
 			// The write gives up after the timeout, and the server that would
-			// not take the frame is then stopped, which it has to be asked to:
-			// that is the timeout and the two seconds a server is given.
-			const ceiling = timeout + shutdownGrace + 3*time.Second
+			// not take the frame is then stopped. At worst that takes every
+			// stage of the shutdown: the grace to exit by itself, the grace
+			// after it is asked to, and the grace for its output. The ceiling
+			// is that worst case and a second of slack, which still ends
+			// before a write held to the smallest maximum here (ten timeouts)
+			// could have given up and been stopped.
+			const ceiling = timeout + 2*shutdownGrace + pipeGrace + time.Second
 			select {
 			case err := <-done:
 				var transportErr *TransportError
