@@ -6,6 +6,7 @@ It is a complete, native protocol implementation built on Velocity's own router,
 
 ```bash
 go get github.com/velocitykode/velocity-mcp
+go mod tidy
 ```
 
 > **Status:** pre-1.0. The API is still settling and may change between minor versions.
