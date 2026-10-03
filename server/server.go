@@ -98,6 +98,17 @@ type Server struct {
 	newSessionID SessionIDGenerator
 	mu           sync.RWMutex
 
+	// sessionKey is the HMAC key under which issued session ids are tagged and
+	// later verified (see session.go). Drawn at random in New unless
+	// WithSessionKey supplies one, and never changed after construction.
+	sessionKey []byte
+	// sessionKeyRefused records that WithSessionKey refused a key for being
+	// shorter than MinSessionKeySize, and refusedSessionKeySize the length of
+	// the last one refused (0 for an empty key). New reports it once the logger
+	// is known.
+	sessionKeyRefused     bool
+	refusedSessionKeySize int
+
 	// methods is the resolved per-server method set, built once at construction
 	// from the installed factory plus the directly-implemented methods.
 	methods map[string]Method
@@ -130,14 +141,17 @@ func New(name, version string, opts ...Option) *Server {
 		maxPageSize:     defaultMaxPageSize,
 		defaultPageSize: defaultPageSize,
 		newSessionID:    randomSessionID,
+		sessionKey:      newSessionKey(),
 	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(s)
 		}
 	}
+	s.reportRefusedSessionKey()
 	s.detectUICapability()
 	s.methods = s.buildMethods()
+	reportAdjustedCatalogLimits(s)
 	finalizeToolCatalog(s)
 	return s
 }
@@ -192,6 +206,16 @@ func (s *Server) ResourceTemplates() []URITemplate { return s.templates }
 
 // Prompts returns the registered prompts.
 func (s *Server) Prompts() []Prompt { return s.prompts }
+
+// SupportedProtocolVersions returns the protocol versions the server advertises
+// through server/discover and accepts in a request's protocol metadata, newest
+// first: the default set unless WithProtocolVersions overrode it. A transport
+// that refuses a request over its protocol version before the server sees it
+// reads the list here, so what it reports as supported is what this server
+// speaks rather than what the package defaults to.
+func (s *Server) SupportedProtocolVersions() []ProtocolVersion {
+	return append([]ProtocolVersion(nil), s.versions...)
+}
 
 // implementation builds the schema.Implementation advertised during initialize.
 func (s *Server) implementation() schema.Implementation {
@@ -267,7 +291,12 @@ func (s *Server) dispatch(ctx context.Context, event any) {
 }
 
 // SetSessionIDGenerator overrides the session id generator, primarily for
-// deterministic tests. A nil generator restores the default.
+// deterministic tests. A nil generator restores the default. The generator
+// supplies the id's distinguishing part; the server appends a tag it can later
+// verify (see IssuedSessionID), so the id a client receives is the generator's
+// value followed by "." and the tag, and a test holding the generator's value
+// compares it as a prefix or asks IssuedSessionID. A generator must produce
+// visible ASCII, which is what a session id may contain.
 func (s *Server) SetSessionIDGenerator(fn SessionIDGenerator) {
 	s.mu.Lock()
 	if fn == nil {
@@ -278,10 +307,11 @@ func (s *Server) SetSessionIDGenerator(fn SessionIDGenerator) {
 	s.mu.Unlock()
 }
 
-// sessionID generates a new session id using the configured generator.
+// sessionID issues a new session id: the configured generator's value with the
+// server's verification tag appended.
 func (s *Server) sessionID() string {
 	s.mu.RLock()
 	gen := s.newSessionID
 	s.mu.RUnlock()
-	return gen()
+	return s.tagSessionID(gen())
 }

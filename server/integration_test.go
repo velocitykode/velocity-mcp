@@ -252,13 +252,25 @@ func TestToolReceivesRequestContext(t *testing.T) {
 	}
 }
 
-// TestNullIDRoutedAsNotification asserts a present-but-null id is routed as a
-// notification (no reply).
-func TestNullIDRoutedAsNotification(t *testing.T) {
-	s := server.New("demo", "1.0.0")
-	res := s.Handle(context.Background(), []byte(`{"jsonrpc":"2.0","id":null,"method":"ping"}`), "sess-1")
-	if res.HasResponse {
-		t.Fatalf("present-but-null id should produce no reply, got %+v", res.Response)
+// TestNullIDIsRefusedAsAnInvalidRequest asserts a message stating an id the
+// specification forbids (null, or a number that is not an integer) is answered,
+// with -32600 and a null id, rather than routed as a notification: the client
+// asked for a reply and would otherwise wait for one forever.
+func TestNullIDIsRefusedAsAnInvalidRequest(t *testing.T) {
+	for _, id := range []string{"null", "1.5", "1e3", "-1.0"} {
+		t.Run(id, func(t *testing.T) {
+			s := server.New("demo", "1.0.0")
+			res := s.Handle(context.Background(), []byte(`{"jsonrpc":"2.0","id":`+id+`,"method":"ping"}`), "sess-1")
+			if !res.HasResponse || res.Response == nil {
+				t.Fatal("a request stating an id produced no reply")
+			}
+			if res.Response.Error == nil || res.Response.Error.Code != jsonrpc.CodeInvalidRequest {
+				t.Fatalf("error = %+v, want code %d", res.Response.Error, jsonrpc.CodeInvalidRequest)
+			}
+			if !res.Response.ID.IsNull() {
+				t.Fatalf("reply echoes id %s, want null", res.Response.ID.Raw())
+			}
+		})
 	}
 }
 

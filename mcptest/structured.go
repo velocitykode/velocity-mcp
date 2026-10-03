@@ -94,10 +94,17 @@ func (r *Response) AssertStructuredContentKey(key string, want any) *Response {
 // AssertNoStructuredContent asserts the reply carries no structuredContent
 // member at all, which is the expected shape for a tool that returns only
 // human-readable content. A tool that returned an explicit null did carry one,
-// so it fails here: a null result and no result are different answers.
+// so it fails here: a null result and no result are different answers. It is
+// a statement about a result, so it needs one: it fails on no reply, on a
+// protocol error (which carries no result at all, and may mean the tool never
+// ran) and on a result that is not an object.
 func (r *Response) AssertNoStructuredContent() *Response {
 	if r.t != nil {
 		r.t.Helper()
+	}
+	if fault := r.resultFault(); fault != "" {
+		r.fatalf("mcptest: %s: expected no structured content, but there is no result to inspect: %s", r.method, fault)
+		return r
 	}
 	if got, ok := r.structuredRaw(); ok {
 		r.fatalf("mcptest: %s: expected no structured content, got %s", r.method, describeJSON(got))

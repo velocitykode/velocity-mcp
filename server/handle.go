@@ -96,18 +96,22 @@ func (s *Server) handle(ctx context.Context, raw []byte, sessionID string, emit 
 // route dispatches a parsed request to its handler: the special initialize path
 // (which assigns a session id and dispatches SessionInitialized), the
 // tools/call path (which dispatches the tool events), or a plain method
-// lookup. An unknown method is a MethodNotFound error response.
+// lookup. An unknown method is a MethodNotFound error response, and so is a
+// method the request's own revision does not have: initialize called by a
+// request that declares the discovery revision in its _meta (see
+// predatesProtocolMeta), which must neither open a session nor be told the
+// method exists.
 func (s *Server) route(ctx context.Context, sc *Context, req *jsonrpc.Request, sessionID string) HandleResult {
 	if req.Method == "initialize" {
+		if meta, hasMeta := requestMeta(req); predatesProtocolMeta(req.Method) && !isLegacyMeta(meta, hasMeta) {
+			return methodNotFound(req)
+		}
 		return s.handleInitialize(ctx, sc, req)
 	}
 
 	method, ok := s.methods[req.Method]
 	if !ok {
-		return HandleResult{
-			Response:    jsonrpc.NewErrorResponseCode(req.ID, jsonrpc.CodeMethodNotFound, "The method ["+req.Method+"] was not found."),
-			HasResponse: true,
-		}
+		return methodNotFound(req)
 	}
 
 	// The argument bag is shaped once here, after the method is known and before
@@ -123,6 +127,15 @@ func (s *Server) route(ctx context.Context, sc *Context, req *jsonrpc.Request, s
 
 	resp, err := s.runMethod(sc, req, method)
 	return HandleResult{Response: resp, HasResponse: true, SessionID: ""}.withError(req.ID, err)
+}
+
+// methodNotFound answers a request naming a method this server does not serve
+// under the revision the request is made with.
+func methodNotFound(req *jsonrpc.Request) HandleResult {
+	return HandleResult{
+		Response:    jsonrpc.NewErrorResponseCode(req.ID, jsonrpc.CodeMethodNotFound, "The method ["+req.Method+"] was not found."),
+		HasResponse: true,
+	}
 }
 
 // runMethod invokes a method handler and normalizes any error into a JSON-RPC
@@ -287,9 +300,11 @@ func clientInfoFromParams(params map[string]any) *event.ClientInfo {
 	return ci
 }
 
-// randomSessionID returns a 128-bit hex-encoded random session id. crypto/rand
-// is used so session ids are unguessable; on the vanishingly rare read error an
-// empty string is returned rather than panicking (library code never panics).
+// randomSessionID is the default session id generator: a 128-bit hex-encoded
+// random value, to which the server appends its verification tag before
+// issuing it (see session.go). crypto/rand is used so session ids are
+// unguessable; on the vanishingly rare read error an empty string is returned
+// rather than panicking (library code never panics).
 func randomSessionID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {

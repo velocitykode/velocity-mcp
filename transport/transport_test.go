@@ -19,10 +19,20 @@ import (
 // is concurrency-safe so it can back the Fake's concurrent tests.
 type stubServer struct {
 	fn func(ctx context.Context, raw []byte, sessionID string) server.HandleResult
+	// issued, when set, vouches for the session ids the stub claims to have
+	// issued; a stub without it vouches for none, like any server that offers
+	// no check.
+	issued func(id string) bool
 
 	mu            sync.Mutex
 	lastSessionID string
 	calls         int
+}
+
+// IssuedSessionID lets the stub stand in for a server that can vouch for the
+// session ids it issued.
+func (s *stubServer) IssuedSessionID(id string) bool {
+	return s.issued != nil && s.issued(id)
 }
 
 func (s *stubServer) Handle(ctx context.Context, raw []byte, sessionID string) server.HandleResult {
@@ -31,6 +41,13 @@ func (s *stubServer) Handle(ctx context.Context, raw []byte, sessionID string) s
 	s.calls++
 	s.mu.Unlock()
 	return s.fn(ctx, raw, sessionID)
+}
+
+// lastSession returns the session id the most recent Handle call was given.
+func (s *stubServer) lastSession() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastSessionID
 }
 
 func (s *stubServer) callCount() int {

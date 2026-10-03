@@ -322,7 +322,9 @@ func TestDecodeNotificationFrame(t *testing.T) {
 	}{
 		{"notification", `{"jsonrpc":"2.0","method":"notifications/progress","params":{"p":1}}`, true, "notifications/progress", `{"p":1}`},
 		{"notification without params", `{"jsonrpc":"2.0","method":"notifications/initialized"}`, true, "notifications/initialized", ""},
-		{"null id is a notification", `{"jsonrpc":"2.0","id":null,"method":"x"}`, true, "x", ""},
+		// A frame stating an id, null included, is a reply (one the server
+		// could correlate to nothing), not a notification.
+		{"null id is not a notification", `{"jsonrpc":"2.0","id":null,"method":"x"}`, false, "", ""},
 		// The inbound parser rejects params that are not an object, but a frame
 		// the server emitted is evidence, not a request to validate: dropping it
 		// would hide the emission from every notification assertion, so it is
@@ -1110,7 +1112,7 @@ func TestNotificationWithoutParams(t *testing.T) {
 			}
 
 			tb := &recordingTB{}
-			r := s.withNotifications(0, newResponse(tb, "tools/call", nil))
+			r := s.withNotifications(0, nil, newResponse(tb, "tools/call", nil))
 			if len(r.notifications) != 1 {
 				t.Fatalf("attributed %d notifications, want 1", len(r.notifications))
 			}

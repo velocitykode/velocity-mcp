@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -89,46 +90,157 @@ func TestProtocolMetaAcceptsEmptyArrayCapabilities(t *testing.T) {
 	}
 }
 
+// metaRequest builds a request for method declaring version in its protocol
+// metadata, with the client capabilities the discovery handshake requires.
+func metaRequest(method, version string) string {
+	return `{"jsonrpc":"2.0","id":1,"method":"` + method + `","params":{"_meta":{` +
+		`"io.modelcontextprotocol/protocolVersion":"` + version + `","io.modelcontextprotocol/clientCapabilities":{}}}}`
+}
+
 // TestUnsupportedProtocolVersion asserts a well-formed request naming a version
 // the server does not speak is refused with the dedicated code and told which
-// versions it may retry with.
+// versions it may retry with. The list is every version the server speaks
+// (2026-07-28, versioning, protocol version negotiation: the error lists the
+// versions the server does support, and its example names an initialize-era
+// revision beside the current one): the ones accepted in a request's metadata,
+// which follow the server's configuration rather than a package constant, and
+// the ones the initialize handshake negotiates for every server, each once.
 func TestUnsupportedProtocolVersion(t *testing.T) {
-	s := server.New("demo", "1.0.0")
-	res := handle(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientCapabilities":{}}}}`)
-
-	if code := errorOf(t, res).Code; code != -32022 {
-		t.Fatalf("code = %d, want -32022", code)
+	tests := []struct {
+		name       string
+		configured []server.ProtocolVersion
+		requested  string
+		supported  string
+	}{
+		{"the default server", nil, "1900-01-01", `["2026-07-28","2025-11-25","2025-06-18"]`},
+		{"a revision newer than any", nil, "2999-01-01", `["2026-07-28","2025-11-25","2025-06-18"]`},
+		{"a server pinned to another revision", []server.ProtocolVersion{"2027-01-01"}, "2026-07-28", `["2027-01-01","2025-11-25","2025-06-18"]`},
+		{"a server also accepting an initialize revision per request", []server.ProtocolVersion{"2025-11-25", "2026-07-28"}, "1900-01-01", `["2025-11-25","2026-07-28","2025-06-18"]`},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := server.New("demo", "1.0.0", server.WithProtocolVersions(tt.configured...))
+			res := handle(t, s, metaRequest("tools/list", tt.requested))
+			if code := errorOf(t, res).Code; code != jsonrpc.CodeUnsupportedProtocolVersion {
+				t.Fatalf("code = %d, want %d", code, jsonrpc.CodeUnsupportedProtocolVersion)
+			}
 
-	// Assert the wire form: the client reads the supported list and the
-	// rejected value out of the encoded error, not the in-process struct.
-	encoded, err := json.Marshal(res.Response)
-	if err != nil {
-		t.Fatalf("marshal response: %v", err)
-	}
-	const want = `{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"requested":"2025-11-25","supported":["2026-07-28"]}}}`
-	if string(encoded) != want {
-		t.Fatalf("wire form =\n%s\nwant\n%s", encoded, want)
+			// Assert the wire form: the client reads the supported list and the
+			// rejected value out of the encoded error, not the in-process struct.
+			encoded, err := json.Marshal(res.Response)
+			if err != nil {
+				t.Fatalf("marshal response: %v", err)
+			}
+			want := `{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"requested":"` +
+				tt.requested + `","supported":` + tt.supported + `}}}`
+			if string(encoded) != want {
+				t.Fatalf("wire form =\n%s\nwant\n%s", encoded, want)
+			}
+		})
 	}
 }
 
-// TestUnsupportedProtocolVersionFollowsServerConfiguration asserts the accepted
-// set is the server's own advertised list, not a package constant, so a server
-// pinned to another revision reports that revision.
-func TestUnsupportedProtocolVersionFollowsServerConfiguration(t *testing.T) {
-	s := server.New("demo", "1.0.0", server.WithProtocolVersions("2027-01-01"))
-	res := handle(t, s, modernRequest(1, "tools/list"))
+// TestUnsupportedProtocolVersionErrorIsTheOneTheServerRaises asserts the
+// exported error a transport writes is the error the server itself raises for
+// the same server and the same requested version, so the two layers cannot
+// report different lists.
+func TestUnsupportedProtocolVersionErrorIsTheOneTheServerRaises(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured []server.ProtocolVersion
+	}{
+		{"the default server", nil},
+		{"a server pinned to another revision", []server.ProtocolVersion{"2027-01-01"}},
+		{"a server also accepting an initialize revision per request", []server.ProtocolVersion{"2025-11-25", "2026-07-28"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := server.New("demo", "1.0.0", server.WithProtocolVersions(tt.configured...))
+			raised, err := json.Marshal(errorOf(t, handle(t, s, metaRequest("tools/list", "1900-01-01"))))
+			if err != nil {
+				t.Fatalf("marshal raised error: %v", err)
+			}
+			built, err := json.Marshal(server.UnsupportedProtocolVersionError(s.SupportedProtocolVersions(), "1900-01-01"))
+			if err != nil {
+				t.Fatalf("marshal built error: %v", err)
+			}
+			if string(raised) != string(built) {
+				t.Fatalf("the server raised\n%s\nbut the exported error is\n%s", raised, built)
+			}
+		})
+	}
+}
 
-	if code := errorOf(t, res).Code; code != jsonrpc.CodeUnsupportedProtocolVersion {
-		t.Fatalf("code = %d", code)
+// TestEveryVersionReportedAsSupportedIsServed asserts the supported list is
+// truthful: each version in it is served when the client states it the way its
+// revision does, in the request's metadata for one accepted there and through
+// the initialize handshake for one that handshake negotiates.
+func TestEveryVersionReportedAsSupportedIsServed(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured []server.ProtocolVersion
+	}{
+		{"the default server", nil},
+		{"a server pinned to another revision", []server.ProtocolVersion{"2027-01-01"}},
+		{"a server also accepting an initialize revision per request", []server.ProtocolVersion{"2025-11-25", "2026-07-28"}},
 	}
-	encoded, err := json.Marshal(res.Response.Error)
-	if err != nil {
-		t.Fatalf("marshal error: %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := server.New("demo", "1.0.0", server.WithProtocolVersions(tt.configured...))
+			data, ok := errorOf(t, handle(t, s, metaRequest("tools/list", "1900-01-01"))).Data.(map[string]any)
+			if !ok {
+				t.Fatal("the refusal carries no data object")
+			}
+			supported, _ := data["supported"].([]server.ProtocolVersion)
+			if len(supported) == 0 {
+				t.Fatalf("data.supported = %#v, want a list of versions", data["supported"])
+			}
+			accepted := s.SupportedProtocolVersions()
+			for _, version := range supported {
+				request := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"` + version + `"}}`
+				if slices.Contains(accepted, version) {
+					request = metaRequest("tools/list", version)
+				}
+				res := handle(t, s, request)
+				if res.Response == nil || res.Response.Error != nil {
+					t.Fatalf("version %s was reported as supported and then refused: %+v", version, res.Response)
+				}
+			}
+		})
 	}
-	const want = `{"code":-32022,"message":"Unsupported protocol version","data":{"requested":"2026-07-28","supported":["2027-01-01"]}}`
-	if string(encoded) != want {
-		t.Fatalf("wire form =\n%s\nwant\n%s", encoded, want)
+}
+
+// TestHandshakeRevisionDeclaredPerRequestIsMisplacedNotUnsupported asserts a
+// request declaring, in its metadata, a revision the server speaks only through
+// the initialize handshake is answered -32602 and not -32022: the revision is
+// in the supported list, so reporting it as the unsupported one would have the
+// error contradict itself and send the client round again with the same value.
+// The check still runs ahead of method lookup.
+func TestHandshakeRevisionDeclaredPerRequestIsMisplacedNotUnsupported(t *testing.T) {
+	tests := []struct {
+		name    string
+		method  string
+		version string
+	}{
+		{"the newest initialize revision", "tools/list", "2025-11-25"},
+		{"the older initialize revision", "tools/list", "2025-06-18"},
+		{"on discovery", "server/discover", "2025-11-25"},
+		{"on a method that does not exist", "no/such/method", "2025-06-18"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := server.New("demo", "1.0.0")
+			rpcErr := errorOf(t, handle(t, s, metaRequest(tt.method, tt.version)))
+			if rpcErr.Code != jsonrpc.CodeInvalidParams {
+				t.Fatalf("code = %d, want %d", rpcErr.Code, jsonrpc.CodeInvalidParams)
+			}
+			if !strings.Contains(rpcErr.Message, tt.version) || !strings.Contains(rpcErr.Message, "initialize") {
+				t.Fatalf("message %q does not name the version and the handshake that negotiates it", rpcErr.Message)
+			}
+			if rpcErr.Data != nil {
+				t.Fatalf("data = %#v, want none", rpcErr.Data)
+			}
+		})
 	}
 }
 
@@ -187,7 +299,7 @@ func TestDeclaringEitherMemberDemandsBoth(t *testing.T) {
 // never told to fix the wrong thing.
 func TestProtocolMetaValidatedBeforeDispatch(t *testing.T) {
 	s := server.New("demo", "1.0.0")
-	res := handle(t, s, `{"jsonrpc":"2.0","id":1,"method":"no/such/method","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-06-18","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	res := handle(t, s, `{"jsonrpc":"2.0","id":1,"method":"no/such/method","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}`)
 	if code := errorOf(t, res).Code; code != jsonrpc.CodeUnsupportedProtocolVersion {
 		t.Fatalf("code = %d, want %d", code, jsonrpc.CodeUnsupportedProtocolVersion)
 	}
@@ -268,6 +380,11 @@ func TestInspectMessage(t *testing.T) {
 		},
 		{name: "notification", raw: `{"jsonrpc":"2.0","method":"tools/list"}`},
 		{name: "null id", raw: `{"jsonrpc":"2.0","id":null,"method":"tools/list"}`},
+		// The specification permits a string or an integer; a number with a
+		// fraction or an exponent is neither, and the server refuses it with a
+		// null id, so there is nothing for the guard to correlate.
+		{name: "fractional id", raw: `{"jsonrpc":"2.0","id":1.5,"method":"tools/list"}`},
+		{name: "exponent id", raw: `{"jsonrpc":"2.0","id":1e3,"method":"tools/list"}`},
 		{name: "missing method", raw: `{"jsonrpc":"2.0","id":1}`},
 		{name: "non-string method", raw: `{"jsonrpc":"2.0","id":1,"method":7}`},
 		// A null method decodes into the empty string without error, so it has
@@ -317,13 +434,16 @@ func TestInspectMessage(t *testing.T) {
 }
 
 // TestInspectMessagePreservesIDForm asserts the id is handed back in its
-// original JSON form, so a reply correlates to the call whatever type the
-// client used for the id.
+// original JSON form, so a reply correlates to the call whichever of the two
+// permitted types the client used for the id, and in the exact spelling it
+// used: an integer beyond float64 precision is not renumbered and a negative
+// zero keeps its sign.
 func TestInspectMessagePreservesIDForm(t *testing.T) {
 	tests := []struct{ raw, want string }{
 		{modernRequest(7, "tools/list"), "7"},
 		{`{"jsonrpc":"2.0","id":"abc","method":"tools/list","params":{}}`, `"abc"`},
-		{`{"jsonrpc":"2.0","id":1.5,"method":"tools/list","params":{}}`, "1.5"},
+		{`{"jsonrpc":"2.0","id":9007199254740993,"method":"tools/list","params":{}}`, "9007199254740993"},
+		{`{"jsonrpc":"2.0","id":-0,"method":"tools/list","params":{}}`, "-0"},
 	}
 	for _, tt := range tests {
 		info, ok := server.InspectMessage([]byte(tt.raw))

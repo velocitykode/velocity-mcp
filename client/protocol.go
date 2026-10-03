@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"sync"
 	"time"
 
@@ -22,6 +23,15 @@ type protocol struct {
 	// now is the local clock the freshness of a kept result is measured on. It
 	// is set once, when the protocol is built.
 	now func() time.Time
+
+	// timeout bounds one attempt at an exchange, from the request going out to
+	// the response coming back, when the caller's context carries no deadline
+	// of its own and the transport states no timeout (see exchangeTimeout). The
+	// bound is enforced here rather than by the transport: a transport times
+	// out a wait for one frame, and a server sending progress or log
+	// notifications would start that clock over with every one, while the
+	// specification has a maximum timeout enforced regardless of them.
+	timeout time.Duration
 
 	// notified is told the method of every notification the server sends, so
 	// whoever keeps what the server stated hears when the server says it has
@@ -63,6 +73,29 @@ type protocol struct {
 	// taken for what the server now states: a server that restarts between two
 	// calls may answer with definitions it did not answer with before.
 	generation int64
+
+	// unaccounted holds the requests this client stopped waiting for and told
+	// the server so, over the channel now open, whose reply may still arrive on
+	// it. A server may answer one with an error it puts no id on, and while a
+	// withdrawn request is unaccounted for such an error is its reply and not
+	// that of the request in flight. A server that conforms never answers a
+	// cancelled request at all, so an entry does not wait for a reply for
+	// ever: it lapses after withdrawnReplyWindow, the oldest goes when there
+	// are more than maxUnaccounted, and all go when the channel is given up.
+	unaccounted []withdrawnRequest
+
+	// maxTimeout is the maximum one exchange may take however much progress
+	// the server reports, or zero for the default of maxTimeoutFactor times the
+	// timeout. nextToken numbers the progress tokens this client hands out.
+	maxTimeout time.Duration
+	nextToken  int64
+
+	// silent reports that the last request over the open channel timed out and
+	// the server has sent no frame of any kind since. A server that is only
+	// slow on one request goes on answering others; one that says nothing at
+	// all through a second timeout is taken for hung, and is given up rather
+	// than cancelled at again.
+	silent bool
 }
 
 // noCapabilities is the capability set of a client that declares none.
@@ -73,11 +106,98 @@ func newProtocol(transport Transport, clientInfo schema.Implementation) *protoco
 	return &protocol{
 		transport:          transport,
 		now:                time.Now,
+		timeout:            defaultTimeout,
 		clientInfo:         clientInfo,
 		clientCapabilities: noCapabilities,
 		nextID:             1,
 		exchange:           make(chan struct{}, 1),
 	}
+}
+
+// setTimeout sets the bound on one attempt at an exchange over a transport that
+// does not state its own. A duration of zero or less leaves an attempt bounded
+// by the caller's context alone.
+func (p *protocol) setTimeout(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.timeout = d
+}
+
+// timeoutStated is what a transport that states its timeout implements. The
+// transports of this package do, so a timeout set on one, as the recipe of a
+// named client sets it, bounds the exchange as well as the wait for a frame.
+type timeoutStated interface {
+	Timeout() time.Duration
+}
+
+// exchangeTimeout returns the bound on one attempt: the timeout the transport
+// states, or the client's own over a transport that states none.
+func (p *protocol) exchangeTimeout() time.Duration {
+	if stated, ok := p.transport.(timeoutStated); ok {
+		return stated.Timeout()
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.timeout
+}
+
+// maxTimeoutFactor is how many times the timeout an exchange may take at the
+// most, when no maximum was set: long enough for a call that reports progress
+// to do real work, and short enough that a caller is never held for good.
+const maxTimeoutFactor = 10
+
+// setMaxTimeout sets the maximum an exchange may take whatever progress the
+// server reports. A duration of zero or less restores the default.
+func (p *protocol) setMaxTimeout(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d < 0 {
+		d = 0
+	}
+	p.maxTimeout = d
+}
+
+// exchangeMaximum returns the maximum an exchange may take, given its timeout.
+func (p *protocol) exchangeMaximum(timeout time.Duration) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.maxTimeout > 0 {
+		return p.maxTimeout
+	}
+	return timeout * maxTimeoutFactor
+}
+
+// bounded returns the context one attempt runs under. A caller's own deadline
+// is the bound when the context carries one, and nothing here cuts the attempt
+// before it. Otherwise the attempt runs under a clock: the timeout, which
+// progress reported for the request starts over, inside the maximum, which
+// nothing does. The clock is nil when the caller's deadline is the bound.
+//
+// The cancel function releases whatever the attempt still holds, as the response
+// stream a transport left open, and is called once the attempt is over.
+func (p *protocol) bounded(ctx context.Context) (context.Context, *exchangeClock, context.CancelFunc) {
+	timeout := p.exchangeTimeout()
+	if _, hasDeadline := ctx.Deadline(); hasDeadline || timeout <= 0 {
+		held, cancel := context.WithCancel(ctx)
+		return held, nil, cancel
+	}
+	capped, cancel := context.WithTimeout(ctx, p.exchangeMaximum(timeout))
+	clock := newExchangeClock(capped, timeout)
+	return clock, clock, func() {
+		clock.release()
+		cancel()
+	}
+}
+
+// boundedOnce returns a context for work made of several requests that is given
+// the time of one as a whole: the caller's own when it carries a deadline, and
+// otherwise the caller's bounded by the timeout.
+func (p *protocol) boundedOnce(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := p.exchangeTimeout()
+	if _, hasDeadline := ctx.Deadline(); hasDeadline || timeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // acquireExchange takes the exchange gate, giving up when ctx is done. A
@@ -132,7 +252,7 @@ func (p *protocol) identity() schema.Implementation {
 // recorded and reported by every request that would have carried it, so a
 // client never quietly advertises less than it was told to.
 func (p *protocol) setClientCapabilities(capabilities map[string]any) {
-	encoded, err := json.Marshal(capabilities)
+	encoded, err := marshalWire(capabilities)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err != nil {
@@ -406,6 +526,8 @@ func (p *protocol) setConnecting(connecting bool) {
 func (p *protocol) disconnect() {
 	p.mu.Lock()
 	p.connected = false
+	p.unaccounted = nil
+	p.silent = false
 	p.mu.Unlock()
 	_ = p.transport.Disconnect()
 }
@@ -432,7 +554,7 @@ func (p *protocol) dispatch(ctx context.Context, method string, params any) (jso
 // handed the encoded params of the attempt it belongs to, so a header can only
 // state what that attempt's body carries. If the server reports the session as
 // expired the connection is renegotiated once and the request retried.
-func (p *protocol) dispatchWith(ctx context.Context, method string, params any, extra headerFunc) (json.RawMessage, error) {
+func (p *protocol) dispatchWith(ctx context.Context, method string, params any, extra mirrorFunc) (json.RawMessage, error) {
 	reply, err := p.exchangeWith(ctx, method, params, terms{headers: extra})
 	if err != nil {
 		return nil, err
@@ -447,8 +569,43 @@ func (p *protocol) dispatchWith(ctx context.Context, method string, params any, 
 // context it was handed out in, and is refused before it is sent when the
 // credential now presented belongs to another.
 type terms struct {
-	headers       headerFunc
+	headers       mirrorFunc
 	authorization int64
+}
+
+// mirrorFunc renders the extra request headers of one attempt from the encoded
+// params the attempt puts on the wire. It is called at most once per attempt,
+// only for a protocol version that carries headers, and while the exchange is
+// held: under is the connection the attempt travels over, which nothing can
+// replace until the attempt is done, and over which the function may ask the
+// server what it needs to know before the frame goes out.
+type mirrorFunc func(ctx context.Context, under heldConnection, params json.RawMessage) (map[string]string, error)
+
+// heldConnection is the connection an exchange travels over, in the hands of
+// whoever holds that exchange. The gate is held for as long as the value is in
+// use, so the connection it names is the one standing, the credential its
+// frames present is the one that was settled for the exchange, and a request
+// made through it travels over the same connection as the request it serves.
+type heldConnection struct {
+	proto         *protocol
+	version       ProtocolVersion
+	generation    int64
+	authorization int64
+}
+
+// ask makes a request over the held connection and reports what it brought
+// back, as an exchange of its own would.
+func (h heldConnection) ask(ctx context.Context, method string, params any) (answered, error) {
+	result, err := h.proto.attempt(ctx, method, params, h.version, nil)
+	if err != nil {
+		return answered{}, err
+	}
+	return answered{
+		result:        result,
+		generation:    h.generation,
+		receivedAt:    h.proto.now(),
+		authorization: h.authorization,
+	}, nil
 }
 
 // errAuthorizationChanged is a sentinel signalling that an exchange was not
@@ -502,32 +659,76 @@ func (p *protocol) exchangeFor(ctx context.Context, methodFor func(ProtocolVersi
 	}
 
 	method := methodFor(conn.version)
-	result, err := p.attempt(ctx, method, params, conn.version, held.headers)
+	result, err := p.attempt(ctx, method, params, conn.version, p.rendering(ctx, held, conn))
 	if errors.Is(err, errSessionExpired) {
 		conn, err = p.standingConnection(ctx, held)
 		if err != nil {
 			return answered{}, err
 		}
 		method = methodFor(conn.version)
-		result, err = p.attempt(ctx, method, params, conn.version, held.headers)
+		result, err = p.attempt(ctx, method, params, conn.version, p.rendering(ctx, held, conn))
+	}
+	if isUnsupportedVersion(err) {
+		conn, err = p.renegotiated(ctx, conn, err)
+		if err != nil {
+			return answered{}, err
+		}
+		method = methodFor(conn.version)
+		result, err = p.attempt(ctx, method, params, conn.version, p.rendering(ctx, held, conn))
 	}
 	if err != nil {
 		return answered{}, err
-	}
-	receivedAt := p.now()
-	// A result the server did not complete is not the answer to the call, so it
-	// never reaches a decoder that would read it as an empty one.
-	if unfinished := unfinishedResult(method, result); unfinished != nil {
-		return answered{}, unfinished
 	}
 	// The gate is still held here: the deferred release runs once this value has
 	// been built, so the connection read is the one the result arrived over.
 	return answered{
 		result:        result,
 		generation:    p.connectionGeneration(),
-		receivedAt:    receivedAt,
+		receivedAt:    p.now(),
 		authorization: conn.authorization,
 	}, nil
+}
+
+// isUnsupportedVersion reports whether a failure is the server refusing the
+// protocol version a request was made at.
+func isUnsupportedVersion(err error) bool {
+	var rpcErr *jsonrpc.Error
+	return errors.As(err, &rpcErr) && rpcErr.Code == CodeUnsupportedProtocolVersion
+}
+
+// renegotiated settles the connection again after the server refused a request
+// for the version the connection was settled on, and returns the connection to
+// repeat the request over. The caller holds the exchange lock.
+//
+// A version is agreed once, by the handshake, and a server may stop accepting
+// it afterwards: it was rolled back, or the request reached another replica.
+// The specification has a client that is told so select a version both sides
+// support and try again, and probe again when what it assumed of the server no
+// longer holds. The refused request did nothing on the server, so repeating it
+// is safe. The handshake runs over the channel that is open, as it does when
+// what a server advertised has run out, and the connection it settles is a new
+// one to everything that dates what it keeps by the connection it was read
+// over.
+//
+// The rejection stands when there is nothing to renegotiate: the version is
+// pinned, so no other may be settled, or the handshake settles the very version
+// the server just refused, and a second attempt at it would be refused again.
+func (p *protocol) renegotiated(ctx context.Context, refused *negotiatedConnection, rejection error) (*negotiatedConnection, error) {
+	if pinned, _ := p.pinnedVersion(); pinned != "" {
+		return nil, rejection
+	}
+	p.mu.Lock()
+	p.connected = false
+	p.conn = nil
+	p.mu.Unlock()
+	if err := p.settle(ctx, refused.authorization); err != nil {
+		return nil, err
+	}
+	conn := p.connection()
+	if conn.version == refused.version {
+		return nil, rejection
+	}
+	return conn, nil
 }
 
 // standingConnection settles the connection an attempt travels over and returns
@@ -554,33 +755,61 @@ func (p *protocol) standingConnection(ctx context.Context, held terms) (*negotia
 	return conn, nil
 }
 
-// headerFunc renders the extra request headers of one exchange from the encoded
-// params the attempt puts on the wire. It is called at most once per attempt,
-// and only for a protocol version that carries headers.
+// headerFunc renders the extra request headers of one attempt from the encoded
+// params it puts on the wire: the mirrorFunc of an exchange, bound to the
+// connection that attempt travels over.
 type headerFunc func(params json.RawMessage) (map[string]string, error)
+
+// rendering binds the extra headers an exchange is held to render to the
+// connection one attempt at it travels over. The caller holds the exchange
+// lock.
+func (p *protocol) rendering(ctx context.Context, held terms, conn *negotiatedConnection) headerFunc {
+	if held.headers == nil {
+		return nil
+	}
+	under := heldConnection{
+		proto:         p,
+		version:       conn.version,
+		generation:    p.connectionGeneration(),
+		authorization: conn.authorization,
+	}
+	return func(params json.RawMessage) (map[string]string, error) {
+		return held.headers(ctx, under, params)
+	}
+}
 
 // attempt performs a single request/response exchange at the given protocol
 // version, answering any server-initiated requests interleaved before the
 // matching response. The caller holds the exchange lock.
+//
+// Every result passes through here, the handshake's included, and none is
+// returned unless it is the whole answer: a result the server did not complete,
+// one stating a result type the specification does not define, or one that is
+// not an object at all is reported instead, so no decoder ever reads it as an
+// empty success.
 func (p *protocol) attempt(ctx context.Context, method string, params any, version ProtocolVersion, extra headerFunc) (json.RawMessage, error) {
 	p.useProtocol(version)
 
-	encoded, err := p.encodeParams(params, version)
+	// A request that asks for progress carries a progress token of the
+	// client's own unless the caller's params already name one, which is what
+	// lets a server say it is still working and keeps the timeout from cutting
+	// work that is under way (see exchangeClock).
+	var token json.RawMessage
+	if p.asksForProgress(method) {
+		p.mu.Lock()
+		p.nextToken++
+		token = json.RawMessage(strconv.FormatInt(p.nextToken, 10))
+		p.mu.Unlock()
+	}
+	encoded, err := p.encodeParams(params, version, token)
 	if err != nil {
 		return nil, err
 	}
+	token = progressTokenOf(encoded)
 
-	p.mu.Lock()
-	id := jsonrpc.IntID(p.nextID)
-	p.nextID++
-	p.mu.Unlock()
-
-	req := jsonrpc.Request{JSONRPC: jsonrpc.Version, ID: id, Method: method, Params: encoded}
-	frame, err := json.Marshal(&req)
-	if err != nil {
-		return nil, wrapError(err, "unable to encode request")
-	}
-
+	// The headers are rendered before the request is given its id and its
+	// bound: rendering them may ask the server something first, and what that
+	// takes is not time the request itself has had.
 	var headers map[string]string
 	if handshakeFor(version) == handshakeDiscovery {
 		headers = mirroredHeaders(method, encoded)
@@ -593,11 +822,29 @@ func (p *protocol) attempt(ctx context.Context, method string, params any, versi
 		}
 	}
 
-	result, rpcErr, err := p.exchangeFrame(ctx, string(frame), headers, id)
+	p.mu.Lock()
+	id := jsonrpc.IntID(p.nextID)
+	p.nextID++
+	p.mu.Unlock()
+
+	req := jsonrpc.Request{JSONRPC: jsonrpc.Version, ID: id, Method: method, Params: encoded}
+	frame, err := marshalWire(&req)
 	if err != nil {
-		// The channel itself failed: the stream is out of step with the server,
-		// so the connection goes down and the next request negotiates again.
-		p.disconnectIfConnected()
+		return nil, wrapError(err, "unable to encode request")
+	}
+
+	ctx, clock, cancel := p.bounded(ctx)
+	defer cancel()
+
+	result, rpcErr, err := p.exchangeFrame(ctx, method, string(frame), headers, id, version, progressOf{clock: clock, token: token})
+	if err != nil {
+		// A request the client stopped waiting for is withdrawn where the
+		// transport lets the connection outlive it. Anything else is the
+		// channel itself failing: the stream is out of step with the server, so
+		// the connection goes down and the next request negotiates again.
+		if !p.withdrawn(ctx, err, id, version) {
+			p.disconnectIfConnected()
+		}
 		return nil, err
 	}
 	if rpcErr != nil {
@@ -606,7 +853,162 @@ func (p *protocol) attempt(ctx context.Context, method string, params any, versi
 		// the caller may simply try something else.
 		return nil, rpcErr
 	}
+	if unfinished := unfinishedResult(method, result); unfinished != nil {
+		return nil, unfinished
+	}
 	return result, nil
+}
+
+// cancellationGrace bounds the sending of a cancellation. It is sent on behalf
+// of a request whose own time is up, so it is given a moment of its own, and a
+// short one: the exchange gate is held while it goes out.
+const cancellationGrace = time.Second
+
+// withdrawn reports whether a failed exchange was a request the client stopped
+// waiting for and has withdrawn, so that the connection stands. The MCP
+// specification (basic/utilities/cancellation) has the client cancel such a
+// request, a timeout the same way as a caller giving up, and over stdio it has
+// to: the server is one process for every request, not one per call.
+//
+// Only a transport that says an abandoned request leaves its channel in use
+// takes part (see CancellationAware), and only once the connection is settled:
+// a handshake request is not one a client may cancel, and what a failed
+// handshake costs is the negotiation's to decide. A cancellation that cannot be
+// sent is the channel failing after all.
+func (p *protocol) withdrawn(ctx context.Context, failure error, id jsonrpc.ID, version ProtocolVersion) bool {
+	aware, ok := p.transport.(CancellationAware)
+	if !ok {
+		return false
+	}
+	var timeoutErr *TimeoutError
+	timedOut := errors.As(failure, &timeoutErr) || errors.Is(failure, context.DeadlineExceeded)
+	if !timedOut && !errors.Is(failure, context.Canceled) {
+		return false
+	}
+	p.mu.Lock()
+	settled := p.connected && !p.connecting
+	// A second timeout in a row with nothing heard from the server in between
+	// is not a slow request, it is a server that has stopped: keeping the
+	// connection would have every request after this one wait out its timeout
+	// against the same silence. The connection is given up, so the next request
+	// starts over, with a new subprocess where the server is one.
+	hung := timedOut && p.silent
+	if settled && timedOut {
+		p.silent = !hung
+	}
+	p.mu.Unlock()
+	if !settled || hung {
+		return false
+	}
+	if !aware.NotifiesCancellation(version) {
+		return true
+	}
+
+	reason := "the caller withdrew the request"
+	if timedOut {
+		reason = "the request timed out"
+	}
+	// The context of the exchange is done, which is why the request is being
+	// withdrawn; the cancellation travels under one of its own.
+	notice, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancellationGrace)
+	defer cancel()
+	params := map[string]any{"requestId": id.Raw(), "reason": reason}
+	if p.notify(notice, "notifications/cancelled", params, version) != nil {
+		return false
+	}
+	p.account(id)
+	return true
+}
+
+// withdrawnRequest is a request this client withdrew, and when.
+type withdrawnRequest struct {
+	id string
+	at time.Time
+}
+
+// withdrawnReplyWindow is how long after a request was withdrawn an error
+// carrying a null id is still taken for its reply. A server that answers a
+// cancelled request does so when the cancellation reaches it; past that, an
+// error nobody can correlate belongs to the request in flight, as it always
+// did.
+const withdrawnReplyWindow = 5 * time.Second
+
+// maxUnaccounted caps how many withdrawn requests are kept at once.
+const maxUnaccounted = 64
+
+// repliesPerRequest is implemented by a transport that carries the reply to
+// each request on a channel of that request's own, as streamable HTTP carries
+// it on the response to the POST: nothing a server sends late can reach a later
+// request there, so nothing is kept to tell the two apart.
+type repliesPerRequest interface {
+	repliesPerRequest()
+}
+
+// account records a request withdrawn over a channel on which its reply may
+// still arrive.
+func (p *protocol) account(id jsonrpc.ID) {
+	if _, apart := p.transport.(repliesPerRequest); apart {
+		return
+	}
+	now := p.now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lapseLocked(now)
+	p.unaccounted = append(p.unaccounted, withdrawnRequest{id: string(id.Raw()), at: now})
+	if excess := len(p.unaccounted) - maxUnaccounted; excess > 0 {
+		p.unaccounted = append(p.unaccounted[:0], p.unaccounted[excess:]...)
+	}
+}
+
+// lapseLocked drops the withdrawn requests whose reply is no longer waited
+// for. The caller holds p.mu.
+func (p *protocol) lapseLocked(now time.Time) {
+	kept := p.unaccounted[:0]
+	for _, withdrawn := range p.unaccounted {
+		if now.Sub(withdrawn.at) < withdrawnReplyWindow {
+			kept = append(kept, withdrawn)
+		}
+	}
+	p.unaccounted = kept
+}
+
+// heard records that the server sent a frame, whatever it was: it is not silent.
+func (p *protocol) heard() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.silent = false
+}
+
+// accountedFor records that the reply to a withdrawn request has arrived.
+func (p *protocol) accountedFor(id jsonrpc.ID) {
+	raw := string(id.Raw())
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for index, withdrawn := range p.unaccounted {
+		if withdrawn.id == raw {
+			p.unaccounted = append(p.unaccounted[:index], p.unaccounted[index+1:]...)
+			return
+		}
+	}
+}
+
+// repliesToWithdrawn reports whether an error carrying a null id is the reply to
+// a request this client withdrew, and accounts for one such request when it is.
+// The error cannot say which request it answers, so it is taken for the oldest
+// business still open on the channel: a request withdrawn within the window in
+// which a server answers one. Each withdrawn request takes one such error with
+// it and no more, and when none is open the error answers the request in
+// flight.
+func (p *protocol) repliesToWithdrawn() bool {
+	now := p.now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lapseLocked(now)
+	if len(p.unaccounted) == 0 {
+		return false
+	}
+	p.unaccounted = append(p.unaccounted[:0], p.unaccounted[1:]...)
+	return true
 }
 
 // renderExtraHeaders renders the extra headers of an exchange, if it has any,
@@ -619,21 +1021,36 @@ func renderExtraHeaders(extra headerFunc, params json.RawMessage) (map[string]st
 }
 
 // exchangeFrame sends one request frame and reads until the matching response
-// arrives, serving any server-initiated frames in between. A JSON-RPC error
-// answering the request is returned separately from a failure of the exchange:
-// only the latter costs the connection.
-func (p *protocol) exchangeFrame(ctx context.Context, frame string, headers map[string]string, id jsonrpc.ID) (json.RawMessage, *jsonrpc.Error, error) {
+// arrives, serving any server-initiated frames in between as the revision of the
+// connection allows. A JSON-RPC error answering the request is returned
+// separately from a failure of the exchange: only the latter costs the
+// connection.
+//
+// The context is consulted after every frame that was not the response, so the
+// bound on the exchange holds over any transport: one that honours the context
+// ends the read itself, and reports the end in its own words, and one that does
+// not is read from no more once the context is done, however many frames it
+// would still deliver.
+//
+// A progress notification naming the token of this request starts its timeout
+// over; any other frame leaves the clock running.
+func (p *protocol) exchangeFrame(ctx context.Context, method, frame string, headers map[string]string, id jsonrpc.ID, version ProtocolVersion, progress progressOf) (json.RawMessage, *jsonrpc.Error, error) {
 	if err := p.send(ctx, frame, headers); err != nil {
 		return nil, nil, err
 	}
 
-	for {
+	for passedOver := false; ; passedOver = true {
+		if err := ctx.Err(); passedOver && err != nil {
+			return nil, nil, exchangeEnded(method, err)
+		}
 		raw, err := p.receive(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
+		p.heard()
+		progress.report([]byte(raw))
 
-		if served, err := p.serveServerFrame(ctx, []byte(raw)); err != nil {
+		if served, err := p.serveServerFrame(ctx, []byte(raw), version); err != nil {
 			return nil, nil, err
 		} else if served {
 			continue
@@ -645,8 +1062,15 @@ func (p *protocol) exchangeFrame(ctx context.Context, frame string, headers map[
 		}
 		// A response for another id belongs to an exchange that has already
 		// been abandoned; keep reading for ours. An error carrying a null id
-		// cannot be correlated, so it answers the request in flight.
-		if !bytes.Equal(resp.ID.Raw(), id.Raw()) && !(resp.ID.IsNull() && resp.Error != nil) {
+		// cannot be correlated: it answers the request in flight, unless a
+		// request withdrawn before this one was sent is still unanswered, in
+		// which case it is that request's reply and is passed over with it.
+		switch {
+		case bytes.Equal(resp.ID.Raw(), id.Raw()):
+		case !resp.ID.IsNull():
+			p.accountedFor(resp.ID)
+			continue
+		case resp.Error == nil || p.repliesToWithdrawn():
 			continue
 		}
 		if resp.Error != nil {
@@ -656,78 +1080,201 @@ func (p *protocol) exchangeFrame(ctx context.Context, frame string, headers map[
 	}
 }
 
+// progressDeaf is implemented by a transport on which reported progress cannot
+// keep a request alive, because the transport bounds the whole request by a
+// timeout of its own. A request over it asks for no progress: the token would
+// only have a server report progress that changes nothing. It is the one place
+// that decides this for a transport: a transport that learns to let progress
+// extend a request stops implementing it, and its requests ask.
+type progressDeaf interface {
+	progressDeaf()
+}
+
+// asksForProgress reports whether a request of the given method carries a
+// progress token of the client's own. The requests that do are the ones a
+// server may take long over, because they run something of the server's or of
+// what it fronts: calling a tool, reading a resource, rendering a prompt. A
+// listing, a liveness check, and the handshake do not, and are sent as they
+// always were.
+func (p *protocol) asksForProgress(method string) bool {
+	if _, deaf := p.transport.(progressDeaf); deaf {
+		return false
+	}
+	switch method {
+	case "tools/call", "resources/read", "prompts/get":
+		return true
+	default:
+		return false
+	}
+}
+
+// progressOf is what one exchange listens for progress with: the clock its
+// timeout runs on, which is nil when the caller's deadline is the bound, and
+// the progress token its request carried, which is nil when it carried none.
+type progressOf struct {
+	clock *exchangeClock
+	token json.RawMessage
+}
+
+// report starts the timeout over when the frame is a progress notification for
+// this exchange's token. A notification of anything else, or of progress on
+// another request, is not this request being worked on.
+func (o progressOf) report(frame []byte) {
+	if o.clock == nil || o.token == nil {
+		return
+	}
+	var notification struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params struct {
+			Token json.RawMessage `json:"progressToken"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(frame, &notification); err != nil || len(notification.ID) != 0 ||
+		notification.Method != "notifications/progress" {
+		return
+	}
+	if bytes.Equal(trimJSONSpace(notification.Params.Token), o.token) {
+		o.clock.progressed()
+	}
+}
+
+// progressTokenOf returns the progress token the encoded params of a request
+// carry, or nil when they carry none.
+func progressTokenOf(encoded json.RawMessage) json.RawMessage {
+	var params struct {
+		Meta struct {
+			Token json.RawMessage `json:"progressToken"`
+		} `json:"_meta"`
+	}
+	if err := json.Unmarshal(encoded, &params); err != nil {
+		return nil
+	}
+	token := trimJSONSpace(params.Meta.Token)
+	if len(token) == 0 || bytes.Equal(token, []byte("null")) {
+		return nil
+	}
+	return token
+}
+
+// exchangeEnded reports an exchange its context ended before the response
+// arrived, while the transport went on delivering other frames. A deadline that
+// passed is a timeout like any other; a cancelled context is the caller
+// withdrawing the request, which is neither a timeout nor a failure of the
+// channel.
+func exchangeEnded(method string, cause error) error {
+	if errors.Is(cause, context.Canceled) {
+		return wrapError(cause, "the wait for a response to ["+method+"] was cancelled")
+	}
+	return NewTimeoutError("timed out while waiting for a response to ["+method+"]", cause)
+}
+
+// marshalWire encodes a value for the wire. It is json.Marshal without the
+// escaping of the characters HTML gives a meaning to, which the standard
+// encoder applies to everything it writes, a json.RawMessage included: a member
+// the client holds raw in order to send it back exactly as it arrived, as the
+// state token of an unfinished result and the cursor of a listing are, would
+// leave with its ampersands, angle brackets and line separators rewritten as
+// escapes. Every frame the client sends is encoded here, so what was kept byte
+// for byte goes out byte for byte.
+func marshalWire(value any) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	// The encoder ends what it writes with a newline, which is no part of it.
+	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
+}
+
 // encodeParams encodes the params member of a request, adding the protocol
-// metadata a discovery-era request carries. Metadata already present in the
+// metadata a discovery-era request carries and, when token is set, the progress
+// token the request asks for progress under. Metadata already present in the
 // caller's params wins, so a caller can override any of it.
-func (p *protocol) encodeParams(params any, version ProtocolVersion) (json.RawMessage, error) {
+func (p *protocol) encodeParams(params any, version ProtocolVersion, token json.RawMessage) (json.RawMessage, error) {
+	discovery := handshakeFor(version) == handshakeDiscovery
 	var members map[string]json.RawMessage
 	if params != nil {
-		raw, err := json.Marshal(params)
+		raw, err := marshalWire(params)
 		if err != nil {
 			return nil, wrapError(err, "unable to encode request params")
 		}
-		if handshakeFor(version) != handshakeDiscovery {
+		if !discovery && token == nil {
 			return raw, nil
 		}
 		if err := json.Unmarshal(raw, &members); err != nil {
 			return nil, wrapError(err, "unable to encode request params")
 		}
 	}
-	if handshakeFor(version) != handshakeDiscovery {
+	if !discovery && token == nil {
 		return nil, nil
 	}
 
 	if members == nil {
 		members = map[string]json.RawMessage{}
 	}
-	meta, err := p.protocolMeta(members["_meta"], version)
+	meta, err := p.protocolMeta(members["_meta"], version, token)
 	if err != nil {
 		return nil, err
 	}
 	members["_meta"] = meta
 
-	raw, err := json.Marshal(members)
+	raw, err := marshalWire(members)
 	if err != nil {
 		return nil, wrapError(err, "unable to encode request params")
 	}
 	return raw, nil
 }
 
-// protocolMeta builds the _meta member of a discovery-era request: the protocol
-// version, the client capabilities, and the client identity, with any metadata
-// the caller already supplied layered on top.
-func (p *protocol) protocolMeta(existing json.RawMessage, version ProtocolVersion) (json.RawMessage, error) {
-	capabilities, err := p.declaredCapabilities()
-	if err != nil {
-		return nil, err
+// protocolMeta builds the _meta member of a request: on the discovery revision
+// the protocol version, the client capabilities, and the client identity, and
+// on any revision the progress token when one is given, with any metadata the
+// caller already supplied layered on top.
+func (p *protocol) protocolMeta(existing json.RawMessage, version ProtocolVersion, token json.RawMessage) (json.RawMessage, error) {
+	meta := map[string]any{}
+	if handshakeFor(version) == handshakeDiscovery {
+		capabilities, err := p.declaredCapabilities()
+		if err != nil {
+			return nil, err
+		}
+		meta[MetaProtocolVersion] = version
+		meta[MetaClientCapabilities] = capabilities
+		meta[MetaClientInfo] = p.identity().ToMap()
 	}
-	meta := map[string]any{
-		MetaProtocolVersion:    version,
-		MetaClientCapabilities: capabilities,
-		MetaClientInfo:         p.identity().ToMap(),
+	if token != nil {
+		meta["progressToken"] = token
 	}
 	if len(existing) > 0 {
-		var supplied map[string]any
-		if err := json.Unmarshal(existing, &supplied); err != nil {
+		var supplied map[string]json.RawMessage
+		if err := json.Unmarshal(existing, &supplied); err != nil || supplied == nil {
 			return nil, newError("unable to encode request params: the [_meta] member must be an object")
 		}
 		for key, value := range supplied {
 			meta[key] = value
 		}
 	}
-	raw, err := json.Marshal(meta)
+	raw, err := marshalWire(meta)
 	if err != nil {
 		return nil, wrapError(err, "unable to encode request params")
 	}
 	return raw, nil
 }
 
-// serveServerFrame handles a frame initiated by the server. It answers ping
-// requests, declines other requests with method-not-found, passes the method of
-// a notification on to whoever listens for them, and reports (false) for
-// anything that is a client-bound response. The returned bool indicates the
-// frame was consumed.
-func (p *protocol) serveServerFrame(ctx context.Context, raw []byte) (bool, error) {
+// serveServerFrame handles a frame initiated by the server, as the revision of
+// the connection it arrived over allows. It passes the method of a notification
+// on to whoever listens for them, and reports (false) for anything that is a
+// client-bound response. The returned bool indicates the frame was consumed.
+//
+// A request from the server is answered only over the initialize-era revisions,
+// which let either peer send one: ping is answered and anything else declined
+// with method-not-found, over whichever transport carries the connection. The
+// discovery revision forbids a server to send requests and a client to send
+// responses on both of its transport bindings, so a request arriving over such
+// a connection is the server breaking the protocol, and the exchange fails with
+// nothing written back: a client that answered would break it too, and a server
+// could have it write one frame for every frame it sent.
+func (p *protocol) serveServerFrame(ctx context.Context, raw []byte, version ProtocolVersion) (bool, error) {
 	var probe struct {
 		Method *string         `json:"method"`
 		ID     json.RawMessage `json:"id"`
@@ -735,17 +1282,30 @@ func (p *protocol) serveServerFrame(ctx context.Context, raw []byte) (bool, erro
 	if err := json.Unmarshal(raw, &probe); err != nil || probe.Method == nil {
 		return false, nil
 	}
-	// A notification (no id) asks for no answer. What it says may still outdate
-	// something the client keeps, so its method is passed on.
-	if len(bytes.TrimSpace(probe.ID)) == 0 || bytes.Equal(bytes.TrimSpace(probe.ID), []byte("null")) {
+	// A notification has no id member at all and asks for no answer. What it
+	// says may still outdate something the client keeps, so its method is
+	// passed on.
+	if len(probe.ID) == 0 {
 		if p.notified != nil {
 			p.notified(*probe.Method)
 		}
 		return true, nil
 	}
-
+	// The specification gives a request an id that is a string or a number,
+	// never null, and a notification none. A frame naming a method under any
+	// other id is neither: it is not acted on as a notification, which would
+	// let a frame the protocol does not define outdate what the client keeps,
+	// and there is no id to answer it under. It ends the exchange as any other
+	// frame the client cannot read does, on every revision.
 	var id jsonrpc.ID
-	_ = id.UnmarshalJSON(probe.ID)
+	if err := id.UnmarshalJSON(probe.ID); err != nil || !id.IsValidRequestID() {
+		return true, newError("invalid JSON-RPC message from server: the [" + *probe.Method +
+			"] frame carries an id that is neither a string nor a number")
+	}
+	if handshakeFor(version) == handshakeDiscovery {
+		return true, newError("the server sent a [" + *probe.Method + "] request over a connection of protocol version [" +
+			version + "], which forbids it; this client sends no response")
+	}
 
 	var resp *jsonrpc.Response
 	if *probe.Method == "ping" {
@@ -754,7 +1314,7 @@ func (p *protocol) serveServerFrame(ctx context.Context, raw []byte) (bool, erro
 		resp = jsonrpc.NewErrorResponseCode(id, jsonrpc.CodeMethodNotFound,
 			"method ["+*probe.Method+"] is not supported by this client")
 	}
-	out, err := json.Marshal(resp)
+	out, err := marshalWire(resp)
 	if err != nil {
 		return true, wrapError(err, "unable to encode response to server request")
 	}
@@ -764,19 +1324,30 @@ func (p *protocol) serveServerFrame(ctx context.Context, raw []byte) (bool, erro
 	return true, nil
 }
 
-// notify sends a parameterless notification at the given protocol version.
-func (p *protocol) notify(ctx context.Context, method string, version ProtocolVersion) error {
+// notify sends a notification at the given protocol version. Its params are
+// encoded as those of a request are, so a discovery-era notification carries the
+// protocol metadata and the headers mirroring it, and one of an initialize-era
+// revision carries what it was given and nothing else.
+func (p *protocol) notify(ctx context.Context, method string, params any, version ProtocolVersion) error {
 	p.useProtocol(version)
 
-	n, err := jsonrpc.NewNotification(method, nil)
+	encoded, err := p.encodeParams(params, version, nil)
+	if err != nil {
+		return err
+	}
+	out, err := marshalWire(struct {
+		JSONRPC string          `json:"jsonrpc"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params,omitempty"`
+	}{JSONRPC: jsonrpc.Version, Method: method, Params: encoded})
 	if err != nil {
 		return wrapError(err, "unable to encode notification")
 	}
-	out, err := json.Marshal(n)
-	if err != nil {
-		return wrapError(err, "unable to encode notification")
+	var headers map[string]string
+	if handshakeFor(version) == handshakeDiscovery {
+		headers = mirroredHeaders(method, encoded)
 	}
-	return p.send(ctx, string(out), nil)
+	return p.send(ctx, string(out), headers)
 }
 
 // useProtocol tells a protocol-aware transport which version the next frames

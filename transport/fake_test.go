@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"strings"
 	"sync"
 	"testing"
 
@@ -99,8 +100,8 @@ func TestFake_Inject_DrivesServer(t *testing.T) {
 	if resp.Error != nil {
 		t.Fatalf("initialize errored: %+v", resp.Error)
 	}
-	if f.SessionID() != "fixed-session" {
-		t.Fatalf("session id not retained: %q", f.SessionID())
+	if sid := f.SessionID(); !strings.HasPrefix(sid, "fixed-session.") || !srv.IssuedSessionID(sid) {
+		t.Fatalf("session id not retained: %q", sid)
 	}
 
 	// tools/call should carry the retained session id and return the sum.

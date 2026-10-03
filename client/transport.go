@@ -90,6 +90,31 @@ type AuthorizationAware interface {
 	AuthorizationContext() int64
 }
 
+// CancellationAware is the optional hook a Transport implements when a request
+// the client has stopped waiting for, because its caller withdrew it or its
+// timeout passed, leaves the channel fit for the next one. The client then keeps
+// the connection and withdraws the request the way the transport says the
+// revision of the connection has it withdrawn.
+//
+// A stdio server is one process serving every request over one stream, and the
+// specification has a client cancel a request there by sending a
+// notifications/cancelled frame naming it; stopping the server instead would
+// take everything else it holds with it. Over streamable HTTP the revision
+// decides: closing the response stream is the cancellation of the revision that
+// has no session, and the revisions before it ask for the notification.
+//
+// A transport that does not implement it keeps working as it always has: an
+// exchange that is abandoned costs the connection, and the next request
+// negotiates a new one.
+type CancellationAware interface {
+	// NotifiesCancellation reports whether a request abandoned over a
+	// connection of the given protocol version is withdrawn by sending the
+	// server a notifications/cancelled frame. When it reports false the
+	// transport has withdrawn the request itself by the time the wait for its
+	// response returned.
+	NotifiesCancellation(version ProtocolVersion) bool
+}
+
 // defaultTimeout is the per-operation timeout applied when neither the caller's
 // context nor SetTimeout provides one.
 const defaultTimeout = 30 * time.Second

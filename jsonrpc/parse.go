@@ -15,7 +15,7 @@ var errTrailingData = errors.New("jsonrpc: trailing data after JSON value")
 // wire-level diagnostics are stable and descriptive.
 const (
 	msgParseError       = "Parse error: Invalid JSON was received by the server."
-	msgInvalidID        = "Invalid Request: The [id] member must be a string, number."
+	msgInvalidID        = "Invalid Request: The [id] member must be a string or an integer."
 	msgInvalidVersion   = "Invalid Request: The [jsonrpc] member must be exactly [2.0]."
 	msgMissingMethodReq = "Invalid Request: The [method] member is required and must be a string."
 	msgMissingMethodNtf = "Invalid Request: Invalid or missing [method]. Must be a string."
@@ -38,17 +38,6 @@ func (e envelope) has(key string) bool {
 	return ok
 }
 
-// hasNonNull reports whether the named member is present AND its value is not
-// JSON null. A present-but-null member counts as "not set", which is how
-// messages are routed: a present-but-null id is treated as absent.
-func (e envelope) hasNonNull(key string) bool {
-	v, ok := e[key]
-	if !ok {
-		return false
-	}
-	return !bytes.Equal(bytes.TrimSpace(v), []byte("null"))
-}
-
 // raw returns the raw token for the named member, or nil when absent.
 func (e envelope) raw(key string) json.RawMessage {
 	if v, ok := e[key]; ok {
@@ -59,20 +48,23 @@ func (e envelope) raw(key string) json.RawMessage {
 
 // IsNotificationBytes reports whether the incoming JSON-RPC message should be
 // routed as a notification (no reply) rather than a request. A message is a
-// notification when it has no usable id member: either the id is absent or it is
-// present but JSON null. A present-but-null id is treated as absent when
-// choosing between a request and a notification. Malformed JSON yields a
-// CodeParseError.
+// notification exactly when it carries no id member at all (JSON-RPC 2.0,
+// section 4.1). A message that states an id, null included, asked for a reply
+// and is routed as a request, where an id the specification does not permit (a
+// null, a fraction) is refused as an invalid request: treating a null id as
+// absent answered such a message with nothing, so a client waiting on the reply
+// it asked for waited forever. Malformed JSON yields a CodeParseError.
 func IsNotificationBytes(data []byte) (bool, error) {
 	var env envelope
 	if err := strictUnmarshal(data, &env); err != nil {
 		return false, NewError(CodeParseError, msgParseError)
 	}
-	return !env.hasNonNull("id"), nil
+	return !env.has("id"), nil
 }
 
 // ParseRequest strictly decodes a JSON-RPC request. It rejects malformed JSON
-// (CodeParseError), a missing or non-string/number id, a jsonrpc version other
+// (CodeParseError), a missing id or one that is neither a string nor an
+// integer, a jsonrpc version other
 // than exactly "2.0", and a missing or non-string method (all CodeInvalidRequest).
 // On the id and version/method checks the recovered id (when usable) is returned
 // so callers can correlate the error response.
@@ -90,7 +82,7 @@ func ParseRequest(data []byte) (*Request, ID, *Error) {
 	}
 
 	if !id.IsValidRequestID() {
-		// Only a usable (string/number) id is echoed; otherwise null.
+		// Only a usable (string or integer) id is echoed; otherwise null.
 		return nil, NullID(), NewError(CodeInvalidRequest, msgInvalidID)
 	}
 

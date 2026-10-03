@@ -99,9 +99,25 @@ func assertStdioTornDown(t *testing.T, tr *StdioTransport) {
 	}
 }
 
+// assertStdioStands asserts the subprocess is still the one the transport
+// talks to: a frame written to it is the frame read back, which is what cat
+// does with one.
+func assertStdioStands(t *testing.T, tr *StdioTransport) {
+	t.Helper()
+	const frame = `{"jsonrpc":"2.0","id":9,"method":"ping"}`
+	if err := tr.Send(context.Background(), frame); err != nil {
+		t.Fatalf("send after the wait ended = %v, want the subprocess still there", err)
+	}
+	got, err := tr.Receive(context.Background())
+	if err != nil || got != frame {
+		t.Fatalf("receive after the wait ended = %q, %v; want the frame the subprocess echoes", got, err)
+	}
+}
+
 func TestStdioReceiveTimeoutIsATypedTimeout(t *testing.T) {
-	// `sleep` never writes, so the receive can only end in a timeout.
-	tr := NewStdioTransport("sleep", "5")
+	// `cat` is sent nothing and so writes nothing: the receive can only end
+	// in a timeout.
+	tr := NewStdioTransport("cat")
 	tr.SetTimeout(50 * time.Millisecond)
 	if err := tr.Connect(context.Background()); err != nil {
 		t.Fatalf("connect: %v", err)
@@ -117,11 +133,14 @@ func TestStdioReceiveTimeoutIsATypedTimeout(t *testing.T) {
 	if err.Error() != "timed out while waiting for server response" {
 		t.Fatalf("error = %q", err.Error())
 	}
-	assertStdioTornDown(t, tr)
+	// A wait that timed out is the end of one request, not of the server that
+	// holds every other: the subprocess stands.
+	tr.SetTimeout(30 * time.Second)
+	assertStdioStands(t, tr)
 }
 
 func TestStdioReceiveHonoursAContextDeadline(t *testing.T) {
-	tr := NewStdioTransport("sleep", "5")
+	tr := NewStdioTransport("cat")
 	if err := tr.Connect(context.Background()); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -139,9 +158,9 @@ func TestStdioReceiveHonoursAContextDeadline(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want it to carry the context deadline", err)
 	}
-	// A deadline that elapsed is a timeout like any other, so the subprocess is
-	// stopped with it.
-	assertStdioTornDown(t, tr)
+	// A deadline that elapsed is a timeout like any other, and the subprocess
+	// stands through it as it does through one.
+	assertStdioStands(t, tr)
 }
 
 // TestStdioReceiveSeparatesCancellationFromATimeout pins that a caller
@@ -150,7 +169,7 @@ func TestStdioReceiveHonoursAContextDeadline(t *testing.T) {
 // retries with the older handshake, while a cancelled context is the caller
 // giving up and no handshake would do better.
 func TestStdioReceiveSeparatesCancellationFromATimeout(t *testing.T) {
-	tr := NewStdioTransport("sleep", "5")
+	tr := NewStdioTransport("cat")
 	if err := tr.Connect(context.Background()); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -179,12 +198,12 @@ func TestStdioReceiveSeparatesCancellationFromATimeout(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want it to carry the cancellation", err)
 	}
-	if err.Error() != "the wait for a response from subprocess [sleep] was cancelled: context canceled" {
+	if err.Error() != "the wait for a response from subprocess [cat] was cancelled: context canceled" {
 		t.Fatalf("error = %q", err.Error())
 	}
-	// The exchange was abandoned mid-flight, so the subprocess goes with it: the
-	// stream it owns can no longer be trusted to be in step.
-	assertStdioTornDown(t, tr)
+	// The caller gave up on one request. The subprocess serves all the others,
+	// so it stands; the request is the client's to withdraw.
+	assertStdioStands(t, tr)
 }
 
 func TestStdioTransportCarriesNoProtocolHooks(t *testing.T) {

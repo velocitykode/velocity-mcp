@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -17,8 +18,17 @@ const discoveryMeta = `"_meta":{"io.modelcontextprotocol/clientCapabilities":{},
 	`"io.modelcontextprotocol/clientInfo":{"name":"Acme MCP App","version":"9.9.9"},` +
 	`"io.modelcontextprotocol/protocolVersion":"2026-07-28"}`
 
+// discoveryMetaAsking is discoveryMeta of a request that asks for progress under
+// the given token, which every request after the handshake does.
+func discoveryMetaAsking(token string) string {
+	return strings.TrimSuffix(discoveryMeta, "}") + `,"progressToken":` + token + `}`
+}
+
 // TestRequestParamsOnTheWire pins the exact params member a request carries in
-// each protocol era, taken from the frame the client actually sent.
+// each protocol era, taken from the frame the client actually sent. A request
+// the server may take long over carries a progress token of the client's own,
+// numbered from one over the life of the client; every other request is sent
+// as it was before there was one.
 func TestRequestParamsOnTheWire(t *testing.T) {
 	legacy := []string{methodNotFoundFrame(), initializeFrame(ProtocolV20251125)}
 	discovery := []string{discoverFrame(LatestProtocolVersion)}
@@ -44,7 +54,7 @@ func TestRequestParamsOnTheWire(t *testing.T) {
 				_, err := c.CallTool(context.Background(), "add", map[string]any{"a": 1})
 				return err
 			},
-			wantParams: `{"arguments":{"a":1},"name":"add"}`,
+			wantParams: `{"_meta":{"progressToken":1},"arguments":{"a":1},"name":"add"}`,
 		},
 		{
 			name:       "a legacy request without params sends none",
@@ -69,7 +79,7 @@ func TestRequestParamsOnTheWire(t *testing.T) {
 				_, err := c.CallTool(context.Background(), "add", map[string]any{"a": 1})
 				return err
 			},
-			wantParams: `{` + discoveryMeta + `,"arguments":{"a":1},"name":"add"}`,
+			wantParams: `{` + discoveryMetaAsking("1") + `,"arguments":{"a":1},"name":"add"}`,
 		},
 	}
 
@@ -89,6 +99,164 @@ func TestRequestParamsOnTheWire(t *testing.T) {
 				t.Fatalf("params = %s, want %s", got, tc.wantParams)
 			}
 		})
+	}
+}
+
+// TestOnlyALongRunningRequestAsksForProgress pins which requests carry a
+// progress token, on each transport and each handshake. Calling a tool, reading
+// a resource and getting a prompt may take a server long, and ask for progress
+// so that its reports keep the timeout from cutting them. A liveness check, a
+// listing, the catalogue a tool call reads first, and the handshake ask for
+// none. Over the HTTP transport no request asks: the transport bounds a whole
+// request by its own timeout, so progress could not keep one alive there.
+func TestOnlyALongRunningRequestAsksForProgress(t *testing.T) {
+	calls := []struct {
+		method string
+		call   func(c *Client) error
+	}{
+		{"ping", func(c *Client) error { return c.Ping(context.Background()) }},
+		{"tools/list", func(c *Client) error { _, err := c.Tools(context.Background()); return err }},
+		{"resources/list", func(c *Client) error { _, err := c.Resources(context.Background()); return err }},
+		{"prompts/list", func(c *Client) error { _, err := c.Prompts(context.Background()); return err }},
+		{"tools/call", func(c *Client) error { _, err := c.CallTool(context.Background(), "add", nil); return err }},
+		{"resources/read", func(c *Client) error { _, err := c.ReadResource(context.Background(), "file:///a"); return err }},
+		{"prompts/get", func(c *Client) error { _, err := c.GetPrompt(context.Background(), "p", nil); return err }},
+	}
+	asking := map[string]bool{"tools/call": true, "resources/read": true, "prompts/get": true}
+
+	// serve answers every request of either handshake with a result every call
+	// above can read.
+	result := func(method string) map[string]any {
+		switch method {
+		case "server/discover":
+			return map[string]any{"resultType": "complete", "supportedVersions": []any{LatestProtocolVersion},
+				"capabilities": map[string]any{}, "ttlMs": 600000}
+		case "initialize":
+			return map[string]any{"protocolVersion": ProtocolV20251125, "capabilities": map[string]any{},
+				"serverInfo": map[string]any{"name": "s", "version": "1"}}
+		default:
+			return map[string]any{"resultType": "complete", "tools": []any{}, "resources": []any{}, "prompts": []any{},
+				"content": []any{}, "contents": []any{}, "messages": []any{}, "isError": false, "ttlMs": 600000}
+		}
+	}
+
+	type sent struct {
+		method string
+		token  bool
+	}
+	read := func(frame string) sent {
+		var decoded struct {
+			Method string `json:"method"`
+			Params struct {
+				Meta map[string]json.RawMessage `json:"_meta"`
+			} `json:"params"`
+		}
+		_ = json.Unmarshal([]byte(frame), &decoded)
+		_, token := decoded.Params.Meta["progressToken"]
+		return sent{method: decoded.Method, token: token}
+	}
+
+	transports := []struct {
+		name string
+		// asks is whether a long-running request asks for progress over it.
+		asks bool
+		// run makes every call over a client of the given handshake and
+		// returns the frames that were sent.
+		run func(t *testing.T, legacy bool) []string
+	}{
+		{
+			name: "a transport that lets progress extend a request",
+			asks: true,
+			run: func(t *testing.T, legacy bool) []string {
+				f := newFakeTransport()
+				f.handlers = map[string]fakeHandler{}
+				for _, method := range []string{"initialize", "ping", "tools/list", "resources/list", "prompts/list",
+					"tools/call", "resources/read", "prompts/get"} {
+					f.on(method, func(id jsonrpc.ID, _ json.RawMessage) *jsonrpc.Response {
+						resp, _ := jsonrpc.NewResult(id, result(method))
+						return resp
+					})
+				}
+				if !legacy {
+					f.on("server/discover", func(id jsonrpc.ID, _ json.RawMessage) *jsonrpc.Response {
+						resp, _ := jsonrpc.NewResult(id, result("server/discover"))
+						return resp
+					})
+				}
+				c := New(f, testClientInfo())
+				for _, call := range calls {
+					if err := call.call(c); err != nil {
+						t.Fatalf("%s: %v", call.method, err)
+					}
+				}
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				return append([]string(nil), f.sent...)
+			},
+		},
+		{
+			name: "the HTTP transport",
+			run: func(t *testing.T, legacy bool) []string {
+				endpoint := newRecordingEndpoint(t, func(w http.ResponseWriter, request recordedRequest) {
+					switch {
+					case request.httpMethod == http.MethodDelete:
+						w.WriteHeader(http.StatusNoContent)
+					case len(request.id) == 0:
+						w.WriteHeader(http.StatusAccepted)
+					case request.method == "server/discover" && legacy:
+						w.WriteHeader(http.StatusBadRequest)
+					default:
+						writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": result(request.method)}))
+					}
+				})
+				c := Web(endpoint.URL)
+				for _, call := range calls {
+					if err := call.call(c.Client); err != nil {
+						t.Fatalf("%s: %v", call.method, err)
+					}
+				}
+				endpoint.mu.Lock()
+				defer endpoint.mu.Unlock()
+				frames := make([]string, 0, len(endpoint.requests))
+				for _, request := range endpoint.requests {
+					frames = append(frames, request.body)
+				}
+				return frames
+			},
+		},
+	}
+
+	for _, transport := range transports {
+		for _, legacy := range []bool{false, true} {
+			name := transport.name + "/the discovery handshake"
+			if legacy {
+				name = transport.name + "/the initialize handshake"
+			}
+			t.Run(name, func(t *testing.T) {
+				seen := map[string]bool{}
+				for _, frame := range transport.run(t, legacy) {
+					got := read(frame)
+					if got.method == "" {
+						continue
+					}
+					seen[got.method] = true
+					want := transport.asks && asking[got.method]
+					if got.token != want {
+						t.Errorf("[%s] carries a progress token = %v, want %v", got.method, got.token, want)
+					}
+				}
+				for _, call := range calls {
+					// The discovery revision has no ping: its liveness check is
+					// a server/discover, which is among the frames read above.
+					if call.method == "ping" && !legacy {
+						continue
+					}
+					if !seen[call.method] {
+						t.Errorf("[%s] was never sent", call.method)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -143,7 +311,7 @@ func TestEncodeParamsRefusesUnusableParams(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			encoded, err := p.encodeParams(tc.params, tc.version)
+			encoded, err := p.encodeParams(tc.params, tc.version, nil)
 
 			if tc.wantErr != "" {
 				if err == nil {

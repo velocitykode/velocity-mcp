@@ -372,6 +372,7 @@ func TestHTTPIdentity_Concurrent(t *testing.T) {
 			defer wg.Done()
 
 			c, w := router.NewTestContext(http.MethodPost, "/mcp", strings.NewReader(whoamiBody))
+			c.Request.Header.Set("Content-Type", contentTypeJSON)
 			c.SetServices(services)
 			if credential != "" {
 				c.Request.Header.Set("Authorization", "Bearer "+credential)

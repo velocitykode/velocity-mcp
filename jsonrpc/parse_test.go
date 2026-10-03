@@ -68,6 +68,20 @@ func TestParseRequest(t *testing.T) {
 			wantMsg:  msgInvalidID,
 		},
 		{
+			name:     "fractional id",
+			input:    `{"jsonrpc":"2.0","id":1.5,"method":"ping"}`,
+			wantErr:  true,
+			wantCode: CodeInvalidRequest,
+			wantMsg:  msgInvalidID,
+		},
+		{
+			name:     "exponent id",
+			input:    `{"jsonrpc":"2.0","id":1e3,"method":"ping"}`,
+			wantErr:  true,
+			wantCode: CodeInvalidRequest,
+			wantMsg:  msgInvalidID,
+		},
+		{
 			name:      "wrong version",
 			input:     `{"jsonrpc":"1.0","id":4,"method":"ping"}`,
 			wantErr:   true,
@@ -406,10 +420,11 @@ func TestIsNotificationBytes(t *testing.T) {
 		{"notification", `{"jsonrpc":"2.0","method":"x"}`, true, false},
 		{"request with int id", `{"jsonrpc":"2.0","id":1,"method":"x"}`, false, false},
 		{"request with string id", `{"jsonrpc":"2.0","id":"abc","method":"x"}`, false, false},
-		// A present-but-null id is routed as a notification (no reply): a
-		// present-but-null id is treated as absent, so {"id":null,...} becomes
-		// a notification.
-		{"present-but-null id is a notification", `{"jsonrpc":"2.0","id":null,"method":"x"}`, true, false},
+		// A message stating an id asked for a reply, whatever the id holds: a
+		// null id is an invalid request to be refused, not a notification to
+		// be acknowledged with nothing (the client would wait forever).
+		{"present-but-null id is not a notification", `{"jsonrpc":"2.0","id":null,"method":"x"}`, false, false},
+		{"fractional id is not a notification", `{"jsonrpc":"2.0","id":1.5,"method":"x"}`, false, false},
 		{"malformed", `{oops`, false, true},
 	}
 	for _, tt := range tests {

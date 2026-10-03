@@ -253,3 +253,133 @@ func TestGeneratorsExposeUniqueNamesAndDescriptions(t *testing.T) {
 		}
 	}
 }
+
+// The output directory's last segment names the package, and velocity's
+// scaffold accepts segments that are not Go identifiers: a hyphen, an upper
+// case letter or a keyword all pass its directory rule. The generated file must compile for
+// every directory the generator accepts, so the package name is derived as an
+// identifier where one can be, and a segment that cannot name a package is
+// refused before anything is written.
+func TestGeneratorPackageNameIsAGoIdentifier(t *testing.T) {
+	t.Run("derived from the directory", func(t *testing.T) {
+		cases := []struct {
+			dir     string
+			wantPkg string
+		}{
+			{"internal/my-tools", "package mytools"},
+			{"internal/Mixed-Case_Dir", "package mixedcase_dir"},
+			{"internal/My_Tools", "package my_tools"},
+			{"internal/tools-2", "package tools2"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.dir, func(t *testing.T) {
+				t.Chdir(t.TempDir())
+				if err := genByKind(t, "tool").Handle(nil, []string{"Weather", "--dir", tc.dir}); err != nil {
+					t.Fatalf("Handle: %v", err)
+				}
+				path := filepath.Join(tc.dir, "weather_tool.go")
+				src, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("expected file %s: %v", path, err)
+				}
+				if _, err := parser.ParseFile(token.NewFileSet(), path, src, parser.AllErrors); err != nil {
+					t.Fatalf("generated file does not parse: %v\n---\n%s", err, src)
+				}
+				if !strings.Contains(string(src), tc.wantPkg+"\n") {
+					t.Fatalf("package clause: want %q in\n%s", tc.wantPkg, src)
+				}
+			})
+		}
+	})
+
+	t.Run("a keyword segment is refused before writing", func(t *testing.T) {
+		for _, dir := range []string{"internal/go", "internal/func", "internal/type", "internal/Go"} {
+			t.Run(dir, func(t *testing.T) {
+				t.Chdir(t.TempDir())
+				err := genByKind(t, "tool").Handle(nil, []string{"Weather", "--dir", dir})
+				if err == nil {
+					t.Fatal("a keyword package name was accepted, want an error")
+				}
+				if !strings.Contains(err.Error(), "keyword") {
+					t.Fatalf("error = %v, want it to name the keyword", err)
+				}
+				var written []string
+				_ = filepath.WalkDir(".", func(path string, d os.DirEntry, _ error) error {
+					if d != nil && !d.IsDir() {
+						written = append(written, path)
+					}
+					return nil
+				})
+				if len(written) != 0 {
+					t.Fatalf("files written despite the refusal: %v", written)
+				}
+			})
+		}
+	})
+}
+
+// A directory whose last segment gives the package name "main" is refused by
+// every generator before anything is written: the file would declare a type in
+// a program package, which nothing can import and which does not build as a
+// library. The name is derived, so the refusal holds for every spelling that
+// derives to it.
+func TestGeneratorRefusesAProgramPackage(t *testing.T) {
+	dirs := []string{"internal/main", "internal/Main", "internal/ma-in", "main", "cmd/server/main"}
+	for _, kind := range []string{"tool", "resource", "prompt", "server"} {
+		for _, dir := range dirs {
+			t.Run(kind+"/"+dir, func(t *testing.T) {
+				t.Chdir(t.TempDir())
+				err := genByKind(t, kind).Handle(nil, []string{"Weather", "--dir", dir})
+				if err == nil {
+					t.Fatal("a directory naming the main package was accepted, want an error")
+				}
+				if !strings.Contains(err.Error(), `names the package "main"`) || !strings.Contains(err.Error(), "cannot be imported as a library") {
+					t.Fatalf("error = %v, want it to say the directory names the main package, which is not a library", err)
+				}
+				entries, readErr := os.ReadDir(".")
+				if readErr != nil {
+					t.Fatalf("read the working directory: %v", readErr)
+				}
+				if len(entries) != 0 {
+					t.Fatalf("the refusal left %d entries behind, the first %q", len(entries), entries[0].Name())
+				}
+			})
+		}
+	}
+}
+
+// The names packageNameFor refuses, and the ones next to them it must keep.
+func TestPackageNameFor(t *testing.T) {
+	cases := []struct {
+		dir     string
+		want    string
+		wantErr string
+	}{
+		{dir: "internal/tools", want: "tools"},
+		{dir: "internal/maintenance", want: "maintenance"},
+		{dir: "internal/main2", want: "main2"},
+		{dir: "internal/main_tools", want: "main_tools"},
+		{dir: "internal/main", wantErr: "is a program"},
+		{dir: "internal/MAIN", wantErr: "is a program"},
+		{dir: "internal/m.a.i.n", wantErr: "is a program"},
+		{dir: "internal/_", wantErr: "no Go package name"},
+		{dir: "internal/-_-", wantErr: "no Go package name"},
+		{dir: "internal/---", wantErr: "no Go package name"},
+		{dir: "internal/2fa", wantErr: "no Go package name"},
+		{dir: "internal/range", wantErr: "keyword"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.dir, func(t *testing.T) {
+			got, err := packageNameFor(tc.dir)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("packageNameFor(%q) = %q, %v; want an error saying %q", tc.dir, got, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("packageNameFor(%q) = %q, %v; want %q", tc.dir, got, err, tc.want)
+			}
+		})
+	}
+}

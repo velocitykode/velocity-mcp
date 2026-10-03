@@ -7,20 +7,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/velocitykode/prism"
 	velapp "github.com/velocitykode/velocity/app"
+	"github.com/velocitykode/velocity/str"
 
 	"github.com/velocitykode/velocity-mcp/server"
 )
@@ -58,14 +60,24 @@ const (
 	// (TestInspectorProtocolEraMatchesTheServerProtocol guards this).
 	inspectorProtocolEra = "auto"
 
-	// inspectorShutdownGrace is how long the inspector is given to shut its own
-	// node children down after an interrupt before it is killed outright.
-	inspectorShutdownGrace = 5 * time.Second
-
 	// startCommandName is the command the inspector launches for a stdio
 	// session; it is served by startCommand in this package.
 	startCommandName = "mcp:start"
 )
+
+// inspectorShutdownGrace is how long the inspector is given to shut its own
+// node children down after an interrupt before it is killed outright. It is a
+// variable so a test can shorten the wait for a child that ignores the
+// interrupt.
+var inspectorShutdownGrace = 5 * time.Second
+
+// inspectorSignalArrival is how long a run whose inspector was ended by a stop
+// signal waits for the command's own copy of that signal. A terminal signals
+// the whole job at once, and the inspector can be gone before the command has
+// been handed its copy; the run must not report a failed inspector for what
+// is a stop still on its way. It is a variable so a test can shorten the wait
+// for a signal that never comes.
+var inspectorSignalArrival = time.Second
 
 // inspectorLaunch is the resolved description of the inspector process a run
 // would start: the executable, its arguments, the environment overlaid on the
@@ -108,7 +120,7 @@ func (inspectorCommand) Description() string {
 
 // Handle resolves the transport configuration, writes it to a temporary
 // inspector configuration file, prints the connection guidance, and runs the
-// inspector until it exits or the process is interrupted.
+// inspector until it exits or the process is signalled to stop.
 func (c inspectorCommand) Handle(s *velapp.Services, args []string) error {
 	if c.srv == nil {
 		return errors.New("mcp: inspector command built without a server")
@@ -119,20 +131,38 @@ func (c inspectorCommand) Handle(s *velapp.Services, args []string) error {
 		return err
 	}
 
+	stoppedBy, err := c.inspect(opts)
+	if err != nil {
+		return err
+	}
+	// The run has ended what it started and removed its configuration file
+	// by now, so a signal that ends the command itself may do so.
+	return endAsSignalled(stoppedBy)
+}
+
+// stoppedBySignal is the cancellation cause of a run that a signal stopped.
+// It tells the runner which signal to pass on to the inspector.
+type stoppedBySignal struct{ sig os.Signal }
+
+func (s stoppedBySignal) Error() string { return "stopped by signal: " + s.sig.String() }
+
+// inspect performs one inspector run and reports the signal that stopped it,
+// if one did. Everything the run leaves behind is cleaned up when it returns.
+func (c inspectorCommand) inspect(opts inspectorOptions) (os.Signal, error) {
 	// Announced before anything else happens, so the operator knows which
 	// server they are answering route parameter questions for.
 	if err := c.writeHeader(); err != nil {
-		return err
+		return nil, err
 	}
 
 	config, guidance, env, err := c.transportConfig(opts)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	configPath, err := writeInspectorConfig(c.srv.Name(), config)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// The inspector reads the file at startup; it is ours to clean up, and it
 	// may carry a url with credentials in it, so it does not outlive the run.
@@ -143,22 +173,45 @@ func (c inspectorCommand) Handle(s *velapp.Services, args []string) error {
 		[2]string{"Config", filepath.ToSlash(configPath)},
 	)
 	if err := c.writeGuidance(guidance); err != nil {
-		return err
+		return nil, err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// Every signal that ends the command is caught, a hangup and a quit
+	// included: whichever it is, the run has to end the inspector and remove
+	// the configuration file rather than leave both behind with the command
+	// gone.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, inspectorStopSignals()...)
+	defer signal.Stop(signals)
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	finished := make(chan struct{})
+	defer close(finished)
+	go func() {
+		select {
+		case sig := <-signals:
+			cancel(stoppedBySignal{sig: sig})
+		case <-finished:
+		}
+	}()
 
 	run := c.run
 	if run == nil {
 		run = runInspectorProcess
 	}
-	return run(ctx, inspectorLaunch{
+	err = run(ctx, inspectorLaunch{
 		Name:       "npx",
 		Args:       []string{opts.packageSpec(), "--config", configPath},
 		Env:        env,
 		ConfigPath: configPath,
 	})
+
+	var stop stoppedBySignal
+	if errors.As(context.Cause(ctx), &stop) {
+		return stop.sig, err
+	}
+	return nil, err
 }
 
 // transportConfig builds the inspector's server entry plus the guidance lines
@@ -224,7 +277,7 @@ func (c inspectorCommand) transportConfig(opts inspectorOptions) (map[string]any
 	serverURL := parsed.String()
 	guidance := [][2]string{
 		{"Transport Type", "Streamable HTTP"},
-		{"URL", serverURL},
+		{"URL", redactedURL(parsed)},
 	}
 	if parsed.Scheme == "https" || opts.caCert != "" {
 		guidance = append(guidance, certificateGuidance(opts.caCert, parsed.Hostname()))
@@ -288,17 +341,147 @@ func (c inspectorCommand) serverURL(raw string) (*url.URL, error) {
 		return nil, err
 	}
 
+	// None of the refusals below shows the url or the parser's reason. The
+	// parser quotes the url whole, and its reasons quote the part it stopped
+	// at (a port, an escape), which in a url with credentials is a piece of
+	// them. A url that is refused did not take the shape redactedURL relies
+	// on to find the secrets either: without the scheme and host it expects,
+	// a password or a token parses as a scheme or a path, which are shown.
 	parsed, err := url.Parse(filled)
 	if err != nil {
-		return nil, fmt.Errorf("mcp: --url is not a valid url: %w", err)
+		return nil, errors.New("mcp: --url is not a valid url" + argumentWithheld)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("mcp: --url must be an absolute http or https url, got %q", filled)
+		return nil, errors.New("mcp: --url must be an absolute http or https url" + argumentWithheld)
 	}
 	if parsed.Host == "" {
-		return nil, fmt.Errorf("mcp: --url is missing a host: %q", filled)
+		return nil, errors.New("mcp: --url is missing a host" + argumentWithheld)
 	}
 	return parsed, nil
+}
+
+// argumentWithheld ends every refusal of a command line argument. No error of
+// this command shows the value it refuses: the operator can put a url with
+// credentials after any flag, or after none, and the error goes to a terminal
+// with scrollback and to CI logs. The flag is named instead, which is enough
+// to find the value on the command line that was just typed.
+const argumentWithheld = " (the value is not shown, since an argument may carry a url with credentials)"
+
+// urlSecretMarker stands in for every part of a url that may carry a secret
+// when the url is shown to the operator. It is the marker the standard library
+// uses for a redacted password.
+const urlSecretMarker = "xxxxx"
+
+// redactedURL renders a url for the terminal and for error messages: the
+// scheme, host and path as written, and a marker in place of the user
+// information, of every query value, of the fragment, and of the opaque part
+// of a url that has no authority. A secret is handed to this command in any
+// of those places (a password, a bearer token in the user name, an api key in
+// a query parameter, a token in the fragment), and the terminal is scrollback
+// and CI log; the inspector itself reads the url whole from the configuration
+// file. The path and the query keys stay visible: the path is the route the
+// operator is checking, with the parameters they were just asked for filled
+// in, and the keys say which parameters were passed. A bare key with no value
+// is treated as a value, since a token is passed that way too. Parameters are
+// told apart at "&" and at ";" alike: servers have split a query at either,
+// and reading "token;x=1" as one parameter would show the token as its key.
+//
+// The path and the keys are shown only where they are plain text. A path
+// segment or a key holding anything but letters, digits, ".", "_", "~" and
+// "-" is replaced by the marker: an escape or a delimiter there (";", "=",
+// "%3F") is where another parser, the server's among them, may start a
+// parameter that this one read as part of a name, and a value hidden that way
+// would otherwise be shown as route.
+//
+// It is only used for a url that serverURL accepted: an absolute http or https
+// url with a host. Anything else is not shown at all (see argumentWithheld),
+// because the parts named above are not where its secrets end up.
+func redactedURL(u *url.URL) string {
+	shown := *u
+	if shown.User != nil {
+		shown.User = url.User(urlSecretMarker)
+	}
+	if shown.Opaque != "" {
+		shown.Opaque = urlSecretMarker
+	}
+	if path := u.EscapedPath(); path != "" {
+		segments := strings.Split(path, "/")
+		for i, segment := range segments {
+			if !isPlainURLText(segment) {
+				segments[i] = urlSecretMarker
+			}
+		}
+		shown.Path, shown.RawPath = strings.Join(segments, "/"), ""
+	}
+	if shown.RawQuery != "" {
+		shown.RawQuery = redactedQuery(shown.RawQuery)
+		shown.ForceQuery = false
+	}
+	if shown.Fragment != "" || shown.RawFragment != "" {
+		shown.Fragment, shown.RawFragment = urlSecretMarker, ""
+	}
+	return shown.String()
+}
+
+// isPlainURLText reports whether a path segment or a query key is made of
+// unreserved url characters only, which no parser reads as a delimiter or
+// decodes into one. The empty text is plain.
+func isPlainURLText(text string) bool {
+	for _, r := range text {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '.', r == '_', r == '~', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// redactedQuery renders a query string with every parameter's value replaced
+// by the marker, keeping the plain keys and the separators as written. A
+// parameter with no "=" is replaced whole, as is a key that is not plain text,
+// and an empty parameter (two separators in a row) stays empty.
+func redactedQuery(query string) string {
+	var b strings.Builder
+	for len(query) > 0 {
+		end := strings.IndexAny(query, "&;")
+		parameter, separator := query, ""
+		if end >= 0 {
+			parameter, separator = query[:end], query[end:end+1]
+		}
+		switch key, _, hasValue := strings.Cut(parameter, "="); {
+		case hasValue && !isPlainURLText(key):
+			b.WriteString(urlSecretMarker + "=" + urlSecretMarker)
+		case hasValue:
+			b.WriteString(key + "=" + urlSecretMarker)
+		case parameter != "":
+			b.WriteString(urlSecretMarker)
+		}
+		b.WriteString(separator)
+		query = query[len(parameter)+len(separator):]
+	}
+	return b.String()
+}
+
+// userInfoEnd reports where the user information of a url ends in raw: the
+// index just past the last "@" of its first part, the one before any "/", "?"
+// or "#" that follows the scheme. It is zero for a url that carries none.
+// The part is found by its text rather than by parsing, because it is read
+// before the route parameters are filled in and has to hold for a url the
+// parser would refuse.
+func userInfoEnd(raw string) int {
+	start := 0
+	if i := strings.Index(raw, "//"); i >= 0 && !strings.ContainsAny(raw[:i], "/?#") {
+		start = i + 2
+	}
+	end := len(raw)
+	if i := strings.IndexAny(raw[start:], "/?#"); i >= 0 {
+		end = start + i
+	}
+	if at := strings.LastIndexByte(raw[start:end], '@'); at >= 0 {
+		return start + at + 1
+	}
+	return 0
 }
 
 // fillRouteParameters replaces each {name} placeholder of a route path with a
@@ -307,6 +490,11 @@ func (c inspectorCommand) serverURL(raw string) (*url.URL, error) {
 // that may carry braces of its own, as in "{id:[0-9]{2}}". Values are
 // percent-encoded so an answer containing a slash or a space cannot reshape the
 // url.
+//
+// The user information of the url is not searched. A route has no parameter
+// there, and a password is free to hold braces: read as a placeholder, the
+// text between them would be printed in the question and then replaced with
+// the answer.
 func (c inspectorCommand) fillRouteParameters(raw string) (string, error) {
 	ask := c.ask
 	if ask == nil {
@@ -314,7 +502,9 @@ func (c inspectorCommand) fillRouteParameters(raw string) (string, error) {
 	}
 
 	var b strings.Builder
-	rest := raw
+	skipped := userInfoEnd(raw)
+	b.WriteString(raw[:skipped])
+	rest := raw[skipped:]
 	for {
 		open := strings.IndexByte(rest, '{')
 		if open < 0 {
@@ -323,7 +513,7 @@ func (c inspectorCommand) fillRouteParameters(raw string) (string, error) {
 		}
 		end := routeParameterEnd(rest, open)
 		if end < 0 {
-			return "", fmt.Errorf("mcp: unterminated route parameter in --url: %q", raw)
+			return "", errors.New("mcp: unterminated route parameter in --url" + argumentWithheld)
 		}
 
 		name := rest[open+1 : end]
@@ -331,7 +521,7 @@ func (c inspectorCommand) fillRouteParameters(raw string) (string, error) {
 			name = name[:i]
 		}
 		if strings.TrimSpace(name) == "" {
-			return "", fmt.Errorf("mcp: unnamed route parameter in --url: %q", raw)
+			return "", errors.New("mcp: unnamed route parameter in --url" + argumentWithheld)
 		}
 
 		value := strings.TrimSpace(ask(fmt.Sprintf("What is the value for the [%s] route parameter?", name)))
@@ -446,9 +636,14 @@ func parseInspectorArgs(args []string) (inspectorOptions, error) {
 		target, ok := targets[name]
 		switch {
 		case !ok && strings.HasPrefix(arg, "-"):
-			return inspectorOptions{}, fmt.Errorf("unknown flag %q", arg)
+			if !isFlagName(name) {
+				return inspectorOptions{}, fmt.Errorf("unknown flag at position %d%s", i+1, argumentWithheld)
+			}
+			return inspectorOptions{}, fmt.Errorf("unknown flag %q%s", name, argumentWithheld)
 		case !ok:
-			return inspectorOptions{}, fmt.Errorf("unexpected argument %q (usage: vel run mcp:inspector [--url URL] [--host HOST] [--port PORT] [--ca-cert FILE])", arg)
+			// A url passed without its flag is the likely stray argument, so
+			// it is pointed at by position rather than shown.
+			return inspectorOptions{}, fmt.Errorf("unexpected argument at position %d%s (usage: vel run mcp:inspector [--url URL] [--host HOST] [--port PORT] [--ca-cert FILE])", i+1, argumentWithheld)
 		case hasInline:
 			*target = inline
 		case i+1 >= len(args):
@@ -465,21 +660,27 @@ func parseInspectorArgs(args []string) (inspectorOptions, error) {
 	if opts.port != "" {
 		port, err := strconv.Atoi(opts.port)
 		if err != nil || port < 1 || port > 65535 {
-			return inspectorOptions{}, fmt.Errorf("--port must be a number between 1 and 65535, got %q", opts.port)
+			return inspectorOptions{}, errors.New("--port must be a number between 1 and 65535" + argumentWithheld)
 		}
 	}
 	if opts.version != "" {
 		if !isVersionSpec(opts.version) {
-			return inspectorOptions{}, fmt.Errorf("--inspector-version must be an npm version or tag, got %q", opts.version)
+			return inspectorOptions{}, errors.New("--inspector-version must be an npm version or tag" + argumentWithheld)
 		}
 		// A dist-tag cannot be resolved without reaching npm, so only an
 		// explicit version is checked against the launch contract.
 		if major, ok := versionMajor(opts.version); ok && major < inspectorMinimumMajor {
-			return inspectorOptions{}, fmt.Errorf("--inspector-version must be %d.0.0 or newer, got %q: older inspectors do not understand the generated configuration file", inspectorMinimumMajor, opts.version)
+			return inspectorOptions{}, fmt.Errorf("--inspector-version must be %d.0.0 or newer, got major version %d: older inspectors do not understand the generated configuration file", inspectorMinimumMajor, major)
 		}
 	}
 	if opts.command != "" && strings.ContainsAny(opts.command, "\x00\n\r") {
 		return inspectorOptions{}, errors.New("--command must not contain control characters")
+	}
+	// The command is printed in the guidance and written to the configuration
+	// file as the program to run. A url there is a value meant for --url, and
+	// it would be shown with whatever credentials it carries.
+	if looksLikeURL(opts.command) {
+		return inspectorOptions{}, errors.New("--command must name a program, not a url; pass a url with --url" + argumentWithheld)
 	}
 	if opts.caCert != "" {
 		path, err := caCertPath(opts.caCert)
@@ -489,6 +690,34 @@ func parseInspectorArgs(args []string) (inspectorOptions, error) {
 		opts.caCert = path
 	}
 	return opts, nil
+}
+
+// looksLikeURL reports whether a value given as the program to run is a url
+// by its text: it names a scheme followed by "//", or starts with the http or
+// https scheme in any form the url parser accepts, the one without slashes
+// included. No program is named that way.
+func looksLikeURL(value string) bool {
+	if strings.Contains(value, "://") {
+		return true
+	}
+	lower := str.Lower(value)
+	return str.StartsWith(lower, "http:", "https:")
+}
+
+// isFlagName reports whether name reads as the name of a flag: letters,
+// digits, dashes and underscores only. An unknown flag is quoted in its error
+// only when it does. Anything else is a value typed where a flag was expected
+// (a url always holds a character a flag name cannot), and it is pointed at
+// by position rather than shown in part.
+func isFlagName(name string) bool {
+	for _, r := range name {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // caCertPath validates a --ca-cert value and resolves it to an absolute path.
@@ -504,27 +733,46 @@ func caCertPath(value string) (string, error) {
 	}
 	path, err := filepath.Abs(value)
 	if err != nil {
-		return "", fmt.Errorf("--ca-cert is not a usable path %q: %w", value, err)
+		return "", fmt.Errorf("--ca-cert is not a usable path%s: %w", argumentWithheld, pathErrorReason(err))
 	}
 	// The kind of file is settled before it is opened: opening a named pipe
 	// blocks until a writer appears, so a value naming one would hang the
 	// command instead of being refused.
 	info, err := os.Stat(path)
 	if err != nil {
-		return "", fmt.Errorf("--ca-cert must name a readable certificate file: %w", err)
+		return "", fmt.Errorf("--ca-cert must name a readable certificate file%s: %w", argumentWithheld, pathErrorReason(err))
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("--ca-cert must name a regular file, got %q", value)
+		return "", errors.New("--ca-cert must name a regular file" + argumentWithheld)
 	}
 	// Opening is the readability check, not stating: node reads the bundle, so
 	// a file this user may not read is as useless as an absent one and must be
 	// refused with the same clear message.
 	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("--ca-cert must name a readable certificate file: %w", err)
+		return "", fmt.Errorf("--ca-cert must name a readable certificate file%s: %w", argumentWithheld, pathErrorReason(err))
 	}
 	defer f.Close()
 	return path, nil
+}
+
+// pathErrorReason returns the reason a file operation failed without the path
+// it failed on. The operating system's errors quote the path, which here is
+// the value the operator passed.
+func pathErrorReason(err error) error {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Err
+	}
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) {
+		return linkErr.Err
+	}
+	var syscallErr *os.SyscallError
+	if errors.As(err, &syscallErr) {
+		return syscallErr.Err
+	}
+	return errors.New("the path cannot be used")
 }
 
 // validateEnvValue rejects a flag value that cannot safely become an
@@ -635,13 +883,41 @@ func promptForValue(question string) string {
 // to stop with an interrupt of its own instead of being killed, giving it the
 // chance to shut down the node children serving the inspector UI and proxy
 // before they are orphaned on their ports.
+//
+// The inspector is started the way a shell starts a command it is asked to
+// run: in the command's own process group, with the command's standard input.
+// A terminal therefore treats the two as one job. Its interrupt, quit and
+// suspend keys reach the inspector and everything the inspector starts
+// directly, a suspended job is resumed whole, and npx can ask on the terminal
+// before it installs the pinned package for the first time.
+//
+// npx is only the first of the processes the launch starts, and the ones
+// holding the ports are started by it. A stop that reaches the command alone
+// (a signal sent to it rather than typed at the terminal) is passed on to
+// all of them, and once npx has exited, by itself or killed after the grace
+// period, whatever the run started that is still alive is ended before the
+// run returns, so nothing started by the command outlives it. A signal typed
+// at the terminal can end npx before the command has been handed its own
+// copy; the run waits a moment for that copy (inspectorSignalArrival) rather
+// than report the stop as a failed inspector. Sharing a
+// group means the group cannot be signalled as a whole; startedProcesses
+// describes how the run's processes are picked out of it, and placeInspector
+// what is done on a platform where the group cannot be listed at all.
 func runInspectorProcess(ctx context.Context, l inspectorLaunch) error {
 	cmd := exec.CommandContext(ctx, l.Name, l.Args...)
 	cmd.Env = inspectorEnviron(os.Environ(), l.Env)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	before := placeInspector(cmd)
+	cmd.Cancel = func() error {
+		var sig os.Signal = os.Interrupt
+		var stop stoppedBySignal
+		if errors.As(context.Cause(ctx), &stop) {
+			sig = stop.sig
+		}
+		return interruptInspector(cmd, before, relayedSignal(sig))
+	}
 	// An inspector that ignores the interrupt is killed once the grace period
 	// is over, so the command cannot hang on to the terminal.
 	cmd.WaitDelay = inspectorShutdownGrace
@@ -652,7 +928,21 @@ func runInspectorProcess(ctx context.Context, l inspectorLaunch) error {
 		}
 		return fmt.Errorf("mcp: start the MCP Inspector: %w", err)
 	}
-	if err := cmd.Wait(); err != nil {
+	err := cmd.Wait()
+	endStartedProcesses(cmd, before)
+	if err != nil {
+		if ctx.Err() == nil && endedByStopSignal(err) {
+			// The signal that ended the inspector was most likely sent to the
+			// whole job, and the command's copy is then about to cancel the
+			// run. Only when none arrives was the inspector signalled alone,
+			// which is a failure of the inspector like any other.
+			arrival := time.NewTimer(inspectorSignalArrival)
+			select {
+			case <-ctx.Done():
+			case <-arrival.C:
+			}
+			arrival.Stop()
+		}
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -661,26 +951,84 @@ func runInspectorProcess(ctx context.Context, l inspectorLaunch) error {
 	return nil
 }
 
-// tlsRejectUnauthorizedVar is the node setting that switches certificate
-// verification off for every connection the process makes. This command never
-// sets it, and drops it from the environment it inherits.
-const tlsRejectUnauthorizedVar = "NODE_TLS_REJECT_UNAUTHORIZED"
+// withheldVariables and withheldPrefixes name the inherited settings the
+// inspector process is not handed, compared case-folded (see
+// inheritedVariableWithheld). They are grouped by the program that reads them,
+// and each group is withheld whole rather than one name at a time, because
+// every member of it can change what the launch verified and announced:
+//
+//   - node_*: the node runtime's own settings. NODE_OPTIONS injects any flag
+//     (a TLS protocol floor, an insecure parser, a preloaded module),
+//     NODE_TLS_REJECT_UNAUTHORIZED switches certificate verification off,
+//     NODE_EXTRA_CA_CERTS adds a trust anchor the guidance never named,
+//     NODE_PATH and NODE_COMPILE_CACHE load code from elsewhere.
+//   - npm_config_*: npm's settings, which npx fetches the inspector under.
+//     They choose the registry, whether its certificate is verified
+//     (strict-ssl), which trust store is used (ca, cafile), and which config
+//     file is read next (userconfig, globalconfig), so no one of them can be
+//     allowed through without the others following.
+//   - OPENSSL_CONF, SSL_CERT_FILE and SSL_CERT_DIR: the OpenSSL stack node
+//     links, which can lower the protocol floor or swap the trust store
+//     underneath every node setting above.
+//   - the inspector's own switches: DANGEROUSLY_OMIT_AUTH disables the proxy
+//     session token, MCP_PROXY_AUTH_TOKEN fixes it to a known value,
+//     ALLOWED_ORIGINS widens the origin check that keeps other sites from
+//     driving the proxy, HOST binds the UI and proxy beyond the loopback
+//     interface, and MCP_PROXY_FULL_ADDRESS tells the UI to drive a proxy
+//     other than the one this command started.
+//
+// The values the command sets itself (HOST, CLIENT_PORT, NODE_EXTRA_CA_CERTS)
+// travel in the launch overlay, which is applied after the inherited
+// environment has been filtered.
+var (
+	withheldPrefixes  = []string{"node_", "npm_config_"}
+	withheldVariables = []string{
+		"openssl_conf", "ssl_cert_file", "ssl_cert_dir",
+		"dangerously_omit_auth", "mcp_proxy_auth_token", "allowed_origins", "host", "mcp_proxy_full_address",
+	}
+)
+
+// inheritedVariableWithheld reports whether an inherited variable is kept from
+// the inspector process. The name is compared case-folded: Windows resolves
+// variables without regard to case, and npm reads its npm_config_ settings
+// that way on every platform, so a setting blocked in one spelling would
+// otherwise reach the child in another.
+func inheritedVariableWithheld(name string) bool {
+	folded := str.Lower(name)
+	return str.StartsWith(folded, withheldPrefixes...) || slices.Contains(withheldVariables, folded)
+}
 
 // inspectorEnviron builds the environment of the inspector process: the one
-// this command was started with, without the certificate exception, plus the
-// launch overlay.
+// this command was started with, without the settings inheritedVariableWithheld
+// names, plus the launch overlay. A variable the overlay sets replaces every
+// inherited spelling of it, so the child reads one value for it and it is the
+// one the command decided on.
 //
-// Node applies tlsRejectUnauthorizedVar to every connection it makes, so a
+// Node applies its TLS settings to every connection the process makes, so a
 // value exported in the operator's shell would follow the session to the
 // inspected server, to the authorization server of an OAuth-protected session,
-// and to the registry. Inheriting it would leave the launch without
-// verification for reasons outside the launch, so it is dropped here; a
-// development certificate is trusted by naming its issuing CA with --ca-cert,
-// which adds an anchor rather than removing verification.
+// and to the registry; npm applies its own to the fetch of the inspector
+// itself. Inheriting any of them would leave the launch without the
+// verification it announces, for reasons outside the launch, so they are
+// dropped here; a development certificate is trusted by naming its issuing CA
+// with --ca-cert, which adds an anchor rather than removing verification.
 func inspectorEnviron(parent []string, overlay map[string]string) []string {
+	overlaid := make(map[string]struct{}, len(overlay))
+	for name := range overlay {
+		overlaid[str.Lower(name)] = struct{}{}
+	}
+
 	env := make([]string, 0, len(parent)+len(overlay))
 	for _, entry := range parent {
-		if name, _, ok := strings.Cut(entry, "="); ok && name == tlsRejectUnauthorizedVar {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			env = append(env, entry)
+			continue
+		}
+		if inheritedVariableWithheld(name) {
+			continue
+		}
+		if _, replaced := overlaid[str.Lower(name)]; replaced {
 			continue
 		}
 		env = append(env, entry)

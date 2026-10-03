@@ -22,13 +22,16 @@ import (
 
 // postContext builds a router.Context for a POST to /mcp with the given body and
 // optional headers, returning the context and its recorder. Headers are supplied
-// as alternating key/value pairs.
+// as alternating key/value pairs. The body is declared as application/json, as
+// every MCP client declares it; a test about the declaration itself overrides
+// the Content-Type header.
 func postContext(t *testing.T, body string, headers ...string) (*router.Context, *httptest.ResponseRecorder) {
 	t.Helper()
 	if len(headers)%2 != 0 {
 		t.Fatalf("headers must be key/value pairs, got %d", len(headers))
 	}
 	c, w := router.NewTestContext(http.MethodPost, "/mcp", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", contentTypeJSON)
 	for i := 0; i < len(headers); i += 2 {
 		c.Request.Header.Set(headers[i], headers[i+1])
 	}
@@ -50,8 +53,8 @@ func TestHandler_Initialize(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); ct != contentTypeJSON {
 		t.Fatalf("Content-Type = %q, want %q", ct, contentTypeJSON)
 	}
-	if sid := w.Header().Get(sessionHeader); sid != "fixed-session" {
-		t.Fatalf("%s = %q, want fixed-session", sessionHeader, sid)
+	if sid := w.Header().Get(sessionHeader); !strings.HasPrefix(sid, "fixed-session.") || !srv.IssuedSessionID(sid) {
+		t.Fatalf("%s = %q, want the tagged fixed-session id", sessionHeader, sid)
 	}
 	resp := decodeResponse(t, w.Body.Bytes())
 	if resp.Error != nil {
@@ -120,6 +123,11 @@ func TestHandler_BadJSON_ParseError(t *testing.T) {
 	}
 }
 
+// TestHandler_OversizedBody_Rejected asserts a body over the cap is refused
+// before the server sees it, as the *http.MaxBytesError the framework's error
+// boundary answers with 413 (RFC 9110 section 15.5.14). Nothing is written by
+// the handler itself, and in particular no JSON-RPC parse error: the body was
+// never parsed, and a client told its JSON was invalid would resend it.
 func TestHandler_OversizedBody_Rejected(t *testing.T) {
 	srv := &stubServer{fn: func(ctx context.Context, raw []byte, sessionID string) server.HandleResult {
 		t.Errorf("server.Handle should not be called for an oversized body")
@@ -129,15 +137,12 @@ func TestHandler_OversizedBody_Rejected(t *testing.T) {
 
 	big := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":"` + strings.Repeat("x", 1024) + `"}}`
 	c, w := postContext(t, big)
-	if err := h(c); err != nil {
-		t.Fatalf("handler returned error: %v", err)
+	err := h(c)
+	if !maxBytesError(err) {
+		t.Fatalf("handler returned %v, want the *http.MaxBytesError", err)
 	}
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
-	}
-	resp := decodeResponse(t, w.Body.Bytes())
-	if resp.Error == nil || resp.Error.Code != jsonrpc.CodeParseError {
-		t.Fatalf("want parse error for oversized body, got %s", w.Body.Bytes())
+	if w.Body.Len() != 0 {
+		t.Fatalf("handler wrote %q, want nothing", w.Body.String())
 	}
 	if srv.callCount() != 0 {
 		t.Fatalf("server was called %d times, want 0", srv.callCount())
@@ -160,25 +165,29 @@ func TestHandler_WithMaxBodyBytes_NonPositiveIgnored(t *testing.T) {
 
 func TestHandler_SessionHeaderFlow(t *testing.T) {
 	// The inbound session header is forwarded to the server as the existing
-	// session id; an initialize assigns a new one echoed back in the header.
+	// session id when the server vouches for it; an initialize assigns a new
+	// one echoed back in the header.
 	var seen []string
 	var mu sync.Mutex
-	srv := &stubServer{fn: func(ctx context.Context, raw []byte, sessionID string) server.HandleResult {
-		mu.Lock()
-		seen = append(seen, sessionID)
-		mu.Unlock()
-		if strings.Contains(string(raw), "initialize") {
-			return server.HandleResult{
-				Response:    mustResult(t, jsonrpc.IntID(1), map[string]any{"ok": true}),
-				HasResponse: true,
-				SessionID:   "new-session",
+	srv := &stubServer{
+		fn: func(ctx context.Context, raw []byte, sessionID string) server.HandleResult {
+			mu.Lock()
+			seen = append(seen, sessionID)
+			mu.Unlock()
+			if strings.Contains(string(raw), "initialize") {
+				return server.HandleResult{
+					Response:    mustResult(t, jsonrpc.IntID(1), map[string]any{"ok": true}),
+					HasResponse: true,
+					SessionID:   "new-session",
+				}
 			}
-		}
-		return server.HandleResult{
-			Response:    mustResult(t, jsonrpc.IntID(2), map[string]any{"pong": true}),
-			HasResponse: true,
-		}
-	}}
+			return server.HandleResult{
+				Response:    mustResult(t, jsonrpc.IntID(2), map[string]any{"pong": true}),
+				HasResponse: true,
+			}
+		},
+		issued: func(id string) bool { return id == "new-session" },
+	}
 	h := Handler(srv)
 
 	// 1. initialize with no inbound session -> server sees "" -> assigns one.
@@ -232,8 +241,8 @@ func TestHandler_SSEResponseMode(t *testing.T) {
 		t.Fatalf("SSE body must end with blank line, got %q", body)
 	}
 	// The session id is still surfaced in the header in SSE mode.
-	if sid := w.Header().Get(sessionHeader); sid != "fixed-session" {
-		t.Fatalf("%s = %q, want fixed-session", sessionHeader, sid)
+	if sid := w.Header().Get(sessionHeader); !strings.HasPrefix(sid, "fixed-session.") || !srv.IssuedSessionID(sid) {
+		t.Fatalf("%s = %q, want the tagged fixed-session id", sessionHeader, sid)
 	}
 	// The payload between the framing must be a valid JSON-RPC response.
 	payload := strings.TrimSuffix(strings.TrimPrefix(body, "data: "), "\n\n")
@@ -456,14 +465,11 @@ func TestHandler_OversizedBody_LogsServerSide(t *testing.T) {
 	h := Handler(srv, WithMaxBodyBytes(8))
 
 	big := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":"` + strings.Repeat("x", 512) + `"}}`
-	c, w := postContext(t, big)
+	c, _ := postContext(t, big)
 	c.SetServices(&app.Services{Log: logger})
 
-	if err := h(c); err != nil {
-		t.Fatalf("handler returned error: %v", err)
-	}
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
+	if err := h(c); !maxBytesError(err) {
+		t.Fatalf("handler returned %v, want the *http.MaxBytesError", err)
 	}
 	if logger.count() == 0 {
 		t.Fatalf("expected the oversized-body cause to be logged server-side")

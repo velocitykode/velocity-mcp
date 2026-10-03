@@ -1,6 +1,8 @@
 package mcptest
 
 import (
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -62,25 +64,40 @@ func (r *Response) fatalf(format string, args ...any) {
 }
 
 // AssertOk asserts the reply carries no error: neither a protocol-level error
-// object nor a tool-level isError result.
+// object nor a tool-level isError result. It certifies only a reply it can
+// read as a success, so it fails on no reply at all (a notification yields
+// none; AssertNoResponse is the assertion for that), on a reply with neither
+// a result nor an error, on a result that is not an object, and on an isError
+// that is not a boolean: a reply the assertion cannot read is not a reply it
+// can call untroubled.
 func (r *Response) AssertOk() *Response {
 	if r.t != nil {
 		r.t.Helper()
 	}
 	if r.hasError() {
 		r.fatalf("mcptest: %s: expected no errors, got: %s", r.method, describeErrors(r.errors()))
+		return r
+	}
+	if fault := r.resultFault(); fault != "" {
+		r.fatalf("mcptest: %s: expected no errors, but the reply cannot be read as a success: %s", r.method, fault)
 	}
 	return r
 }
 
 // AssertError asserts the reply carries at least one error (a protocol-level
 // error object or a tool-level isError result). When messages are supplied, each
-// must appear as a substring of some error message.
+// must appear as a substring of some error message. A reply that cannot be
+// read at all (no reply, a result that is not an object, an isError that is
+// not a boolean) is not an error reply either, and fails naming the fault.
 func (r *Response) AssertError(messages ...string) *Response {
 	if r.t != nil {
 		r.t.Helper()
 	}
 	if !r.hasError() {
+		if fault := r.resultFault(); fault != "" {
+			r.fatalf("mcptest: %s: expected an error, but the reply cannot be read: %s", r.method, fault)
+			return r
+		}
 		r.fatalf("mcptest: %s: expected an error, but the reply has none", r.method)
 		return r
 	}
@@ -126,16 +143,34 @@ func (r *Response) AssertText(texts ...string) *Response {
 	return r
 }
 
-// AssertDontSeeText asserts the given text does NOT appear in any content
-// message in the reply.
+// AssertDontSeeText asserts the given text does NOT appear anywhere in the
+// reply's result: not in a content item of any type (a text, a resource
+// link's uri, name or description, an embedded resource), not in the
+// structured content, not in the metadata, and not in a member that is not
+// the shape the specification describes. A text that must stay out of a reply
+// must stay out of all of it, so this reads more than AssertText does. The
+// names of members are structure rather than content and are not read.
+//
+// It is a statement about a result, so it needs one: it fails on no reply, on
+// a protocol error (which carries no result; assert its message with
+// AssertError, or read it with Errors), and on a result that is not an object.
 func (r *Response) AssertDontSeeText(texts ...string) *Response {
 	if r.t != nil {
 		r.t.Helper()
 	}
-	seeable := r.seeable()
+	if fault := r.resultFault(); fault != "" {
+		r.fatalf("mcptest: %s: did not expect to see %s, but there is no result to inspect: %s",
+			r.method, quoteAll(texts), fault)
+		return r
+	}
+	values := r.wireValues()
 	for _, unwanted := range texts {
-		if containsAny(seeable, unwanted) {
-			r.fatalf("mcptest: %s: did not expect to see %q in the reply content", r.method, unwanted)
+		for _, value := range values {
+			if strings.Contains(value, unwanted) {
+				r.fatalf("mcptest: %s: did not expect to see %q in the reply, but the result carries %q",
+					r.method, unwanted, value)
+				return r
+			}
 		}
 	}
 	return r
@@ -196,13 +231,27 @@ func (r *Response) AssertProtocolVersion(version string) *Response {
 }
 
 // AssertServerName asserts an initialize reply advertises the given server name
-// under serverInfo.name.
+// under serverInfo.name. A reply that carries no string there fails whatever
+// name is expected: an absent name is not an empty one.
 func (r *Response) AssertServerName(name string) *Response {
 	if r.t != nil {
 		r.t.Helper()
 	}
-	info, _ := r.result["serverInfo"].(map[string]any)
-	if got, _ := info["name"].(string); got != name {
+	if fault := r.resultFault(); fault != "" {
+		r.fatalf("mcptest: %s: expected serverInfo.name %q, but %s", r.method, name, fault)
+		return r
+	}
+	raw, ok := r.rawResultPath("serverInfo", "name")
+	if !ok {
+		r.fatalf("mcptest: %s: expected serverInfo.name %q, but the reply carries no serverInfo.name", r.method, name)
+		return r
+	}
+	got, isString := rawString(raw)
+	if !isString {
+		r.fatalf("mcptest: %s: expected serverInfo.name %q, but serverInfo.name is not a string: %s", r.method, name, describeJSON(raw))
+		return r
+	}
+	if got != name {
 		r.fatalf("mcptest: %s: serverInfo.name = %q, want %q", r.method, got, name)
 	}
 	return r
@@ -254,6 +303,49 @@ func (r *Response) AssertPromptListed(names ...string) *Response {
 		r.t.Helper()
 	}
 	return r.assertListed("prompts", "prompt", names)
+}
+
+// resultFault reports why the reply cannot be read as a successful result,
+// or "" when it can: no reply was produced, the reply is a protocol error, it
+// carries neither a result nor an error, the result is not an object, or its
+// isError flag is not a boolean. Every assertion that reads the result goes
+// through it, so none of them certifies a reply it could not read.
+func (r *Response) resultFault() string {
+	if fault := r.replyFault(); fault != "" {
+		return fault
+	}
+	switch {
+	case r.raw == nil:
+		return "the result is not an object: " + describeJSON(r.resp.Result)
+	}
+	if flag, present := r.raw["isError"]; present {
+		if _, isBool := rawBool(flag); !isBool {
+			return "isError is not a boolean: " + describeJSON(flag)
+		}
+	}
+	return ""
+}
+
+// replyFault reports why the reply does not show that the server carried the
+// message out, or "" when it does: no reply was produced, the reply is a
+// protocol error, or it carries neither a result nor an error. A result is the
+// one statement the protocol has that a request was carried out; a protocol
+// error is the reply to a request that was refused, often before anything ran
+// (an unknown tool, invalid params), and no reply says nothing at all.
+//
+// Every assertion that something is absent goes through it, directly or by
+// way of resultFault: an absence is only worth asserting about work that was
+// done, and without this it holds over a message that did nothing.
+func (r *Response) replyFault() string {
+	switch {
+	case r.resp == nil:
+		return "no reply was produced"
+	case r.resp.Error != nil:
+		return "the reply is protocol error " + strconv.Itoa(r.resp.Error.Code) + ": " + r.resp.Error.Message + " and carries no result"
+	case len(strings.TrimSpace(string(r.resp.Result))) == 0:
+		return "the reply carries neither a result nor an error"
+	}
+	return ""
 }
 
 // hasError reports whether the reply carries an error at all: a protocol-level
@@ -310,31 +402,47 @@ func (r *Response) seeable() []string {
 	return dedupeNonEmpty(out)
 }
 
-// contentMessages extracts the text/data/blob string of every content item in
-// the reply, across the three result shapes (tool content, prompt messages,
-// resource contents).
+// contentMessages extracts what every content item in the reply says, across
+// the three result shapes (tool content, prompt messages, resource contents):
+// a text item's text, an image's or audio's data, a resource link's uri, name,
+// title and description, an embedded resource's uri, text and blob, and every
+// other value an item carries except the members that describe its shape (see
+// contentShapeMembers). Reading named members alone would leave a link or an
+// embedded resource invisible to AssertText.
 func (r *Response) contentMessages() []string {
-	if r.result == nil {
+	if r.resp == nil || r.resp.Error != nil {
+		return nil
+	}
+	value, ok := decodeWireValue(r.resp.Result)
+	if !ok {
+		return nil
+	}
+	result, isObject := value.(map[string]any)
+	if !isObject {
 		return nil
 	}
 	var out []string
 
-	// tools/call: result.content[] -> {text|data}
-	for _, item := range asMaps(r.result["content"]) {
-		out = append(out, firstString(item, "text", "data"))
-	}
-	// prompts/get: result.messages[] -> .content -> {text|data}
-	for _, msg := range asMaps(r.result["messages"]) {
-		if c, ok := msg["content"].(map[string]any); ok {
-			out = append(out, firstString(c, "text", "data"))
+	// tools/call: result.content[]
+	items, _ := result["content"].([]any)
+	out = scalarValues(items, contentShapeMembers, out)
+	// prompts/get: result.messages[] -> .content
+	messages, _ := result["messages"].([]any)
+	for _, message := range messages {
+		if m, isObject := message.(map[string]any); isObject {
+			out = scalarValues(m["content"], contentShapeMembers, out)
 		}
 	}
-	// resources/read: result.contents[] -> {text|blob}
-	for _, item := range asMaps(r.result["contents"]) {
-		out = append(out, firstString(item, "text", "blob"))
-	}
+	// resources/read: result.contents[]
+	contents, _ := result["contents"].([]any)
+	out = scalarValues(contents, contentShapeMembers, out)
 
 	return dedupeNonEmpty(out)
+}
+
+// sortStrings sorts values in place.
+func sortStrings(values []string) {
+	sort.Strings(values)
 }
 
 // listContainsName reports whether the list under key contains an item whose

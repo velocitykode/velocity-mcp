@@ -1,7 +1,9 @@
 package mcptest
 
 import (
+	"bytes"
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
@@ -22,10 +24,23 @@ func (s *Server) sentCount() int {
 }
 
 // withNotifications attaches every notification frame the server emitted after
-// the sentBefore watermark to r, in emission order, and returns r. Frames that
-// carry an id (the final reply) and frames that are not well-formed JSON-RPC
-// notifications are ignored.
-func (s *Server) withNotifications(sentBefore int, r *Response) *Response {
+// the sentBefore watermark to r, in emission order, and returns r. reply is the
+// frame the transport recorded as the message's own reply (nil for a
+// notification), which is the one frame after the watermark that is not an
+// emitted notification.
+//
+// Every other frame that is not a well-formed JSON-RPC notification fails the
+// test, as a malformed reply does: a frame left out of the recording would
+// leave AssertNotificationCount(0) and AssertNotSentNotification green over a
+// notification the server did emit, a server defect read as a clean test.
+// Context.Emit is public, so a handler can put any bytes on the wire. A
+// server-to-client request (a frame with a method and an id) is refused the
+// same way: this harness has no way to answer it, and dropping it would hide a
+// handler that waits on an answer the test never gives.
+func (s *Server) withNotifications(sentBefore int, reply []byte, r *Response) *Response {
+	if s.t != nil {
+		s.t.Helper()
+	}
 	frames := s.fake.Sent()
 	if sentBefore > len(frames) {
 		// The recording was drained while the message was in flight; there is
@@ -33,16 +48,54 @@ func (s *Server) withNotifications(sentBefore int, r *Response) *Response {
 		return r
 	}
 	for _, frame := range frames[sentBefore:] {
-		if note, ok := decodeNotificationFrame(frame); ok {
-			r.notifications = append(r.notifications, note)
+		if len(reply) > 0 && bytes.Equal(frame, reply) {
+			continue
 		}
+		note, ok := decodeNotificationFrame(frame)
+		if !ok {
+			s.fatalf("mcptest: %s: the server emitted %s", r.method, describeStrayFrame(frame))
+			continue
+		}
+		r.notifications = append(r.notifications, note)
 	}
 	return r
 }
 
+// describeStrayFrame names, for a failure message, a recorded frame that is
+// neither the reply nor a notification: a request the harness cannot answer,
+// or bytes that are not a well-formed notification at all. The frame is shown
+// as it was sent.
+func describeStrayFrame(frame []byte) string {
+	if method, id, isRequest := requestFrame(frame); isRequest {
+		return "a request " + strconv.Quote(method) + " (id " + id + ") that this harness cannot answer: " + string(frame)
+	}
+	return "a frame that is not a well-formed JSON-RPC notification: " + string(frame)
+}
+
+// requestFrame reports whether frame is a well-formed JSON-RPC request (a 2.0
+// envelope with a string method and a non-null id), with its method and the
+// id as written.
+func requestFrame(frame []byte) (method, id string, isRequest bool) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(frame, &members); err != nil {
+		return "", "", false
+	}
+	var version string
+	if err := json.Unmarshal(members["jsonrpc"], &version); err != nil || version != jsonrpc.Version {
+		return "", "", false
+	}
+	method, isString := rawString(members["method"])
+	rawID := bytes.TrimSpace(members["id"])
+	if !isString || len(rawID) == 0 || string(rawID) == "null" {
+		return "", "", false
+	}
+	return method, string(rawID), true
+}
+
 // decodeNotificationFrame decodes one recorded outbound frame as a JSON-RPC
-// notification, reporting false for a reply (a frame with a non-null id) and for
-// a frame that is not a notification envelope at all: bytes that are not one
+// notification, reporting false for a reply (a frame carrying an id member,
+// whatever its value, null included) and for a frame that is not a notification
+// envelope at all: bytes that are not one
 // well-formed JSON object, a jsonrpc member other than "2.0", or a missing or
 // non-string method.
 //
@@ -58,7 +111,7 @@ func (s *Server) withNotifications(sentBefore int, r *Response) *Response {
 func decodeNotificationFrame(frame []byte) (*jsonrpc.Notification, bool) {
 	// IsNotificationBytes settles the two questions the envelope alone answers:
 	// the bytes hold exactly one JSON object (nothing trailing it), and it
-	// carries no usable id, so it is not the final reply.
+	// carries no id member at all, so it is not the final reply.
 	isNotification, err := jsonrpc.IsNotificationBytes(frame)
 	if err != nil || !isNotification {
 		return nil, false
@@ -127,9 +180,21 @@ func cloneNotification(note *jsonrpc.Notification) *jsonrpc.Notification {
 
 // AssertNotificationCount asserts the server emitted exactly n notifications
 // while handling this message.
+//
+// A count of zero is a statement that something is absent, and it is held to
+// the rule AssertNotSentNotification documents: it fails unless the reply
+// carries a result. A positive count needs no such rule, since it can only
+// hold over notifications that were recorded.
 func (r *Response) AssertNotificationCount(n int) *Response {
 	if r.t != nil {
 		r.t.Helper()
+	}
+	if n == 0 && len(r.notifications) == 0 {
+		if fault := r.replyFault(); fault != "" {
+			r.fatalf("mcptest: %s: expected no notifications, but nothing shows the message was carried out: %s; read SentNotifications for the frames recorded regardless",
+				r.method, fault)
+			return r
+		}
 	}
 	if got := len(r.notifications); got != n {
 		r.fatalf("mcptest: %s: emitted %d notifications, want %d; emitted: %s",
@@ -192,6 +257,16 @@ func (r *Response) AssertSentNotificationWith(method string, want map[string]any
 
 // AssertNotSentNotification asserts the server emitted no notification with the
 // given method while handling this message.
+//
+// It is a statement about work the server did, so it needs a reply that shows
+// the work was done: it fails on a protocol error (the reply to a request that
+// was refused, and for an unknown tool or invalid params refused before the
+// handler ran) and on no reply at all. That includes a message driven with
+// Notify. A notification is never answered, so nothing tells a notification
+// the server acted on from one it dropped, and "nothing was emitted" would
+// hold over both. SentNotifications returns the frames recorded for any
+// message, a notification included, for a test that wants to read them
+// knowing that.
 func (r *Response) AssertNotSentNotification(method string) *Response {
 	if r.t != nil {
 		r.t.Helper()
@@ -202,6 +277,10 @@ func (r *Response) AssertNotSentNotification(method string) *Response {
 				r.method, method, describeNotificationParams(note))
 			return r
 		}
+	}
+	if fault := r.replyFault(); fault != "" {
+		r.fatalf("mcptest: %s: did not expect a %q notification, but nothing shows the message was carried out: %s; read SentNotifications for the frames recorded regardless",
+			r.method, method, fault)
 	}
 	return r
 }

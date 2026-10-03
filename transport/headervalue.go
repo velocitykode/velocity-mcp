@@ -25,8 +25,8 @@ var (
 	// either edge. Every such value has a wrapped form and must travel in it.
 	ErrHeaderValueSyntax = errors.New("transport: header value is not a field value")
 	// ErrHeaderValueEncoding reports a sentinel-wrapped value whose payload is
-	// not base64 under either padding rule, so the value it claims to state
-	// cannot be recovered.
+	// not canonical padded base64, so the value it claims to state is not one
+	// the encoding defines.
 	ErrHeaderValueEncoding = errors.New("transport: header value is not base64")
 )
 
@@ -53,10 +53,15 @@ func EncodeHeaderValue(value string) string {
 // name in a form the encoding does not define, and an intermediary routing on
 // the header would then resolve it differently from the server reading the body.
 //
-// Decoding accepts an unpadded payload as well as a padded one. EncodeHeaderValue
-// always pads, but a peer that trims the padding is still stating a value this
-// server can read, and comparing its payload as literal text instead would
-// reject the request with a mismatch it could not act on.
+// The payload is decoded strictly: standard alphabet, padding present (RFC 4648
+// section 4), and no non-zero bits left over in the final character (RFC 4648
+// section 3.5, canonical encoding). A value then has exactly one wrapped
+// spelling, the one EncodeHeaderValue writes. A lenient decoder would read an
+// unpadded payload and a payload with stray trailing bits as the same name, so
+// one name would travel under several header spellings, and an intermediary
+// decoding strictly would refuse a request this server accepted, or match a
+// spelling this server read differently; the specification's rule that the
+// decoded value is what is compared assumes the decoding is one reading.
 func DecodeHeaderValue(header string) (string, error) {
 	if !isLiteralHeaderValue(header) {
 		return "", ErrHeaderValueSyntax
@@ -65,13 +70,11 @@ func DecodeHeaderValue(header string) (string, error) {
 		return header, nil
 	}
 	payload := header[len(base64Prefix) : len(header)-len(base64Suffix)]
-	if decoded, err := base64.StdEncoding.DecodeString(payload); err == nil {
-		return string(decoded), nil
+	decoded, err := base64.StdEncoding.Strict().DecodeString(payload)
+	if err != nil {
+		return "", ErrHeaderValueEncoding
 	}
-	if decoded, err := base64.RawStdEncoding.DecodeString(payload); err == nil {
-		return string(decoded), nil
-	}
-	return "", ErrHeaderValueEncoding
+	return string(decoded), nil
 }
 
 // isSentinelWrapped reports whether a value is wrapped in the base64 sentinels.

@@ -174,19 +174,32 @@ func (p *protocol) negotiatePinned(ctx context.Context, pinned ProtocolVersion) 
 // back to the initialize handshake when the answer says the server does not
 // speak it.
 //
-// Only a rejection that identifies a discovery-era server stops the fallback;
-// it is either negotiated down to a mutually supported version or surfaced.
-// Every other JSON-RPC error means the server is one that predates the
-// handshake, because the fallback must not be keyed to any one error code:
-// servers answer an unknown request made before initialize with an
-// implementation-defined error (method-not-found and invalid-params are the
-// common ones) or with nothing at all. A failure that is not the server's
-// answer, such as a discover result this client cannot read, is surfaced: the
-// server did reply on discovery's terms.
+// A rejection that identifies a discovery-era server stops the fallback; it is
+// either negotiated down to a mutually supported version or surfaced. What else
+// means a server that predates the handshake is the binding's to say (MCP
+// 2026-07-28, basic/versioning, backward compatibility). Over stdio it is any
+// error that is not a recognized modern one, and silence: such a server answers
+// an unknown request with an implementation-defined error or with nothing at
+// all. Over streamable HTTP it is the answer the binding names, which the
+// transport recognizes (see eraDetecting); any other error there is a server
+// failing at the request, and is surfaced with nothing settled. A failure that
+// is not the server's answer, such as a discover result this client cannot
+// read, is surfaced too: the server did reply on discovery's terms.
 func (p *protocol) probe(ctx context.Context) (*negotiatedConnection, error) {
 	conn, err := p.discover(ctx, "")
 	if err == nil {
 		return conn, nil
+	}
+
+	// A probe that got no answer says nothing of what the server speaks. The
+	// transport marks it where silence is not how a server of the older
+	// handshake answers, as over HTTP, where such a server refuses the request
+	// with a status: the failure is reported and nothing is settled, so the
+	// next connection probes again. A subprocess that stays silent on a request
+	// it does not know carries no mark, and falls back as the specification has
+	// it.
+	if isUnanswered(err) {
+		return nil, err
 	}
 
 	// The rejection is remembered so a failing fallback can report both halves
@@ -198,6 +211,11 @@ func (p *protocol) probe(ctx context.Context) (*negotiatedConnection, error) {
 	case errors.As(err, &rpcErr):
 		if identifiesDiscoveryServer(rpcErr) {
 			return p.negotiateDown(ctx, rpcErr)
+		}
+		// A transport whose binding says which answers mean an older server is
+		// asked; any other error is the probe failing, and is reported.
+		if detecting, ok := p.transport.(eraDetecting); ok && !detecting.probeAnsweredAsLegacy(rpcErr) {
+			return nil, err
 		}
 		rejection = err
 	case errors.As(err, &transportErr):
@@ -225,6 +243,19 @@ func (p *protocol) probe(ctx context.Context) (*negotiatedConnection, error) {
 		return nil, err
 	}
 	return nil, wrapError(err, rejection.Error()+"; the legacy handshake also failed")
+}
+
+// eraDetecting is implemented by a transport whose binding does not let every
+// unrecognized error to the probe stand for a server of the older handshake.
+// Over stdio the specification has a client "fall back on any error that is not
+// a recognized modern error", which is what the probe does over a transport
+// that says nothing. Over streamable HTTP it names the answer that means so,
+// and an error that is not it is a server failing, to be reported.
+type eraDetecting interface {
+	// probeAnsweredAsLegacy reports whether a JSON-RPC error answering the
+	// probe, not one a modern server defines, identifies a server of the older
+	// handshake.
+	probeAnsweredAsLegacy(rejection *jsonrpc.Error) bool
 }
 
 // fallback runs the initialize handshake the probe fell back to, once over the
@@ -313,7 +344,7 @@ func (p *protocol) initialize(ctx context.Context, version ProtocolVersion, pinn
 		"clientInfo":      p.identity().ToMap(),
 	}, version, nil)
 	if err != nil {
-		return nil, err
+		return nil, handshakeFailure("initialize", err)
 	}
 
 	result, err := parseInitializeResult(raw)
@@ -323,7 +354,7 @@ func (p *protocol) initialize(ctx context.Context, version ProtocolVersion, pinn
 	if pinned && result.ProtocolVersion != version {
 		return nil, versionMismatch(result.ProtocolVersion, version)
 	}
-	if err := p.notify(ctx, "notifications/initialized", result.ProtocolVersion); err != nil {
+	if err := p.notify(ctx, "notifications/initialized", nil, result.ProtocolVersion); err != nil {
 		return nil, err
 	}
 	return &negotiatedConnection{version: result.ProtocolVersion, initialize: result}, nil
@@ -341,7 +372,7 @@ func (p *protocol) discover(ctx context.Context, pinned ProtocolVersion) (*negot
 
 	raw, err := p.attempt(ctx, "server/discover", nil, offered, nil)
 	if err != nil {
-		return nil, err
+		return nil, handshakeFailure("server/discover", err)
 	}
 	receivedAt := p.now()
 	result, err := parseDiscoverResult(raw)
@@ -361,6 +392,21 @@ func (p *protocol) discover(ctx context.Context, pinned ProtocolVersion) (*negot
 		return p.initialize(ctx, settled, false)
 	}
 	return &negotiatedConnection{version: settled, discover: result, staleAfter: staleAfter(receivedAt, raw)}, nil
+}
+
+// handshakeFailure weighs why a handshake request failed. Its result was
+// validated as every other result is, by the attempt that read it; what is
+// weighed here is the one outcome a handshake cannot have. A result the server
+// did not complete is not a handshake: the specification forbids an
+// input_required result on server/discover, and the initialize handshake
+// predates unfinished results altogether, so one is reported as the invalid
+// result it is rather than as something the caller could continue from.
+func handshakeFailure(method string, err error) error {
+	var unfinished *UnfinishedResultError
+	if errors.As(err, &unfinished) {
+		return invalidResult(method, "it asks for further input, which a handshake never does")
+	}
+	return err
 }
 
 // versionMismatch reports a server settling on a version other than the one

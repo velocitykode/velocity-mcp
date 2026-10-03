@@ -333,15 +333,18 @@ func TestStructuredContentAssertionsSeePresenceNotShape(t *testing.T) {
 }
 
 // TestNoStructuredContentHoldsOnlyWhenAbsent asserts the negative assertion says
-// what it means: it holds for a result that carries no such member and for an
-// error reply, which carries no result at all.
+// what it means: it holds for a result that carries no such member, and for
+// nothing else. An error reply carries no result at all, so it says nothing
+// about structured content, and the assertion refuses it rather than holding
+// over a tool that may never have run.
 func TestNoStructuredContentHoldsOnlyWhenAbsent(t *testing.T) {
-	for _, frame := range []string{
-		`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hi"}]}}`,
-		`{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"boom"}}`,
-	} {
-		r := replyFrom(t, nil, "tools/call", frame)
-		assertHolds(t, r, func(r *Response) { r.AssertNoStructuredContent() })
+	r := replyFrom(t, nil, "tools/call", `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hi"}]}}`)
+	assertHolds(t, r, func(r *Response) { r.AssertNoStructuredContent() })
+
+	r = replyFrom(t, nil, "tools/call", `{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"boom"}}`)
+	message := assertFails(t, r, func(r *Response) { r.AssertNoStructuredContent() })
+	if !strings.Contains(message, "no result to inspect: the reply is protocol error -32602: boom") {
+		t.Fatalf("AssertNoStructuredContent on an error reply failed with %q", message)
 	}
 }
 

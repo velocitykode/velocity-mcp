@@ -3,13 +3,16 @@ package console
 import (
 	"embed"
 	"fmt"
+	"go/token"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/velocitykode/prism"
 	velapp "github.com/velocitykode/velocity/app"
 	"github.com/velocitykode/velocity/chain"
 	"github.com/velocitykode/velocity/console/scaffold"
+	"github.com/velocitykode/velocity/str"
 )
 
 //go:embed stubs/*.stub
@@ -100,9 +103,13 @@ func (g generator) Handle(s *velapp.Services, args []string) error {
 	if err != nil {
 		return err
 	}
+	pkg, err := packageNameFor(outDir)
+	if err != nil {
+		return err
+	}
 
 	data := map[string]any{
-		"Package":       filepath.Base(outDir),
+		"Package":       pkg,
 		"Type":          base + g.typeSuffix,
 		"PrimitiveName": primitive,
 		"URI":           "velocity://" + primitive,
@@ -150,6 +157,40 @@ func parseGenArgs(args []string, command string) (name, dir string, err error) {
 		return "", "", fmt.Errorf("name is required (usage: vel run %s <Name> [--dir DIR])", command)
 	}
 	return name, dir, nil
+}
+
+// packageNameFor derives the package clause of a generated file from its
+// output directory. The directory rule the scaffold applies accepts segments
+// that are not Go identifiers, a hyphen or a dot among them, and Go does not
+// require a package to be named after its directory, so the last segment is
+// reduced to the identifier Go convention would give it: lower case, letters,
+// digits and underscores only. A segment that leaves no identifier, or one
+// that spells a keyword, cannot name a package at all and is refused before
+// anything is written, so the generator never reports success for a file that
+// does not compile.
+//
+// A name that is an identifier but cannot name a library is refused the same
+// way. The generated file declares a type for other packages to register, and
+// "main" names a program, which nothing can import and which does not build
+// without a main function; the blank identifier names no package at all.
+func packageNameFor(outDir string) (string, error) {
+	segment := filepath.Base(outDir)
+	var b strings.Builder
+	for _, r := range str.Lower(segment) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	pkg := b.String()
+	switch {
+	case token.IsKeyword(pkg):
+		return "", fmt.Errorf("invalid --dir %q: its last segment names the Go keyword %q, which cannot be a package name", outDir, pkg)
+	case !token.IsIdentifier(pkg) || pkg == "_":
+		return "", fmt.Errorf("invalid --dir %q: no Go package name can be derived from its last segment %q", outDir, segment)
+	case pkg == "main":
+		return "", fmt.Errorf("invalid --dir %q: its last segment names the package %q, which is a program and cannot be imported as a library", outDir, pkg)
+	}
+	return pkg, nil
 }
 
 // kebabCase converts a Pascal/snake identifier to the kebab-case form MCP uses

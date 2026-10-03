@@ -5,13 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/velocitykode/velocity/contract"
+	"github.com/velocitykode/velocity/str"
 	"github.com/velocitykode/velocity/validation"
 
 	"github.com/velocitykode/velocity-mcp/content"
@@ -421,6 +424,7 @@ func TestToolCatalogSearchReturnsCompleteEntry(t *testing.T) {
 		"ok": true,
 		"tools": []any{map[string]any{
 			"name":        "say-hi-tool",
+			"title":       "Say Hi Tool",
 			"description": "This tool says hello to a person",
 			"inputSchema": map[string]any{
 				"type": "object",
@@ -438,6 +442,79 @@ func TestToolCatalogSearchReturnsCompleteEntry(t *testing.T) {
 	if !jsonEqual(payload, want) {
 		t.Fatalf("payload = %s, want %s", mustJSON(payload), mustJSON(want))
 	}
+}
+
+// titledOutputTool declares a title and an output schema, the two tool
+// definition members a search entry must carry alongside the name,
+// description, input schema and annotations that tools/list carries.
+type titledOutputTool struct{}
+
+func (titledOutputTool) Name() string            { return "out-tool" }
+func (titledOutputTool) Title() string           { return "Zebra Report" }
+func (titledOutputTool) Description() string     { return "Reports a zebra" }
+func (titledOutputTool) Schema(s *schema.Object) { s.String("stripes") }
+func (titledOutputTool) OutputSchema(s *schema.Object) bool {
+	s.String("answer").Required()
+	return true
+}
+func (titledOutputTool) Handle(context.Context, *server.Request) (*server.Response, error) {
+	return server.Text("x"), nil
+}
+
+// TestToolCatalogSearchCarriesWhatToolsListCarries pins that a search entry is
+// the tool definition tools/list would advertise for the same tool: the MCP
+// specification's tool definition members (name, title, description,
+// inputSchema, outputSchema, annotations), member for member. A tool moved
+// behind the catalog must not lose its output schema, which a client needs to
+// validate structuredContent, nor its title; and the title is searchable, so
+// a tool can be found by the headline it is advertised under.
+func TestToolCatalogSearchCarriesWhatToolsListCarries(t *testing.T) {
+	tools := []server.Tool{titledOutputTool{}, sayHiTool()}
+	listed := server.New("demo", "1.0.0", server.WithTools(tools...))
+	catalog := server.New("demo", "1.0.0", server.WithToolCatalog(tools...))
+
+	advertised := map[string]map[string]any{}
+	result := decodeResult(t, handle(t, listed, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`).Response)
+	for _, raw := range result["tools"].([]any) {
+		entry := raw.(map[string]any)
+		advertised[entry["name"].(string)] = entry
+	}
+
+	for _, tool := range tools {
+		t.Run(tool.Name(), func(t *testing.T) {
+			_, payload, text := callCatalogTool(t, catalog, "search_tools", `{"query":"`+tool.Name()+`"}`)
+			entries, _ := payload["tools"].([]any)
+			if len(entries) == 0 {
+				t.Fatalf("search found nothing for %q: %s", tool.Name(), text)
+			}
+			got, _ := entries[0].(map[string]any)
+			want := advertised[tool.Name()]
+			// Annotations are the one member the two render differently by
+			// design: tools/list writes an empty object for a tool without
+			// hints, the search entry omits the member.
+			if hints, _ := want["annotations"].(map[string]any); len(hints) == 0 {
+				delete(want, "annotations")
+			}
+			if !jsonEqual(got, want) {
+				t.Fatalf("search entry = %s, want the tools/list definition %s", mustJSON(got), mustJSON(want))
+			}
+		})
+	}
+
+	t.Run("a title is searchable", func(t *testing.T) {
+		_, payload, _ := callCatalogTool(t, catalog, "search_tools", `{"query":"zebra"}`)
+		if got, want := searchNames(t, payload), []string{"out-tool"}; !equalStrings(got, want) {
+			t.Fatalf("tools = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a derived title is searchable", func(t *testing.T) {
+		// "say-hi-tool" is advertised under the headline "Say Hi Tool".
+		_, payload, _ := callCatalogTool(t, catalog, "search_tools", `{"query":"Say Hi"}`)
+		if got, want := searchNames(t, payload), []string{"say-hi-tool"}; !equalStrings(got, want) {
+			t.Fatalf("tools = %v, want %v", got, want)
+		}
+	})
 }
 
 func TestToolCatalogSearchIncludesAnnotations(t *testing.T) {
@@ -659,7 +736,7 @@ func TestToolCatalogPayloadsKeepTheirBytes(t *testing.T) {
 			name: "search entries",
 			tool: "search_tools",
 			args: `{"query":"<input>"}`,
-			want: `{"ok":true,"tools":[{"name":"html-tool","description":"Wraps <input> in a & b ` + strings.Repeat("<b>&</b> ", 60) + `","inputSchema":{"properties":{"markup":{"description":"Raw <html> & text to wrap","type":"string"}},"type":"object"}}],"hasMore":false}`,
+			want: `{"ok":true,"tools":[{"name":"html-tool","title":"Html Tool","description":"Wraps <input> in a & b ` + strings.Repeat("<b>&</b> ", 60) + `","inputSchema":{"properties":{"markup":{"description":"Raw <html> & text to wrap","type":"string"}},"type":"object"}}],"hasMore":false}`,
 		},
 		{
 			name: "batch results",
@@ -2092,18 +2169,74 @@ func TestToolCatalogLengthLimitsCountCharacters(t *testing.T) {
 	})
 }
 
-func TestToolCatalogExecuteAcceptsNullArguments(t *testing.T) {
-	// A null "arguments" is treated as no arguments, exactly as an omitted
-	// "arguments" object is on a direct tools/call.
-	s := server.New("demo", "1.0.0", server.WithToolCatalog(structuredTool()))
-
-	result, payload, text := callCatalogTool(t, s, "execute_tools",
-		`{"calls":[{"name":"structured-content-tool","arguments":null}]}`)
-	if got := result["isError"]; got != false {
-		t.Fatalf("isError = %v, want false (text %q)", got, text)
+// TestToolCatalogExecuteArgumentShapesMatchTheDirectPath pins that a batch
+// entry's "arguments" member is held to the shape rule a direct tools/call
+// applies to its own: an omitted member and an empty array (which some
+// encoders write for an empty map) both mean no arguments, and null, a scalar
+// and a non-empty array are refused. The outcome on each path is spelled out
+// per shape rather than read from the other path, so the table is the
+// contract and either path drifting from it fails. The two paths report a
+// refusal in their own shape, a -32602 error response on the direct path and
+// a tool error result on the batch path, which is by design.
+func TestToolCatalogExecuteArgumentShapesMatchTheDirectPath(t *testing.T) {
+	cases := []struct {
+		name string
+		// member is the "arguments" member as written after the name, with
+		// its leading comma; empty when the member is omitted.
+		member string
+		// accepted is whether the call runs; when it does, echoed is the
+		// value the echo tool returns.
+		accepted bool
+		echoed   string
+	}{
+		{"omitted", ``, true, ""},
+		{"an object", `,"arguments":{"value":"v"}`, true, "v"},
+		{"an empty object", `,"arguments":{}`, true, ""},
+		{"an empty array", `,"arguments":[]`, true, ""},
+		{"null", `,"arguments":null`, false, ""},
+		{"a string", `,"arguments":"x"`, false, ""},
+		{"a number", `,"arguments":5`, false, ""},
+		{"a non-empty array", `,"arguments":[1]`, false, ""},
+		{"an array of objects", `,"arguments":[{"value":"v"}]`, false, ""},
 	}
-	if got, want := resultNames(t, payload), []string{"structured-content-tool"}; !equalStrings(got, want) {
-		t.Errorf("results = %v, want %v", got, want)
+	direct := server.New("demo", "1.0.0", server.WithTools(echoTool()))
+	batch := server.New("demo", "1.0.0", server.WithToolCatalog(echoTool()))
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := handle(t, direct, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo-tool"`+tc.member+`}}`)
+			if tc.accepted {
+				result := decodeResult(t, res.Response)
+				if result["isError"] != false || firstText(t, result) != tc.echoed {
+					t.Fatalf("direct call = (isError %v, %q), want the tool to run and echo %q", result["isError"], firstText(t, result), tc.echoed)
+				}
+			} else if res.Response == nil || res.Response.Error == nil || res.Response.Error.Code != jsonrpc.CodeInvalidParams {
+				t.Fatalf("direct call = %+v, want error %d", res.Response, jsonrpc.CodeInvalidParams)
+			}
+
+			result, payload, text := callCatalogTool(t, batch, "execute_tools",
+				`{"calls":[{"name":"echo-tool"`+tc.member+`}]}`)
+			if tc.accepted {
+				if result["isError"] != false {
+					t.Fatalf("batch isError = %v, want false (text %q)", result["isError"], text)
+				}
+				records := batchResults(t, result, payload)
+				if len(records) != 1 || records[0]["isError"] != false {
+					t.Fatalf("batch records = %v, want one successful record", records)
+				}
+				items := batchContent(t, result)
+				if len(items) != 1 || items[0]["text"] != tc.echoed {
+					t.Fatalf("batch forwarded %v, want the echo of %q", items, tc.echoed)
+				}
+				return
+			}
+			if result["isError"] != true {
+				t.Fatalf("batch isError = %v, want true (text %q)", result["isError"], text)
+			}
+			if want := "The calls.0.arguments field must be an object."; text != want {
+				t.Fatalf("batch message = %q, want %q", text, want)
+			}
+		})
 	}
 }
 
@@ -2124,7 +2257,7 @@ func TestToolCatalogMetaToolSchemas(t *testing.T) {
 			"query": map[string]any{
 				"type":        "string",
 				"maxLength":   float64(4096),
-				"description": "Search terms. An empty query browses the catalog.",
+				"description": "Search terms; the first 32 distinct terms are matched. An empty query browses the catalog.",
 			},
 			"limit": map[string]any{
 				"type":        "integer",
@@ -2815,7 +2948,7 @@ func TestToolCatalogExecuteReportsEveryBadEntry(t *testing.T) {
 	s := server.New("demo", "1.0.0", server.WithToolCatalog(sayHiTool()))
 
 	// Both entries are malformed: the batch is rejected once, naming each.
-	_, _, text := callCatalogTool(t, s, "execute_tools", `{"calls":[{"name":42},{"name":"say-hi-tool","arguments":[]}]}`)
+	_, _, text := callCatalogTool(t, s, "execute_tools", `{"calls":[{"name":42},{"name":"say-hi-tool","arguments":null}]}`)
 	want := "The calls.0.name field must be a string. The calls.1.arguments field must be an object."
 	if text != want {
 		t.Fatalf("message = %q, want %q", text, want)
@@ -3268,6 +3401,78 @@ func TestToolCatalogRejectsDuplicateNames(t *testing.T) {
 			t.Errorf("tools/list names = %v, want %v", got, want)
 		}
 	})
+
+	// The specification requires tool names to be unique within a server, and
+	// a catalog entry is a tool of the server even though tools/list does not
+	// carry it: the same name reaching two tools depending on the path (a
+	// tools/call or an execute_tools batch) would make ToolCalled and
+	// ToolFailed events ambiguous and let search_tools hand out a name that
+	// resolves to something else on the direct path.
+	t.Run("a catalog entry colliding with a listed tool", func(t *testing.T) {
+		shadow := server.NewTool("echo-tool", "Shadows the listed echo tool").
+			HandleFunc(func(context.Context, *server.Request) (*server.Response, error) {
+				return server.Text("shadow"), nil
+			})
+		logger := &countingLogger{}
+		s := server.New("demo", "1.0.0",
+			server.WithTools(echoTool()),
+			server.WithToolCatalog(shadow),
+			server.WithLogger(logger),
+		)
+
+		want := "Duplicate server tool name [echo-tool]."
+		for _, tool := range []struct{ name, args string }{
+			{"execute_tools", `{"calls":[{"name":"echo-tool","arguments":{"value":"v"}}]}`},
+			{"search_tools", `{}`},
+		} {
+			result, _, text := callCatalogTool(t, s, tool.name, tool.args)
+			if got := result["isError"]; got != true {
+				t.Fatalf("%s isError = %v, want true", tool.name, got)
+			}
+			if text != want {
+				t.Errorf("%s message = %q, want %q", tool.name, text, want)
+			}
+		}
+		if got := logger.errors(); got != 1 {
+			t.Errorf("logged %d errors, want 1", got)
+		}
+		// The listed tool itself is unaffected: the misconfiguration is the
+		// catalog's to report.
+		result, _, text := callCatalogTool(t, s, "echo-tool", `{"value":"direct"}`)
+		if result["isError"] != false || text != "direct" {
+			t.Errorf("direct call = (isError %v, %q), want the listed tool's own reply", result["isError"], text)
+		}
+	})
+
+	t.Run("a catalog entry colliding with a generated name", func(t *testing.T) {
+		for _, name := range []string{"search_tools", "execute_tools"} {
+			t.Run(name, func(t *testing.T) {
+				impostor := server.NewTool(name, "Impersonates a meta tool").
+					HandleFunc(func(context.Context, *server.Request) (*server.Response, error) {
+						return server.Text("impostor"), nil
+					})
+				logger := &countingLogger{}
+				s := server.New("demo", "1.0.0", server.WithToolCatalog(sayHiTool(), impostor), server.WithLogger(logger))
+
+				want := "Duplicate server tool name [" + name + "]."
+				for _, tool := range []struct{ name, args string }{
+					{"execute_tools", `{"calls":[{"name":"` + name + `","arguments":{}}]}`},
+					{"search_tools", `{"query":""}`},
+				} {
+					result, _, text := callCatalogTool(t, s, tool.name, tool.args)
+					if got := result["isError"]; got != true {
+						t.Fatalf("%s isError = %v, want true", tool.name, got)
+					}
+					if text != want {
+						t.Errorf("%s message = %q, want %q", tool.name, text, want)
+					}
+				}
+				if got := logger.errors(); got != 1 {
+					t.Errorf("logged %d errors, want 1", got)
+				}
+			})
+		}
+	})
 }
 
 func TestToolCatalogHandlesConcurrentCalls(t *testing.T) {
@@ -3314,7 +3519,7 @@ func TestToolCatalogHandlesConcurrentCalls(t *testing.T) {
 				"sess-1")
 			// Every worker searches the same catalog, so every worker must see
 			// exactly the one tool whose description mentions a person.
-			wantSearch := `{"ok":true,"tools":[{"name":"say-hi-tool","description":"This tool says hello to a person","inputSchema":{"properties":{"name":{"description":"The name of the person to greet","type":"string"}},"required":["name"],"type":"object"}}],"hasMore":false}`
+			wantSearch := `{"ok":true,"tools":[{"name":"say-hi-tool","title":"Say Hi Tool","description":"This tool says hello to a person","inputSchema":{"properties":{"name":{"description":"The name of the person to greet","type":"string"}},"required":["name"],"type":"object"}}],"hasMore":false}`
 			if got := reply(search, 1); got != wantSearch {
 				errs <- fmt.Sprintf("search %d payload = %s", i, got)
 			}
@@ -3661,4 +3866,229 @@ func mustJSON(v any) []byte {
 		return []byte(fmt.Sprintf("%q", err.Error()))
 	}
 	return b
+}
+
+// largeCatalog builds a catalog of n tools whose text is a few kilobytes each,
+// the shape on which the cost of a search shows.
+func largeCatalog(n int) []server.Tool {
+	description := strings.Repeat("lorem ipsum dolor sit amet ", 150)
+	tools := make([]server.Tool, 0, n)
+	for i := range n {
+		tools = append(tools, server.NewTool(fmt.Sprintf("tool_%d", i), description).
+			WithSchema(func(s *schema.Object) {
+				for j := range 20 {
+					s.String(fmt.Sprintf("property_number_%d", j)).Description("some description text for the property")
+				}
+			}).
+			HandleFunc(func(context.Context, *server.Request) (*server.Response, error) { return server.Text("x"), nil }))
+	}
+	return tools
+}
+
+// fastestOf runs fn a few times and returns the shortest run: the floor of
+// what the work costs, which load on the machine can only raise.
+func fastestOf(runs int, fn func()) time.Duration {
+	best := time.Duration(math.MaxInt64)
+	for range runs {
+		start := time.Now()
+		fn()
+		if elapsed := time.Since(start); elapsed < best {
+			best = elapsed
+		}
+	}
+	return best
+}
+
+// TestToolCatalogSearchQueryWorkIsBounded pins that one search request cannot
+// cost more than a bounded multiple of the cheapest search: the work of a
+// query is the number of its distinct terms times the corpus, and the number
+// of distinct terms a query contributes is capped, so a 4 KB query of near-miss
+// terms (each a prefix of a frequent word plus one wrong letter, the worst case
+// for a substring scan) or of two-letter terms costs at most that many
+// one-term searches. The bound is measured, with a margin for the machine: the
+// cap is 32, and the old uncapped, undeduplicated scan ran nearly a thousand
+// one-term searches for one request.
+func TestToolCatalogSearchQueryWorkIsBounded(t *testing.T) {
+	s := server.New("demo", "1.0.0", server.WithToolCatalog(largeCatalog(2000)...))
+	search := func(query string) func() {
+		raw, err := json.Marshal(map[string]any{"query": query})
+		if err != nil {
+			t.Fatalf("encode query: %v", err)
+		}
+		frame := []byte(`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"search_tools","arguments":` + string(raw) + `}}`)
+		return func() { s.Handle(context.Background(), frame, "sess-1") }
+	}
+
+	baseline := fastestOf(5, search("lorem"))
+	hostile := []struct {
+		name  string
+		query string
+	}{
+		{"near-miss terms repeated", strings.TrimSpace(strings.Repeat("lorex ", 682))},
+		{"two-letter terms", strings.TrimSpace(strings.Repeat("zq ", 1365))},
+		{"distinct near-miss terms", distinctTerms("lore", 585)},
+		{"one 4096-character term", strings.Repeat("a", 4096)},
+	}
+	for _, tc := range hostile {
+		t.Run(tc.name, func(t *testing.T) {
+			if n := str.Length(tc.query); n > 4096 {
+				t.Fatalf("query is %d characters, the schema admits 4096", n)
+			}
+			cost := fastestOf(3, search(tc.query))
+			if limit := 100*baseline + 50*time.Millisecond; cost > limit {
+				t.Fatalf("one request cost %v against a one-term search of %v; the bound is %v", cost, baseline, limit)
+			}
+		})
+	}
+}
+
+// distinctTerms returns n distinct terms sharing the given prefix, separated
+// by spaces, each a near miss of a word in the large catalog.
+func distinctTerms(prefix string, n int) string {
+	terms := make([]string, 0, n)
+	for i := range n {
+		terms = append(terms, fmt.Sprintf("%s%c%c", prefix, 'a'+rune(i%26), 'a'+rune(i/26%26)))
+	}
+	return strings.Join(terms, " ")
+}
+
+// TestToolCatalogSearchTermsAreDistinctAndCapped pins the term set a query
+// contributes: a repeated term counts once, so it neither multiplies a score
+// nor the work, and only the first 32 distinct terms are matched, which is
+// what bounds the work of one request.
+func TestToolCatalogSearchTermsAreDistinctAndCapped(t *testing.T) {
+	a := server.NewTool("delete_user", "remove").
+		HandleFunc(func(context.Context, *server.Request) (*server.Response, error) { return server.Text("a"), nil })
+	b := server.NewTool("user", "delete delete delete a user account").
+		HandleFunc(func(context.Context, *server.Request) (*server.Response, error) { return server.Text("b"), nil })
+	// zed is found only through the term "zed"; where that term lands in the
+	// query decides whether it is matched at all.
+	zed := server.NewTool("zed", "unrelated").
+		HandleFunc(func(context.Context, *server.Request) (*server.Response, error) { return server.Text("z"), nil })
+	s := server.New("demo", "1.0.0", server.WithToolCatalog(a, b, zed))
+
+	names := func(query string) []string {
+		raw, err := json.Marshal(query)
+		if err != nil {
+			t.Fatalf("encode query: %v", err)
+		}
+		_, payload, text := callCatalogTool(t, s, "search_tools", `{"query":`+string(raw)+`}`)
+		if payload == nil {
+			t.Fatalf("search %q returned no payload: %s", query, text)
+		}
+		return searchNames(t, payload)
+	}
+
+	t.Run("a repeated term counts once", func(t *testing.T) {
+		once, thrice := names("user"), names("user user user")
+		if !equalStrings(once, thrice) {
+			t.Fatalf("tools for %q = %v, for %q = %v; a repeated term must not change the ranking", "user", once, "user user user", thrice)
+		}
+		// "delete user" is exactly the name terms of delete_user, however
+		// often each is repeated.
+		if got, want := names("delete user delete user"), []string{"delete_user", "user"}; !equalStrings(got, want) {
+			t.Fatalf("tools = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("only the first 32 distinct terms are matched", func(t *testing.T) {
+		filler := distinctTerms("q", 31)
+		if got, want := names(filler+" zed"), []string{"zed"}; !equalStrings(got, want) {
+			t.Fatalf("the 32nd distinct term was not matched: tools = %v, want %v", got, want)
+		}
+		if got := names(filler + " extra zed"); len(got) != 0 {
+			t.Fatalf("the 33rd distinct term was matched: tools = %v, want none", got)
+		}
+		// A repeat before it does not push a term past the cap ("qaa" is
+		// the first filler term).
+		if got, want := names(filler+" qaa zed"), []string{"zed"}; !equalStrings(got, want) {
+			t.Fatalf("a repeated term consumed a slot: tools = %v, want %v", got, want)
+		}
+	})
+}
+
+// TestToolCatalogLimitsHaveCeilings pins that WithToolCatalogLimits caps a
+// configured limit at a documented ceiling (100 calls, 4 MiB) just as it
+// raises one to the floor: the batch is measured as it is serialized at every
+// step, so the work of one request grows with both limits, and a ceiling is
+// what keeps a generous configuration from making one request arbitrarily
+// expensive.
+func TestToolCatalogLimitsHaveCeilings(t *testing.T) {
+	s := server.New("demo", "1.0.0",
+		server.WithToolCatalog(echoTool()),
+		server.WithToolCatalogLimits(1000, 1<<30),
+	)
+
+	t.Run("the call ceiling is advertised and enforced", func(t *testing.T) {
+		listed := decodeResult(t, handle(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`).Response)
+		tools, _ := listed["tools"].([]any)
+		execute, _ := tools[1].(map[string]any)
+		input, _ := execute["inputSchema"].(map[string]any)
+		properties, _ := input["properties"].(map[string]any)
+		calls, _ := properties["calls"].(map[string]any)
+		if got := calls["maxItems"]; got != float64(100) {
+			t.Errorf("calls maxItems = %v, want the ceiling of 100", got)
+		}
+
+		batch := make([]string, 0, 101)
+		for range 101 {
+			batch = append(batch, `{"name":"echo-tool","arguments":{"value":"v"}}`)
+		}
+		result, _, text := callCatalogTool(t, s, "execute_tools", `{"calls":[`+strings.Join(batch, ",")+`]}`)
+		if result["isError"] != true {
+			t.Fatalf("isError = %v, want true for 101 calls", result["isError"])
+		}
+		if want := "The calls field must not have more than 100 items."; text != want {
+			t.Errorf("message = %q, want %q", text, want)
+		}
+	})
+
+	t.Run("the output ceiling is enforced", func(t *testing.T) {
+		// A single result just past 4 MiB is refused with the ceiling named,
+		// not the configured limit.
+		value := strings.Repeat("x", 4<<20)
+		result, payload, text := callCatalogTool(t, s, "execute_tools", `{"calls":[{"name":"echo-tool","arguments":{"value":"`+value+`"}}]}`)
+		if result["isError"] != true {
+			t.Fatalf("isError = %v, want true for a result past the ceiling (text %.80q)", result["isError"], text)
+		}
+		limit, _ := payload["error"].(map[string]any)
+		if got, want := limit["message"], "The tool output exceeded 4194304 bytes."; got != want {
+			t.Errorf("limit message = %v, want %q", got, want)
+		}
+	})
+}
+
+// TestToolCatalogExecuteWorkIsLinearInTheResults pins that the work of an
+// execute batch grows with the size of its reply, not with its square. The
+// batch is measured as it is serialized after every call, and measuring by
+// re-encoding every result already held makes a batch of n results encode
+// n squared results' worth of bytes. Encoding allocates, so allocations are
+// the measure: they do not depend on the load of the machine, and a batch four
+// times as long must cost about four times as many, not sixteen. The old
+// render cost nine times as many at this ratio.
+func TestToolCatalogExecuteWorkIsLinearInTheResults(t *testing.T) {
+	value := strings.Repeat("x", 2000)
+	allocations := func(calls int) float64 {
+		s := server.New("demo", "1.0.0",
+			server.WithToolCatalog(echoTool()),
+			server.WithToolCatalogLimits(calls, 1<<20),
+		)
+		batch := make([]string, 0, calls)
+		for range calls {
+			batch = append(batch, `{"name":"echo-tool","arguments":{"value":"`+value+`"}}`)
+		}
+		frame := []byte(`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"execute_tools","arguments":{"calls":[` + strings.Join(batch, ",") + `]}}}`)
+		return testing.AllocsPerRun(3, func() {
+			res := s.Handle(context.Background(), frame, "sess-1")
+			if res.Response == nil || res.Response.Error != nil {
+				t.Errorf("batch of %d failed: %+v", calls, res.Response)
+			}
+		})
+	}
+
+	small, large := allocations(20), allocations(80)
+	if large > 5*small {
+		t.Fatalf("a batch of 80 results allocated %.0f times, a batch of 20 %.0f times: %.1fx for 4x the results, want at most 5x",
+			large, small, large/small)
+	}
 }

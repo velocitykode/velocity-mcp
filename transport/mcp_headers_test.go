@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
-	"github.com/velocitykode/velocity-mcp/server"
 	"github.com/velocitykode/velocity/router"
 )
 
@@ -25,17 +25,86 @@ func modernBody(id int, method string, extra ...string) string {
 
 // mcpHeaders returns the headers a compliant client sends for a body, as
 // alternating key/value pairs for postContext.
+//
+// They are derived from the body by this file's own reading of the
+// specification (2026-07-28, streamable HTTP, request headers and value
+// encoding), not by the code under test: MCP-Protocol-Version mirrors the
+// protocol version in params._meta, Mcp-Method mirrors the JSON-RPC method, and
+// Mcp-Name mirrors params.name for tools/call and prompts/get and params.uri for
+// resources/read, base64-wrapped between the "=?base64?" and "?=" sentinels when
+// the value cannot travel in a header as it stands. Deriving them through
+// server.InspectMessage or EncodeHeaderValue would let a misread in either
+// produce headers that match it, and no acceptance test here could fail on it.
 func mcpHeaders(t *testing.T, body string) []string {
 	t.Helper()
-	info, ok := server.InspectMessage([]byte(body))
-	if !ok {
-		t.Fatalf("body is not a request: %s", body)
+	var msg struct {
+		Method json.RawMessage `json:"method"`
+		Params json.RawMessage `json:"params"`
 	}
-	headers := []string{HeaderProtocolVersion, info.ProtocolVersion, HeaderMethod, info.Method}
-	if info.RequiresName && info.Name != "" {
-		headers = append(headers, HeaderName, EncodeHeaderValue(info.Name))
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		t.Fatalf("body is not a JSON object: %s", body)
+	}
+	method, ok := jsonString(msg.Method)
+	if !ok {
+		t.Fatalf("body states no string method: %s", body)
+	}
+	var params struct {
+		Meta map[string]json.RawMessage `json:"_meta"`
+		Name json.RawMessage            `json:"name"`
+		URI  json.RawMessage            `json:"uri"`
+	}
+	if strings.HasPrefix(strings.TrimSpace(string(msg.Params)), "{") {
+		if err := json.Unmarshal(msg.Params, &params); err != nil {
+			t.Fatalf("params are not an object: %s", msg.Params)
+		}
+	}
+	version, _ := jsonString(params.Meta["io.modelcontextprotocol/protocolVersion"])
+	headers := []string{HeaderProtocolVersion, version, HeaderMethod, method}
+
+	var target json.RawMessage
+	switch method {
+	case "tools/call", "prompts/get":
+		target = params.Name
+	case "resources/read":
+		target = params.URI
+	}
+	if name, ok := jsonString(target); ok && name != "" {
+		headers = append(headers, HeaderName, headerValueFor(name))
 	}
 	return headers
+}
+
+// jsonString decodes a raw JSON token as a string, reporting false for an
+// absent token or any other JSON type.
+func jsonString(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	s, ok := value.(string)
+	return s, ok
+}
+
+// headerValueFor renders a value as the specification says a client writes it
+// into Mcp-Name: as it stands when it is printable ASCII without whitespace at
+// either edge and does not itself look like a wrapped value, and otherwise as
+// its standard base64 (RFC 4648 section 4) between the "=?base64?" and "?="
+// sentinels.
+func headerValueFor(value string) string {
+	literal := value != "" && !(strings.HasPrefix(value, "=?base64?") && strings.HasSuffix(value, "?="))
+	for i := 0; literal && i < len(value); i++ {
+		b := value[i]
+		if b < 0x20 || b > 0x7E || ((b == ' ' || b == '\t') && (i == 0 || i == len(value)-1)) {
+			literal = false
+		}
+	}
+	if literal {
+		return value
+	}
+	return "=?base64?" + base64.StdEncoding.EncodeToString([]byte(value)) + "?="
 }
 
 // withoutHeader drops one key/value pair from an alternating header list.
@@ -272,7 +341,8 @@ func TestNonRequestsSkipHeaderValidation(t *testing.T) {
 	}{
 		{"notification", `{"jsonrpc":"2.0","method":"notifications/initialized"}`, http.StatusAccepted},
 		{"malformed json", `{"jsonrpc":"2.0",`, http.StatusOK},
-		{"null id", `{"jsonrpc":"2.0","id":null,"method":"tools/list"}`, http.StatusAccepted},
+		{"null id", `{"jsonrpc":"2.0","id":null,"method":"tools/list"}`, http.StatusOK},
+		{"fractional id", `{"jsonrpc":"2.0","id":1.5,"method":"tools/list"}`, http.StatusOK},
 		{"empty body", ``, http.StatusOK},
 	}
 	for _, tt := range tests {
@@ -321,7 +391,7 @@ func modernIDBody(id string) string {
 // put an object or an array where the specification allows only a string, a
 // number or null.
 func TestUnusableRequestIDIsNotEchoed(t *testing.T) {
-	for _, id := range []string{`{}`, `{"a":1}`, `[1]`, `[]`, `true`, `false`} {
+	for _, id := range []string{`{}`, `{"a":1}`, `[1]`, `[]`, `true`, `false`, `null`, `1.5`, `1e3`, `-0.5`} {
 		t.Run(id, func(t *testing.T) {
 			w := serve(t, modernIDBody(id))
 
@@ -413,7 +483,9 @@ func TestBodyIsHandedOnIntact(t *testing.T) {
 
 // TestOversizedBodyIsRejectedByTheMiddleware asserts the body cap applies to the
 // validation read as well, so the guard cannot become a way to feed the server
-// an unbounded body.
+// an unbounded body. The refusal is the size error itself, which the framework's
+// error boundary answers with 413; the middleware writes nothing, and in
+// particular no JSON-RPC parse error for a body it never parsed.
 func TestOversizedBodyIsRejectedByTheMiddleware(t *testing.T) {
 	huge := modernBody(1, "tools/call", `"name":"`+strings.Repeat("a", 4096)+`"`)
 	next := func(c *router.Context) error {
@@ -421,15 +493,11 @@ func TestOversizedBodyIsRejectedByTheMiddleware(t *testing.T) {
 		return nil
 	}
 	c, w := postContext(t, huge)
-	if err := ValidateHeaders(WithMaxBodyBytes(64))(next)(c); err != nil {
-		t.Fatalf("middleware returned error: %v", err)
+	if err := ValidateHeaders(WithMaxBodyBytes(64))(next)(c); !maxBytesError(err) {
+		t.Fatalf("middleware returned %v, want the *http.MaxBytesError", err)
 	}
-	resp := decodeResponse(t, w.Body.Bytes())
-	if resp.Error == nil || resp.Error.Code != jsonrpc.CodeParseError {
-		t.Fatalf("expected a parse error, got %+v", resp)
-	}
-	if strings.Contains(resp.Error.Message, "too large") {
-		t.Fatalf("the refusal leaks the internal cause: %q", resp.Error.Message)
+	if w.Body.Len() != 0 {
+		t.Fatalf("middleware wrote %q, want nothing", w.Body.String())
 	}
 }
 

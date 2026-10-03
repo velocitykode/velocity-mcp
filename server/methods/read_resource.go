@@ -11,7 +11,9 @@ import (
 // requested uri (matching templates where needed), reads it, and serializes the
 // contents.
 //
-// A uri that is missing or resolves to no registered resource is a protocol
+// A missing uri is InvalidParams (-32602) under every revision: a required
+// parameter that is absent is a malformed request, not a resource that could
+// not be found. A uri that resolves to no registered resource is a protocol
 // error whose code follows the revision the request is made under: revision
 // 2026-07-28 reports InvalidParams (-32602), because the uri is a request
 // parameter the server could not make sense of, while the revisions that
@@ -19,6 +21,16 @@ import (
 // specification names and the one their clients read to tell a resource that is
 // not there from parameters they got wrong. A validation failure becomes an
 // error result text prefixed with "Invalid params: ".
+//
+// A result that reports a failure as content (a validation failure, content the
+// read form cannot represent, or an error response the resource itself
+// returned) carries the zero caching hint whatever the resource or the
+// operation is configured with: resource results have no error marker, so a
+// client or shared cache storing one under the resource's own lifetime and
+// audience would serve the failure as the resource, to every caller, for as
+// long as the resource itself would have been fresh. The caching hints are
+// required to describe the result actually returned, and a failure is not the
+// resource.
 type ReadResource struct{}
 
 var _ server.Method = ReadResource{}
@@ -27,16 +39,14 @@ var _ server.Method = ReadResource{}
 func (ReadResource) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Response, error) {
 	p := decode(req)
 
-	unresolved := unresolvedResourceCode(req)
-
 	uri := p.str("uri")
 	if !p.has("uri") || uri == "" {
-		return jsonrpc.NewErrorResponseCode(req.ID, unresolved, "Missing [uri] parameter."), nil
+		return jsonrpc.NewErrorResponseCode(req.ID, jsonrpc.CodeInvalidParams, "Missing [uri] parameter."), nil
 	}
 
 	resource, vars := resolveResource(c, uri)
 	if resource == nil {
-		return jsonrpc.NewErrorResponseCode(req.ID, unresolved, "Resource ["+uri+"] not found."), nil
+		return jsonrpc.NewErrorResponseCode(req.ID, unresolvedResourceCode(req), "Resource ["+uri+"] not found."), nil
 	}
 
 	request := server.NewRequest(p.arguments()).
@@ -58,7 +68,11 @@ func (ReadResource) Handle(c *server.Context, req *jsonrpc.Request) (*jsonrpc.Re
 
 	result, serr := resourceResult(uri, resource.MimeType(), resp)
 	if serr != nil {
-		result, _ = resourceResult(uri, resource.MimeType(), server.Error("The resource returned content that cannot be represented in a resource read."))
+		resp = server.Error("The resource returned content that cannot be represented in a resource read.")
+		result, _ = resourceResult(uri, resource.MimeType(), resp)
+	}
+	if resp.IsError() {
+		server.CacheHint{}.Apply(result)
 	}
 	return jsonrpc.NewResult(req.ID, result)
 }

@@ -1,9 +1,6 @@
 package client
 
-import (
-	"context"
-	"time"
-)
+import "context"
 
 // Tool is a tool advertised by the server (one entry of tools/list). When it was
 // obtained through a Client it is bound to that client and can be invoked
@@ -14,25 +11,9 @@ type Tool struct {
 	// mirrored is the set of input properties this tool's schema asks to be
 	// mirrored into request headers, and mirrorErr the reason the schema's
 	// annotations were refused. A tool carrying the latter is never advertised
-	// by Tools: its definition is invalid, so calling it could only fail.
+	// by Tools and never called: its definition is invalid.
 	mirrored  mirroredParameters
 	mirrorErr error
-
-	// generation is the connection the listing that produced this value read it
-	// over. A definition describes the server that stated it, so a call made
-	// over a later connection reads the definition again rather than mirroring
-	// what another server asked for.
-	generation int64
-
-	// staleAfter is the moment the page that carried this definition stops
-	// being fresh, and changes the count of changes the server had announced to
-	// its catalogue when the listing set out. A value may be held for as long
-	// as the caller likes, which neither the lifetime the server gave the
-	// definition nor what it has announced since says anything about: a call
-	// made past either reads the definition again rather than mirroring what
-	// the server asked for once.
-	staleAfter time.Time
-	changes    int64
 
 	Name         string
 	Title        string
@@ -54,17 +35,13 @@ func (t Tool) Call(ctx context.Context, arguments map[string]any, continuation .
 	if t.client == nil {
 		return nil, newError("tool [" + t.Name + "] is not bound to a client")
 	}
-	// The definition this value carries is the one the listing that produced it
-	// read, over the connection that listing stood on, which the server may
-	// have changed since and which a later handshake may have replaced. The
-	// call is therefore weighed against a held definition rather than a freshly
-	// read one.
-	return t.client.callTool(ctx, t.Name, arguments, t.client.held(t.stated(), t.generation), continuation)
-}
-
-// stated returns what the listing that produced this value stated for the tool.
-func (t Tool) stated() statedDefinition {
-	return statedDefinition{params: t.mirrored, staleAfter: t.staleAfter, changes: t.changes}
+	// The call is mirrored from what the server states for the tool over the
+	// connection it travels on, as a call by name is. The definition this value
+	// was built from is the one its listing read, which the server may have
+	// changed since and which a later handshake may have replaced: it is used
+	// for as long as the catalogue that listing recorded stands, and read again
+	// after that.
+	return t.client.callTool(ctx, t.Name, arguments, continuation)
 }
 
 // parseTool decodes a tools/list entry, binding it to client. A schema whose

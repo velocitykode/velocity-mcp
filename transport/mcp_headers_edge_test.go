@@ -3,6 +3,7 @@ package transport
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +13,6 @@ import (
 	"github.com/velocitykode/velocity/router"
 
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
-	"github.com/velocitykode/velocity-mcp/server"
 )
 
 // TestSubscriptionStreamsForEveryAcceptThatAllowsIt asserts a subscription is
@@ -133,68 +133,66 @@ func TestIllTypedBodyValueIsNotCompared(t *testing.T) {
 	}
 }
 
-// TestUnpaddedBase64HeaderIsDecoded asserts an Mcp-Name whose base64 payload
-// arrives without its padding is still read as the value it encodes. A peer
-// that trims the padding is stating a name this server can recover, and
-// comparing the payload as literal text instead would refuse a request that
-// mirrors its body correctly.
-//
-// The names below are chosen so their byte lengths are not multiples of three:
-// one pads to a single "=", the other to two, so the padded and unpadded
-// spellings genuinely differ and the unpadded one only decodes if the server
-// accepts it.
-func TestUnpaddedBase64HeaderIsDecoded(t *testing.T) {
+// TestNonCanonicalBase64HeaderIsRefused asserts a wrapped name has exactly one
+// spelling. RFC 4648 requires the padding (section 4) and forbids non-zero bits
+// in the final character (section 3.5), so a payload with the padding dropped or
+// a trailing bit set is not the encoding of anything; a lenient reading of it
+// would let one name travel under several header spellings, which an
+// intermediary decoding strictly would refuse or read differently. The names
+// below have byte lengths that are not multiples of three, so each has one and
+// two padding characters respectively and the spellings genuinely differ.
+func TestNonCanonicalBase64HeaderIsRefused(t *testing.T) {
+	const refused = "Header mismatch: The [Mcp-Name] header value declares a base64 encoding that does not decode."
+
 	tests := []struct {
-		name    string
-		tool    string
-		wantPad int
+		name      string
+		tool      string
+		canonical string
+		variants  map[string]string
 	}{
-		{"one padding character", "é ad", 1},
-		{"two padding characters", "é a", 2},
+		{
+			name: "one padding character", tool: "\u00e9 ad", canonical: "=?base64?w6kgYWQ=?=",
+			variants: map[string]string{"unpadded": "=?base64?w6kgYWQ?=", "trailing bit set": "=?base64?w6kgYWR=?="},
+		},
+		{
+			name: "two padding characters", tool: "\u00e9 a", canonical: "=?base64?w6kgYQ==?=",
+			variants: map[string]string{"unpadded": "=?base64?w6kgYQ?=", "trailing bit set": "=?base64?w6kgYR==?="},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			padded := EncodeHeaderValue(tt.tool)
-			if !strings.HasPrefix(padded, "=?base64?") || !strings.HasSuffix(padded, "?=") {
-				t.Fatalf("expected a wrapped header value, got %q", padded)
-			}
-			payload := strings.TrimSuffix(strings.TrimPrefix(padded, "=?base64?"), "?=")
-			if got := strings.Count(payload, "="); got != tt.wantPad {
-				t.Fatalf("payload %q carries %d padding characters, want %d", payload, got, tt.wantPad)
-			}
-
-			raw := base64.RawStdEncoding.EncodeToString([]byte(tt.tool))
-			unpadded := "=?base64?" + raw + "?="
-			if strings.Contains(raw, "=") {
-				t.Fatalf("raw encoding must not pad: %q", raw)
-			}
-			if unpadded == padded {
-				t.Fatalf("the two spellings are identical (%q), so the test proves nothing", padded)
-			}
-
-			got, err := DecodeHeaderValue(unpadded)
-			if err != nil {
-				t.Fatalf("unpadded header %q was refused: %v", unpadded, err)
-			}
-			if got != tt.tool {
-				t.Fatalf("decoded %q, want %q", got, tt.tool)
-			}
-
-			// The wire half: the guard must accept the unpadded header as
-			// mirroring the body, and let the request through to the handler,
-			// which reports the unknown tool by the exact name the body named.
 			body := modernBody(1, "tools/call", `"name":`+quote(t, tt.tool)+`,"arguments":{}`)
-			w := serve(t, body, HeaderProtocolVersion, "2026-07-28", HeaderMethod, "tools/call", HeaderName, unpadded)
 
+			// The canonical spelling decodes to the name and reaches the
+			// handler, which reports the unknown tool by the exact name the body
+			// named.
+			if got, err := DecodeHeaderValue(tt.canonical); err != nil || got != tt.tool {
+				t.Fatalf("DecodeHeaderValue(%q) = %q, %v; want %q", tt.canonical, got, err, tt.tool)
+			}
+			w := serve(t, body, HeaderProtocolVersion, "2026-07-28", HeaderMethod, "tools/call", HeaderName, tt.canonical)
 			resp := decodeResponse(t, w.Body.Bytes())
-			if resp.Error == nil {
-				t.Fatalf("want the handler's complaint about an unknown tool, got %s", w.Body.String())
+			if resp.Error == nil || resp.Error.Message != "Tool ["+tt.tool+"] not found." {
+				t.Fatalf("canonical spelling: got %s, want the handler's complaint about an unknown tool", w.Body.String())
 			}
-			if resp.Error.Code == jsonrpc.CodeHeaderMismatch {
-				t.Fatalf("an unpadded but correct name was refused: %s", w.Body.String())
-			}
-			if want := "Tool [" + tt.tool + "] not found."; resp.Error.Message != want {
-				t.Fatalf("message = %q, want %q", resp.Error.Message, want)
+
+			for variant, header := range tt.variants {
+				t.Run(variant, func(t *testing.T) {
+					// The lenient reading would yield the same name, which is
+					// what makes the spelling an alias rather than a typo.
+					if lenient, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(strings.TrimSuffix(strings.TrimPrefix(header, "=?base64?"), "?="), "=")); err != nil || string(lenient) != tt.tool {
+						t.Fatalf("variant %q does not read leniently as %q (%q, %v), so the test proves nothing", header, tt.tool, lenient, err)
+					}
+					if got, err := DecodeHeaderValue(header); !errors.Is(err, ErrHeaderValueEncoding) || got != "" {
+						t.Fatalf("DecodeHeaderValue(%q) = %q, %v; want ErrHeaderValueEncoding", header, got, err)
+					}
+					resp := headerError(t, serve(t, body, HeaderProtocolVersion, "2026-07-28", HeaderMethod, "tools/call", HeaderName, header))
+					if resp.Error.Code != jsonrpc.CodeHeaderMismatch {
+						t.Fatalf("code = %d, want %d", resp.Error.Code, jsonrpc.CodeHeaderMismatch)
+					}
+					if resp.Error.Message != refused {
+						t.Fatalf("message = %q, want %q", resp.Error.Message, refused)
+					}
+				})
 			}
 		})
 	}
@@ -268,14 +266,10 @@ func TestMalformedHeaderValuesAreRefused(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			info, ok := server.InspectMessage([]byte(tt.body))
-			if !ok {
-				t.Fatalf("body is not a request: %s", tt.body)
-			}
 			mirrored := map[string]string{
-				HeaderProtocolVersion: info.ProtocolVersion,
-				HeaderMethod:          info.Method,
-				HeaderName:            info.Name,
+				HeaderProtocolVersion: protocolVersionOf(t, tt.body),
+				HeaderMethod:          methodOf(t, tt.body),
+				HeaderName:            nameOf(t, tt.body),
 			}
 			if mirrored[tt.header] != tt.value {
 				t.Fatalf("the body states %q for %s, not %q, so the test proves nothing", mirrored[tt.header], tt.header, tt.value)
@@ -336,7 +330,7 @@ func TestHeaderValuePaddedWithWiderWhitespaceIsRefused(t *testing.T) {
 		},
 		{
 			name: "narrow no-break space around a wrapped name", body: call,
-			header: HeaderName, value: "\u202f" + EncodeHeaderValue("add") + "\u202f",
+			header: HeaderName, value: "\u202fadd\u202f",
 			want: "Header mismatch: The [Mcp-Name] header value is not a valid header value.",
 		},
 		{
@@ -414,10 +408,10 @@ func TestLegacyRequestWithAMalformedVersionHeaderIsRefused(t *testing.T) {
 			want: "Header mismatch: The [MCP-Protocol-Version] header value is not a valid header value.",
 		},
 		{
-			// A well-formed header naming a discovery revision contradicts a body
-			// that declares none, which is the complaint the guard already made.
+			// A well-formed header naming a discovery revision holds the request
+			// to that revision, under which the method header is required.
 			name: "a discovery revision the body does not declare", value: "2026-07-28",
-			want: "Header mismatch: The [MCP-Protocol-Version] header declares protocol version [2026-07-28] but the request body declares no protocol version.",
+			want: "Header mismatch: The [Mcp-Method] header is required.",
 		},
 	}
 	for _, tt := range tests {
@@ -615,7 +609,7 @@ func TestAHeaderStatedTwiceIsRefused(t *testing.T) {
 		{"the method contradicted", HeaderMethod, "tools/list"},
 		{"the name repeated verbatim", HeaderName, "add"},
 		{"the name contradicted", HeaderName, "subtract"},
-		{"the name contradicted in its wrapped form", HeaderName, EncodeHeaderValue("subtract")},
+		{"the name contradicted in its wrapped form", HeaderName, "=?base64?c3VidHJhY3Q=?="},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

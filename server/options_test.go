@@ -128,3 +128,22 @@ func TestWithProtocolVersions(t *testing.T) {
 		t.Fatalf("empty version list should retain defaults, got %v", got)
 	}
 }
+
+// TestServerSupportedProtocolVersionsReportsTheConfiguredList asserts the
+// server exposes the list its requests are validated against, as a copy, so a
+// transport refusing a request on the server's behalf names the same versions
+// the server itself would and cannot alter them.
+func TestServerSupportedProtocolVersionsReportsTheConfiguredList(t *testing.T) {
+	s := New("d", "1", WithProtocolVersions("2027-01-01", "2025-11-25"))
+	got := s.SupportedProtocolVersions()
+	if len(got) != 2 || got[0] != "2027-01-01" || got[1] != "2025-11-25" {
+		t.Fatalf("versions = %v, want [2027-01-01 2025-11-25]", got)
+	}
+	got[0] = "tampered"
+	if again := s.SupportedProtocolVersions(); again[0] != "2027-01-01" {
+		t.Fatalf("the returned list aliases the server's own: %v", again)
+	}
+	if def := New("d", "1").SupportedProtocolVersions(); len(def) != 1 || def[0] != LatestProtocolVersion {
+		t.Fatalf("default versions = %v, want [%s]", def, LatestProtocolVersion)
+	}
+}

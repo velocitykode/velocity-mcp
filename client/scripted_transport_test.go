@@ -1,8 +1,10 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -199,11 +201,16 @@ func (s *scriptedTransport) answering(raw string) string {
 		return raw
 	}
 	members["id"] = s.pendingID.Raw()
-	out, err := json.Marshal(members)
-	if err != nil {
+	// The frame is written back without the escaping the standard encoder
+	// applies, so the members of a scripted frame reach the client spelled as
+	// the script spells them.
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(members); err != nil {
 		return raw
 	}
-	return string(out)
+	return strings.TrimSuffix(out.String(), "\n")
 }
 
 // methods returns the JSON-RPC method of every frame the client sent, in order.

@@ -964,7 +964,7 @@ func TestAMalformedListingIsRefused(t *testing.T) {
 		frame   string
 		wantErr string
 	}{
-		{name: "the result is not an object", frame: page(`["execute_sql"]`), wantErr: "invalid tools/list response from server"},
+		{name: "the result is not an object", frame: page(`["execute_sql"]`), wantErr: "the server answered [tools/list] with an invalid result: it is not an object"},
 		{name: "the page is not an array", frame: page(`{"tools":{"name":"execute_sql"}}`), wantErr: "invalid tools/list response from server"},
 		{name: "the page is absent", frame: page(`{"ttlMs":60000}`), wantErr: "invalid tools/list response from server"},
 		{name: "an entry is not an object", frame: page(`{"tools":["execute_sql"]}`), wantErr: "invalid tools payload from server"},

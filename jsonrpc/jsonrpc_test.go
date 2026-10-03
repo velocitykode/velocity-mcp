@@ -104,19 +104,32 @@ func TestID_RoundTrip(t *testing.T) {
 }
 
 func TestID_IsValidRequestID(t *testing.T) {
-	// Cases built from raw tokens directly so we can exercise the numeric-prefix
-	// branches (+/./-) that the JSON grammar never actually produces.
+	// Cases built from raw tokens directly, so the grammar is exercised on
+	// tokens JSON itself never produces as well as on the ones it does. The
+	// specification permits a string or an integer and forbids null; a number
+	// with a fraction or an exponent is not an integer.
 	tests := []struct {
 		name string
 		raw  string
 		want bool
 	}{
 		{"string", `"x"`, true},
+		{"empty string", `""`, true},
 		{"positive int", `5`, true},
 		{"negative", `-5`, true},
-		{"float", `1.2`, true},
-		{"leading plus", `+5`, true},
-		{"leading dot", `.5`, true},
+		{"zero", `0`, true},
+		{"negative zero", `-0`, true},
+		{"integer beyond float precision", `9007199254740993`, true},
+		{"float", `1.2`, false},
+		{"fraction of zero", `1.0`, false},
+		{"exponent", `1e3`, false},
+		{"negative exponent", `-1E-3`, false},
+		{"leading plus", `+5`, false},
+		{"leading dot", `.5`, false},
+		{"trailing dot", `5.`, false},
+		{"leading zero", `01`, false},
+		{"minus alone", `-`, false},
+		{"hex", `0x10`, false},
 		{"null", `null`, false},
 		{"bool true", `true`, false},
 		{"object", `{}`, false},

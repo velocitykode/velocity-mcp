@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/velocitykode/velocity-mcp/jsonrpc"
 	"github.com/velocitykode/velocity/router"
 )
 
@@ -23,47 +24,72 @@ const legacyToolCall = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
 
 // TestDiscoveryHeaderWithNoBodyDeclarationIsRejected asserts a body that strips
 // its protocol metadata cannot buy its way out of header validation. The headers
-// say 2026-07-28 and name one tool; the body names another and declares nothing.
-// Accepting it would let a gateway that authorizes calls from these headers
-// approve a call the server then runs against a different target.
+// say 2026-07-28, so the request is held to that revision in full: a header that
+// contradicts the body or is missing is the -32020 of the mirrored-header rule,
+// and a body that mirrors its headers but states no protocol version is the
+// -32602 the specification assigns to a request missing a required _meta member
+// (2026-07-28, basic, _meta). Accepting any of them would let a gateway that
+// authorizes calls from these headers approve a call the server then runs as an
+// older client's, against whatever target the body names.
 func TestDiscoveryHeaderWithNoBodyDeclarationIsRejected(t *testing.T) {
-	const wantMessage = "Header mismatch: The [MCP-Protocol-Version] header declares protocol version " +
-		"[2026-07-28] but the request body declares no protocol version."
-
 	tests := []struct {
-		name    string
-		headers []string
+		name     string
+		headers  []string
+		wantCode int
+		wantMsg  string
 	}{
 		{
-			name:    "headers name another tool than the body",
-			headers: []string{HeaderProtocolVersion, "2026-07-28", HeaderMethod, "tools/call", HeaderName, "harmless"},
+			name:     "headers name another tool than the body",
+			headers:  []string{HeaderProtocolVersion, "2026-07-28", HeaderMethod, "tools/call", HeaderName, "harmless"},
+			wantCode: jsonrpc.CodeHeaderMismatch,
+			wantMsg:  "Header mismatch: The [Mcp-Name] header value [harmless] does not match the request body value [add].",
 		},
 		{
-			name:    "headers mirror the body faithfully",
-			headers: []string{HeaderProtocolVersion, "2026-07-28", HeaderMethod, "tools/call", HeaderName, "add"},
+			name:     "headers name another method than the body",
+			headers:  []string{HeaderProtocolVersion, "2026-07-28", HeaderMethod, "tools/list", HeaderName, "add"},
+			wantCode: jsonrpc.CodeHeaderMismatch,
+			wantMsg:  "Header mismatch: The [Mcp-Method] header value [tools/list] does not match the request body value [tools/call].",
 		},
 		{
-			name:    "protocol header on its own",
-			headers: []string{HeaderProtocolVersion, "2026-07-28"},
+			name:     "headers mirror the body faithfully",
+			headers:  []string{HeaderProtocolVersion, "2026-07-28", HeaderMethod, "tools/call", HeaderName, "add"},
+			wantCode: jsonrpc.CodeInvalidParams,
+			wantMsg:  missingProtocolVersion,
 		},
 		{
-			name:    "protocol header spelled in another case",
-			headers: []string{"mcp-protocol-version", "2026-07-28", HeaderMethod, "tools/call", HeaderName, "add"},
+			name:     "protocol header on its own",
+			headers:  []string{HeaderProtocolVersion, "2026-07-28"},
+			wantCode: jsonrpc.CodeHeaderMismatch,
+			wantMsg:  "Header mismatch: The [Mcp-Method] header is required.",
 		},
 		{
-			name:    "protocol header padded with whitespace",
-			headers: []string{HeaderProtocolVersion, "  2026-07-28  ", HeaderMethod, "tools/call", HeaderName, "add"},
+			name:     "protocol and method headers without the name the method requires",
+			headers:  []string{HeaderProtocolVersion, "2026-07-28", HeaderMethod, "tools/call"},
+			wantCode: jsonrpc.CodeHeaderMismatch,
+			wantMsg:  "Header mismatch: The [Mcp-Name] header is required.",
+		},
+		{
+			name:     "protocol header spelled in another case",
+			headers:  []string{"mcp-protocol-version", "2026-07-28", HeaderMethod, "tools/call", HeaderName, "add"},
+			wantCode: jsonrpc.CodeInvalidParams,
+			wantMsg:  missingProtocolVersion,
+		},
+		{
+			name:     "protocol header padded with whitespace",
+			headers:  []string{HeaderProtocolVersion, "  2026-07-28  ", HeaderMethod, "tools/call", HeaderName, "add"},
+			wantCode: jsonrpc.CodeInvalidParams,
+			wantMsg:  missingProtocolVersion,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			resp := headerError(t, serve(t, legacyToolCall, tt.headers...))
-			if resp.Error.Code != -32020 {
-				t.Fatalf("code = %d, want -32020", resp.Error.Code)
+			if resp.Error.Code != tt.wantCode {
+				t.Fatalf("code = %d, want %d", resp.Error.Code, tt.wantCode)
 			}
-			if resp.Error.Message != wantMessage {
-				t.Fatalf("message = %q, want %q", resp.Error.Message, wantMessage)
+			if resp.Error.Message != tt.wantMsg {
+				t.Fatalf("message = %q, want %q", resp.Error.Message, tt.wantMsg)
 			}
 			if got := string(resp.ID.Raw()); got != "1" {
 				t.Fatalf("id = %s, want 1", got)
@@ -220,7 +246,7 @@ func TestDiscoveryHeaderOnANonRequestIsIgnored(t *testing.T) {
 		wantCode int
 	}{
 		{"notification", `{"jsonrpc":"2.0","method":"notifications/initialized"}`, http.StatusAccepted},
-		{"null id", `{"jsonrpc":"2.0","id":null,"method":"tools/list"}`, http.StatusAccepted},
+		{"null id", `{"jsonrpc":"2.0","id":null,"method":"tools/list"}`, http.StatusOK},
 		{"malformed json", `{"jsonrpc":"2.0",`, http.StatusOK},
 	}
 	for _, tt := range tests {

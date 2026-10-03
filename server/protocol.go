@@ -70,6 +70,34 @@ func InitializeSupportedVersions() []ProtocolVersion {
 	return []ProtocolVersion{ProtocolV20251125, ProtocolV20250618}
 }
 
+// SpokenProtocolVersions returns every protocol version a server speaks, given
+// the versions it accepts in a request's protocol metadata: those first, then
+// the ones the initialize handshake negotiates (which WithProtocolVersions does
+// not narrow), each listed once. An empty metadata list stands for the package
+// default, ServerSupportedVersions.
+//
+// It is the one list a -32022 reports as supported, whichever layer writes the
+// error (see UnsupportedProtocolVersionError). The specification (2026-07-28,
+// versioning, protocol version negotiation) requires that error to list the
+// versions the server does support, and a server that answers initialize as
+// well as per-request metadata supports the revisions of both: its own example
+// of the error lists 2025-11-25 beside 2026-07-28.
+func SpokenProtocolVersions(metadata []ProtocolVersion) []ProtocolVersion {
+	if len(metadata) == 0 {
+		metadata = ServerSupportedVersions()
+	}
+	initialize := InitializeSupportedVersions()
+	versions := make([]ProtocolVersion, 0, len(metadata)+len(initialize))
+	for _, list := range [][]ProtocolVersion{metadata, initialize} {
+		for _, version := range list {
+			if !containsVersion(versions, version) {
+				versions = append(versions, version)
+			}
+		}
+	}
+	return versions
+}
+
 // supportedProtocolVersions returns the default list a Server advertises. It is
 // the server-supported set unless WithProtocolVersions overrides it.
 func supportedProtocolVersions() []ProtocolVersion {

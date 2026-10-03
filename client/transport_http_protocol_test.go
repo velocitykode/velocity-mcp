@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
 )
@@ -33,6 +35,8 @@ type recordingEndpoint struct {
 
 	mu       sync.Mutex
 	requests []recordedRequest
+	// serving is the request being handled, for a reply that waits on it.
+	serving *http.Request
 }
 
 // newRecordingEndpoint starts an endpoint that records every request and lets
@@ -56,6 +60,7 @@ func newRecordingEndpoint(t *testing.T, reply func(w http.ResponseWriter, reques
 		}
 		endpoint.mu.Lock()
 		endpoint.requests = append(endpoint.requests, request)
+		endpoint.serving = r
 		endpoint.mu.Unlock()
 		reply(w, request)
 	}))
@@ -461,18 +466,34 @@ func TestHTTPTransportUnsuccessfulResponses(t *testing.T) {
 			wantTransportErr: true,
 		},
 		{
-			name:             "a method not allowed is a transport rejection",
-			status:           http.StatusMethodNotAllowed,
-			body:             "Method Not Allowed",
-			wantErr:          "the endpoint [%s] rejected the request with HTTP status [405]",
-			wantTransportErr: true,
+			name:    "a method not allowed is not a transport rejection",
+			status:  http.StatusMethodNotAllowed,
+			body:    "Method Not Allowed",
+			wantErr: "unexpected HTTP status [405] from endpoint [%s]",
 		},
 		{
-			name:             "a conflict is a transport rejection",
-			status:           http.StatusConflict,
-			body:             "Conflict",
-			wantErr:          "the endpoint [%s] rejected the request with HTTP status [409]",
-			wantTransportErr: true,
+			name:    "a conflict is not a transport rejection",
+			status:  http.StatusConflict,
+			body:    "Conflict",
+			wantErr: "unexpected HTTP status [409] from endpoint [%s]",
+		},
+		{
+			name:    "a rate limit is not a transport rejection",
+			status:  http.StatusTooManyRequests,
+			body:    "Too Many Requests",
+			wantErr: "unexpected HTTP status [429] from endpoint [%s]",
+		},
+		{
+			name:    "a request timeout is not a transport rejection",
+			status:  http.StatusRequestTimeout,
+			body:    "Request Timeout",
+			wantErr: "unexpected HTTP status [408] from endpoint [%s]",
+		},
+		{
+			name:    "an unprocessable request is not a transport rejection",
+			status:  http.StatusUnprocessableEntity,
+			body:    "Unprocessable Entity",
+			wantErr: "unexpected HTTP status [422] from endpoint [%s]",
 		},
 		{
 			name:             "a gateway rejection with a non protocol body is a transport rejection",
@@ -518,11 +539,10 @@ func TestHTTPTransportUnsuccessfulResponses(t *testing.T) {
 			wantTransportErr: true,
 		},
 		{
-			name:             "a not implemented status is a transport rejection",
-			status:           http.StatusNotImplemented,
-			body:             "Not Implemented",
-			wantErr:          "the endpoint [%s] rejected the request with HTTP status [501]",
-			wantTransportErr: true,
+			name:    "a not implemented status is not a transport rejection",
+			status:  http.StatusNotImplemented,
+			body:    "Not Implemented",
+			wantErr: "unexpected HTTP status [501] from endpoint [%s]",
 		},
 		{
 			name:    "an unavailable endpoint is not a transport rejection",
@@ -594,6 +614,315 @@ func TestHTTPTransportUnsuccessfulResponses(t *testing.T) {
 	}
 }
 
+// TestAPassingRejectionOfTheProbeSettlesNothing asserts a status that says
+// nothing of what the endpoint speaks does not send the client to the older
+// handshake. The server here speaks both: a client that read one rate limit,
+// request timeout, or conflict on its probe as the answer of a server that
+// predates it would settle the older revision, remember it, and offer nothing
+// else for as long as it lives. The rejection is reported instead, nothing is
+// settled, and the next request finds the server on the revision it speaks.
+func TestAPassingRejectionOfTheProbeSettlesNothing(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+	}{
+		{name: "a rate limit", status: http.StatusTooManyRequests},
+		{name: "a request timeout", status: http.StatusRequestTimeout},
+		{name: "a conflict", status: http.StatusConflict},
+		{name: "a locked resource", status: http.StatusLocked},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rejected := false
+			endpoint := newRecordingEndpoint(t, func(w http.ResponseWriter, request recordedRequest) {
+				switch {
+				case request.httpMethod == http.MethodDelete:
+					w.WriteHeader(http.StatusNoContent)
+				case request.method == "server/discover" && !rejected:
+					// Something in front of the server turns the first probe
+					// away, once.
+					rejected = true
+					w.Header().Set("Retry-After", "1")
+					w.WriteHeader(tc.status)
+				case request.method == "server/discover":
+					writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+						"resultType":        "complete",
+						"supportedVersions": []any{LatestProtocolVersion, ProtocolV20251125},
+						"capabilities":      map[string]any{},
+						"ttlMs":             600000,
+					}}))
+				case request.method == "initialize":
+					w.Header().Set(sessionHeader, "session-1")
+					writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+						"protocolVersion": ProtocolV20251125,
+						"capabilities":    map[string]any{},
+						"serverInfo":      map[string]any{"name": "dual", "version": "1"},
+					}}))
+				default:
+					w.WriteHeader(http.StatusAccepted)
+				}
+			})
+			c := Web(endpoint.URL)
+
+			version, err := c.ProtocolVersion(context.Background())
+			if err == nil {
+				t.Fatalf("the probe that was turned away settled version %q", version)
+			}
+			want := "unexpected HTTP status [" + strconv.Itoa(tc.status) + "] from endpoint [" + endpoint.URL + "]"
+			if err.Error() != want {
+				t.Fatalf("error = %q, want %q", err.Error(), want)
+			}
+			if c.Connected() {
+				t.Fatal("a probe that was turned away left a connection standing")
+			}
+
+			// The server is asked again, as one whose era is still unknown, on
+			// every connection after that.
+			for range 2 {
+				version, err = c.ProtocolVersion(context.Background())
+				if err != nil {
+					t.Fatalf("the connection after the rejection: %v", err)
+				}
+				if version != LatestProtocolVersion {
+					t.Fatalf("version = %q, want %q: the rejection was read as the server's era", version, LatestProtocolVersion)
+				}
+				c.Disconnect()
+			}
+			wantMethods := []string{"server/discover", "server/discover", "server/discover"}
+			if got := endpoint.methods(); !slices.Equal(got, wantMethods) {
+				t.Fatalf("methods = %v, want %v", got, wantMethods)
+			}
+		})
+	}
+}
+
+// TestAProbeThatGotNoAnswerSettlesNothing asserts a probe the endpoint did not
+// answer, or answered only about the moment, does not send the client to the
+// older handshake. Over HTTP a server of the older handshake answers the probe
+// by refusing it; a probe that timed out, a connection that failed under it,
+// and a rate limit or an unavailable upstream worded as a JSON-RPC error say
+// nothing of what the server speaks. The server here speaks both revisions, so
+// a client that fell back would settle the older one, remember it, and never
+// offer the newer one again. The failure is reported instead, and every
+// connection after it probes again.
+func TestAProbeThatGotNoAnswerSettlesNothing(t *testing.T) {
+	rpcBody := func(id json.RawMessage, message string) string {
+		return jsonFrame(id, map[string]any{"error": map[string]any{"code": -32000, "message": message}})
+	}
+	tests := []struct {
+		name string
+		// first answers the first probe, or fails to.
+		first func(w http.ResponseWriter, r *http.Request, request recordedRequest)
+		// wantTimeout is whether the failure is a timeout; wantTransport
+		// whether it is a transport failure at all.
+		wantTimeout   bool
+		wantTransport bool
+	}{
+		{
+			name: "the first probe outlasts the timeout",
+			first: func(_ http.ResponseWriter, r *http.Request, _ recordedRequest) {
+				// The server is slow, once: it answers nothing until the client
+				// has given up.
+				select {
+				case <-r.Context().Done():
+				case <-time.After(5 * time.Second):
+				}
+			},
+			wantTimeout: true, wantTransport: true,
+		},
+		{
+			name: "the connection fails under the first probe",
+			first: func(w http.ResponseWriter, _ *http.Request, _ recordedRequest) {
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err == nil {
+					_ = conn.Close()
+				}
+			},
+			wantTransport: true,
+		},
+		{
+			name: "a rate limit worded as a JSON-RPC error",
+			first: func(w http.ResponseWriter, _ *http.Request, request recordedRequest) {
+				writeJSON(w, http.StatusTooManyRequests, rpcBody(request.id, "rate limited"))
+			},
+		},
+		{
+			name: "an unavailable upstream worded as a JSON-RPC error",
+			first: func(w http.ResponseWriter, _ *http.Request, request recordedRequest) {
+				writeJSON(w, http.StatusServiceUnavailable, rpcBody(request.id, "upstream unavailable"))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			failed := false
+			var endpoint *recordingEndpoint
+			endpoint = newRecordingEndpoint(t, func(w http.ResponseWriter, request recordedRequest) {
+				switch {
+				case request.httpMethod == http.MethodDelete:
+					w.WriteHeader(http.StatusNoContent)
+				case request.method == "server/discover" && !failed:
+					failed = true
+					tc.first(w, endpoint.current(), request)
+				case request.method == "server/discover":
+					writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+						"resultType":        "complete",
+						"supportedVersions": []any{LatestProtocolVersion, ProtocolV20251125},
+						"capabilities":      map[string]any{},
+						"ttlMs":             600000,
+					}}))
+				case request.method == "initialize":
+					w.Header().Set(sessionHeader, "session-1")
+					writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+						"protocolVersion": ProtocolV20251125,
+						"capabilities":    map[string]any{},
+						"serverInfo":      map[string]any{"name": "dual", "version": "1"},
+					}}))
+				default:
+					w.WriteHeader(http.StatusAccepted)
+				}
+			})
+			c := Web(endpoint.URL)
+			c.WithTimeout(300 * time.Millisecond)
+
+			version, err := c.ProtocolVersion(context.Background())
+			if err == nil {
+				t.Fatalf("the probe that got no answer settled version %q (methods = %v)", version, endpoint.methods())
+			}
+			var timeoutErr *TimeoutError
+			if got := errors.As(err, &timeoutErr); got != tc.wantTimeout {
+				t.Fatalf("error = %v (%T), timeout = %v, want %v", err, err, got, tc.wantTimeout)
+			}
+			var transportErr *TransportError
+			if got := errors.As(err, &transportErr); got != tc.wantTransport {
+				t.Fatalf("error = %v (%T), transport failure = %v, want %v", err, err, got, tc.wantTransport)
+			}
+			if c.Connected() {
+				t.Fatal("a probe that got no answer left a connection standing")
+			}
+
+			for range 2 {
+				version, err = c.ProtocolVersion(context.Background())
+				if err != nil {
+					t.Fatalf("the connection after the failure: %v", err)
+				}
+				if version != LatestProtocolVersion {
+					t.Fatalf("version = %q, want %q: the failure was read as the server's era", version, LatestProtocolVersion)
+				}
+				c.Disconnect()
+			}
+			wantMethods := []string{"server/discover", "server/discover", "server/discover"}
+			if got := endpoint.methods(); !slices.Equal(got, wantMethods) {
+				t.Fatalf("methods = %v, want %v", got, wantMethods)
+			}
+		})
+	}
+}
+
+// TestTheProbeFallsBackOnlyOnTheAnswersOfAnOlderServer pins which answers to
+// the probe send the client to the initialize handshake over streamable HTTP,
+// and that no other does. The binding of 2026-07-28 names the fallback: on 400
+// Bad Request, "if the body is empty or is not a recognized modern JSON-RPC
+// error, fall back to initialize". A server that answers the probe with
+// method-not-found, under whatever status, does not know a request every modern
+// server must implement, so it is not modern either. Everything else is a
+// server, or something in front of it, failing at the request: it says nothing
+// of the era, and a client that settled the older handshake on it would
+// remember that and never offer the newer one again.
+//
+// The server here speaks both handshakes, so a client that falls back settles
+// 2025-11-25, and one that does not finds 2026-07-28 on its next connection.
+func TestTheProbeFallsBackOnlyOnTheAnswersOfAnOlderServer(t *testing.T) {
+	rpc := func(code int, message string) func(id json.RawMessage) string {
+		return func(id json.RawMessage) string {
+			return jsonFrame(id, map[string]any{"error": map[string]any{"code": code, "message": message}})
+		}
+	}
+	bare := func(body string) func(json.RawMessage) string {
+		return func(json.RawMessage) string { return body }
+	}
+	tests := []struct {
+		name   string
+		status int
+		body   func(id json.RawMessage) string
+		// wantFallback is whether the answer settles the older handshake.
+		wantFallback bool
+	}{
+		{name: "400 with an empty body", status: http.StatusBadRequest, body: bare(""), wantFallback: true},
+		{name: "400 with a body that is not JSON-RPC", status: http.StatusBadRequest, body: bare("Bad Request"), wantFallback: true},
+		{name: "400 with an invalid-request error", status: http.StatusBadRequest, body: rpc(-32600, "Invalid Request"), wantFallback: true},
+		{name: "400 with a method-not-found error", status: http.StatusBadRequest, body: rpc(-32601, "Method not found"), wantFallback: true},
+		{name: "200 with a method-not-found error", status: http.StatusOK, body: rpc(-32601, "Method not found"), wantFallback: true},
+		{name: "404 with a method-not-found error", status: http.StatusNotFound, body: rpc(-32601, "Method not found"), wantFallback: true},
+
+		{name: "200 with an internal error", status: http.StatusOK, body: rpc(-32603, "Internal error")},
+		{name: "500 with an internal error", status: http.StatusInternalServerError, body: rpc(-32603, "Internal error")},
+		{name: "520 with an error body", status: 520, body: rpc(-32000, "origin unreachable")},
+		{name: "409 with an error body", status: http.StatusConflict, body: rpc(-32000, "conflict")},
+		{name: "200 with an invalid-params error", status: http.StatusOK, body: rpc(-32602, "Invalid params")},
+		{name: "405 with no JSON-RPC body", status: http.StatusMethodNotAllowed, body: bare("Method Not Allowed")},
+		{name: "501 with no JSON-RPC body", status: http.StatusNotImplemented, body: bare("Not Implemented")},
+		{name: "404 with no JSON-RPC body", status: http.StatusNotFound, body: bare("Not Found")},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			answered := false
+			endpoint := newRecordingEndpoint(t, func(w http.ResponseWriter, request recordedRequest) {
+				switch {
+				case request.httpMethod == http.MethodDelete:
+					w.WriteHeader(http.StatusNoContent)
+				case request.method == "server/discover" && !answered:
+					answered = true
+					writeJSON(w, tc.status, tc.body(request.id))
+				case request.method == "server/discover":
+					writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+						"resultType":        "complete",
+						"supportedVersions": []any{LatestProtocolVersion, ProtocolV20251125},
+						"capabilities":      map[string]any{},
+						"ttlMs":             600000,
+					}}))
+				case request.method == "initialize":
+					w.Header().Set(sessionHeader, "session-1")
+					writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+						"protocolVersion": ProtocolV20251125,
+						"capabilities":    map[string]any{},
+						"serverInfo":      map[string]any{"name": "dual", "version": "1"},
+					}}))
+				default:
+					w.WriteHeader(http.StatusAccepted)
+				}
+			})
+			c := Web(endpoint.URL)
+
+			version, err := c.ProtocolVersion(context.Background())
+			if tc.wantFallback {
+				if err != nil || version != ProtocolV20251125 {
+					t.Fatalf("version = %q, %v; want the older handshake settled", version, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("the probe settled version %q on an answer that says nothing of the server's era (methods = %v)",
+					version, endpoint.methods())
+			}
+			if c.Connected() {
+				t.Fatal("a probe that failed left a connection standing")
+			}
+			if sent := endpoint.requestsFor("initialize"); len(sent) != 0 {
+				t.Fatalf("the older handshake was offered %d time(s)", len(sent))
+			}
+			version, err = c.ProtocolVersion(context.Background())
+			if err != nil || version != LatestProtocolVersion {
+				t.Fatalf("the next connection = %q, %v; want %q: the failure was remembered as the server's era",
+					version, err, LatestProtocolVersion)
+			}
+		})
+	}
+}
+
 func TestWebClientNegotiatesOverHTTP(t *testing.T) {
 	tests := []struct {
 		name string
@@ -621,8 +950,8 @@ func TestWebClientNegotiatesOverHTTP(t *testing.T) {
 		},
 		{
 			name:           "an endpoint that refuses the probe falls back",
-			discoverStatus: http.StatusMethodNotAllowed,
-			discoverBody:   func(json.RawMessage) string { return "Method Not Allowed" },
+			discoverStatus: http.StatusBadRequest,
+			discoverBody:   func(json.RawMessage) string { return "Bad Request" },
 			wantVersion:    ProtocolV20251125,
 			wantMethods:    []string{"server/discover", "initialize", "notifications/initialized", "tools/call"},
 		},
@@ -653,8 +982,8 @@ func TestWebClientNegotiatesOverHTTP(t *testing.T) {
 			// speaks 2025-06-18 settles there and every request after the
 			// handshake carries that version.
 			name:              "an endpoint that settles the fallback on an older version is spoken to at that version",
-			discoverStatus:    http.StatusMethodNotAllowed,
-			discoverBody:      func(json.RawMessage) string { return "Method Not Allowed" },
+			discoverStatus:    http.StatusBadRequest,
+			discoverBody:      func(json.RawMessage) string { return "Bad Request" },
 			initializeVersion: ProtocolV20250618,
 			wantVersion:       ProtocolV20250618,
 			wantMethods:       []string{"server/discover", "initialize", "notifications/initialized", "tools/call"},

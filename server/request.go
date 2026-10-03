@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/velocitykode/velocity/validation"
@@ -286,16 +287,21 @@ func (r *Request) Float(key string) float64 {
 }
 
 // IntOK returns the named argument as an int64 and whether it was present and
-// numeric with a whole value. A fractional number reports ok=false.
+// is exactly that integer. A fractional number, a value outside the int64
+// range and a float64 whose magnitude is 2^53 or more all report ok=false: a
+// JSON number decodes to a float64 before any getter sees it, and from 2^53
+// on not every integer has one, so a wire value there may already be a
+// neighbour of the number the client sent (2^53 itself is what 2^53+1 decodes
+// to) and is refused rather than returned as a different integer. A
+// json.Number and the Go integer kinds carry their exact value and are
+// converted without a float64 round trip, so an identifier beyond that range
+// reaches the handler intact through them.
 func (r *Request) IntOK(key string) (int64, bool) {
-	f, ok := r.FloatOK(key)
+	v, ok := r.lookup(key)
 	if !ok {
 		return 0, false
 	}
-	if f != float64(int64(f)) {
-		return 0, false
-	}
-	return int64(f), true
+	return toInt(v)
 }
 
 // Int returns the named argument as an int64, or 0 when absent or not a whole
@@ -375,6 +381,75 @@ func (r *Request) Validate(rules validation.Rules) error {
 		return fmt.Errorf("%w: %w", ErrValidation, err)
 	}
 	return nil
+}
+
+// maxSafeIntegerFloat is the largest magnitude a float64 can hold as an
+// integer that no other integer decodes to: 2^53 - 1. Every integer up to it
+// has a float64 of its own; from 2^53 on a float64 names only every second
+// integer, then every fourth, and the integers between round to it, so a
+// decoded JSON integer there may already be a neighbour of the one that was
+// sent.
+const maxSafeIntegerFloat = 1<<53 - 1
+
+// toInt converts a numeric argument to the exact int64 it holds, reporting
+// false for a value that is not a whole number, that lies outside the int64
+// range, or that is a float64 beyond maxSafeIntegerFloat (see IntOK). The
+// integer kinds and a json.Number are read without going through float64, so
+// their value is never rounded on the way.
+func toInt(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), true
+	case int8:
+		return int64(n), true
+	case int16:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case int64:
+		return n, true
+	case uint:
+		if uint64(n) > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(n), true
+	case uint8:
+		return int64(n), true
+	case uint16:
+		return int64(n), true
+	case uint32:
+		return int64(n), true
+	case uint64:
+		if n > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(n), true
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i, true
+		}
+		f, err := n.Float64()
+		if err != nil {
+			return 0, false
+		}
+		return floatToInt(f)
+	case float32:
+		return floatToInt(float64(n))
+	case float64:
+		return floatToInt(n)
+	default:
+		return 0, false
+	}
+}
+
+// floatToInt converts a float64 to the integer it is, when it is one that no
+// other integer decodes to: a whole number of magnitude at most
+// maxSafeIntegerFloat. NaN is not whole, and an infinity is beyond the bound.
+func floatToInt(f float64) (int64, bool) {
+	if f != math.Trunc(f) || math.Abs(f) > maxSafeIntegerFloat {
+		return 0, false
+	}
+	return int64(f), true
 }
 
 // toFloat coerces a decoded JSON numeric value to float64. It accepts float64

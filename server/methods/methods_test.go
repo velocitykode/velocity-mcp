@@ -407,9 +407,23 @@ func TestReadResourceUnresolvedURIFollowsTheRequestedRevision(t *testing.T) {
 		wantMsg string
 	}{
 		{
+			// A missing parameter is invalid params in every revision; only an
+			// unresolvable uri takes the older code.
 			name:    "missing uri under the initialize handshake",
 			params:  map[string]any{},
-			want:    jsonrpc.CodeResourceNotFound,
+			want:    jsonrpc.CodeInvalidParams,
+			wantMsg: "Missing [uri] parameter.",
+		},
+		{
+			name:    "empty uri under the initialize handshake",
+			params:  map[string]any{"uri": ""},
+			want:    jsonrpc.CodeInvalidParams,
+			wantMsg: "Missing [uri] parameter.",
+		},
+		{
+			name:    "non-string uri under the initialize handshake",
+			params:  map[string]any{"uri": 7},
+			want:    jsonrpc.CodeInvalidParams,
 			wantMsg: "Missing [uri] parameter.",
 		},
 		{

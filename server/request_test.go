@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -667,5 +668,100 @@ func TestReportProgressNoOpWithoutTokenOrEmitter(t *testing.T) {
 	}
 	if sent != 0 {
 		t.Fatalf("expected no frames without a progressToken, got %d", sent)
+	}
+}
+
+// TestIntGettersReturnOnlyTheExactValue pins the contract of IntOK and Int: ok
+// is true only when the returned integer is the number the argument holds.
+// The expectations are arithmetic, not read back from the getter: 2^53 - 1 is
+// 9007199254740991, the largest integer no other integer shares a float64
+// with; 2^53 + 1 decodes to 2^53 itself (a tie rounds to the even mantissa),
+// so from 2^53 on a wire integer may already be a neighbour of the one sent;
+// 2^63 is 9223372036854775808, one past the int64 range on either side.
+func TestIntGettersReturnOnlyTheExactValue(t *testing.T) {
+	const maxSafe = int64(9007199254740991)
+	wire := func(literal string) any {
+		var args map[string]any
+		if err := json.Unmarshal([]byte(`{"n":`+literal+`}`), &args); err != nil {
+			t.Fatalf("decode %s: %v", literal, err)
+		}
+		return args["n"]
+	}
+
+	tests := []struct {
+		name   string
+		value  any
+		want   int64
+		wantOK bool
+	}{
+		// Numbers decoded from the wire arrive as float64.
+		{"wire integer", wire("42"), 42, true},
+		{"wire negative", wire("-42"), -42, true},
+		{"wire negative zero", wire("-0.0"), 0, true},
+		{"wire exponent form", wire("1e2"), 100, true},
+		{"wire fraction", wire("1.5"), 0, false},
+		{"wire 2^53-1", wire("9007199254740991"), maxSafe, true},
+		{"wire -(2^53-1)", wire("-9007199254740991"), -maxSafe, true},
+		{"wire 2^53 is what 2^53+1 decodes to", wire("9007199254740992"), 0, false},
+		{"wire -2^53", wire("-9007199254740992"), 0, false},
+		{"wire 2^53+1 decodes to a neighbour", wire("9007199254740993"), 0, false},
+		{"wire 2^53+2", wire("9007199254740994"), 0, false},
+		{"wire -2^53-1", wire("-9007199254740993"), 0, false},
+		{"wire 1e30", wire("1e30"), 0, false},
+		{"wire 2^63", wire("9223372036854775808"), 0, false},
+		{"wire -2^63-1", wire("-9223372036854775809"), 0, false},
+		{"wire string digits", wire(`"12"`), 0, false},
+		{"wire boolean", wire("true"), 0, false},
+		{"wire null", wire("null"), 0, false},
+		// Arguments built in Go keep their type and their exact value.
+		{"int64 above 2^53", int64(9007199254740993), 9007199254740993, true},
+		{"int64 max", int64(math.MaxInt64), math.MaxInt64, true},
+		{"int64 min", int64(math.MinInt64), math.MinInt64, true},
+		{"int", int(7), 7, true},
+		{"int8", int8(-3), -3, true},
+		{"int16", int16(300), 300, true},
+		{"int32", int32(-70000), -70000, true},
+		{"uint", uint(9), 9, true},
+		{"uint8", uint8(255), 255, true},
+		{"uint16", uint16(65535), 65535, true},
+		{"uint32", uint32(4294967295), 4294967295, true},
+		{"uint64 within int64", uint64(math.MaxInt64), math.MaxInt64, true},
+		{"uint64 beyond int64", uint64(math.MaxInt64) + 1, 0, false},
+		{"uint64 max", uint64(math.MaxUint64), 0, false},
+		{"float32 whole", float32(12), 12, true},
+		{"float32 fraction", float32(1.5), 0, false},
+		{"float64 NaN", math.NaN(), 0, false},
+		{"float64 +Inf", math.Inf(1), 0, false},
+		{"float64 -Inf", math.Inf(-1), 0, false},
+		// A json.Number carries its digits, so an integer beyond 2^53 is exact.
+		{"json.Number above 2^53", json.Number("9007199254740993"), 9007199254740993, true},
+		{"json.Number int64 max", json.Number("9223372036854775807"), math.MaxInt64, true},
+		{"json.Number int64 min", json.Number("-9223372036854775808"), math.MinInt64, true},
+		{"json.Number 2^63", json.Number("9223372036854775808"), 0, false},
+		{"json.Number -2^63-1", json.Number("-9223372036854775809"), 0, false},
+		{"json.Number exponent form", json.Number("1e2"), 100, true},
+		{"json.Number fraction", json.Number("1.5"), 0, false},
+		{"json.Number whole with fraction digits above 2^53", json.Number("9007199254740993.0"), 0, false},
+		{"json.Number not a number", json.Number("abc"), 0, false},
+		{"string", "12", 0, false},
+		{"bool", true, 0, false},
+		{"nil", nil, 0, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := NewRequest(map[string]any{"n": tc.value})
+			got, ok := req.IntOK("n")
+			if got != tc.want || ok != tc.wantOK {
+				t.Fatalf("IntOK = (%d, %v), want (%d, %v)", got, ok, tc.want, tc.wantOK)
+			}
+			if got := req.Int("n"); got != tc.want {
+				t.Fatalf("Int = %d, want %d", got, tc.want)
+			}
+		})
+	}
+
+	// An absent argument is never a value.
+	if got, ok := NewRequest(nil).IntOK("n"); got != 0 || ok {
+		t.Fatalf("IntOK on an absent argument = (%d, %v), want (0, false)", got, ok)
 	}
 }

@@ -61,6 +61,16 @@ func TestDecodeHeaderValue(t *testing.T) {
 		{name: "overlapping sentinels", header: "=?base64?=", want: "=?base64?="},
 		{name: "undecodable payload", header: "=?base64?not base64!?=", wantErr: ErrHeaderValueEncoding},
 		{name: "sentinel-shaped junk", header: "=?base64?%%%?=", wantErr: ErrHeaderValueEncoding},
+		// RFC 4648 section 4 requires the padding and section 3.5 forbids
+		// non-zero trailing bits, so neither spelling below is the encoding
+		// of anything: "aGVsbG8?=" drops the padding of "hello" and
+		// "aGVsbG9=" keeps the padding but sets a trailing bit.
+		{name: "unpadded payload", header: "=?base64?aGVsbG8?=", wantErr: ErrHeaderValueEncoding},
+		{name: "non-canonical trailing bits", header: "=?base64?aGVsbG9=?=", wantErr: ErrHeaderValueEncoding},
+		{name: "two padding characters dropped", header: "=?base64?w6kgYQ?=", wantErr: ErrHeaderValueEncoding},
+		{name: "url-safe alphabet", header: "=?base64?-_-_?=", wantErr: ErrHeaderValueEncoding},
+		{name: "interior padding", header: "=?base64?aG==Vs?=", wantErr: ErrHeaderValueEncoding},
+		{name: "payload with an interior space", header: "=?base64?aGVs bG8=?=", wantErr: ErrHeaderValueEncoding},
 		{name: "payload with an interior newline", header: "=?base64?ab\ncd?=", wantErr: ErrHeaderValueSyntax},
 		{name: "raw non-ascii", header: "Hello, 世界", wantErr: ErrHeaderValueSyntax},
 		{name: "control character", header: "a\x00b", wantErr: ErrHeaderValueSyntax},
@@ -142,7 +152,7 @@ func FuzzDecodeHeaderValue(f *testing.F) {
 	seeds := []string{
 		"", "tools/call", "=?base64??=", "=?base64?SGVsbG8=?=", "=?base64?not base64!?=",
 		"=?base64?=", "=?base64", "?=", "=?base64?////?=", "=?base64?" + string([]byte{0xff}) + "?=",
-		"=?base64?%%%?=", "=?base64?SGVsbG8?=", "=?base64?=?base64??=?=", " tools/call",
+		"=?base64?%%%?=", "=?base64?SGVsbG8?=", "=?base64?SGVsbG9=?=", "=?base64?=?base64??=?=", " tools/call",
 		"tools/call ", "Hello, 世界", "a\x00b", "a\rb", "=?base64?ab\ncd?=", "=?base64?SGVsbG8=?=?=",
 		"\u00a0tools/call", "tools/call\u3000", "\u00a0=?base64?SGVsbG8=?=",
 	}
@@ -236,19 +246,16 @@ func sentinelPayload(header string) (string, bool) {
 	return strings.CutSuffix(payload, base64Suffix)
 }
 
-// decodeBase64Payload decodes a wrapped payload with the standard library under
-// both padding rules, so what a header spells is settled independently of the
-// decoder under test.
+// decodeBase64Payload decodes a wrapped payload with the standard library's
+// strict decoder (RFC 4648 sections 3.5 and 4: padding present, no non-zero
+// trailing bits), so what a header spells is settled independently of the
+// decoder under test and a value has one spelling.
 func decodeBase64Payload(payload string) (string, error) {
-	decoded, err := base64.StdEncoding.DecodeString(payload)
-	if err == nil {
-		return string(decoded), nil
+	decoded, err := base64.StdEncoding.Strict().DecodeString(payload)
+	if err != nil {
+		return "", err
 	}
-	raw, rawErr := base64.RawStdEncoding.DecodeString(payload)
-	if rawErr == nil {
-		return string(raw), nil
-	}
-	return "", err
+	return string(decoded), nil
 }
 
 // FuzzEncodeHeaderValue asserts every encoding is header-safe and recoverable,

@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"slices"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // This file covers the authorization context of what the client keeps. The
@@ -846,10 +848,9 @@ func TestCallersOfSeveralIdentitiesNeverShareADefinition(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 4 {
-				// A call whose token changed under it once too often is refused
-				// by the client itself, with nothing sent: that is the client
-				// declining to guess, not a definition crossing over.
-				if _, err := client.CallTool(context.Background(), "execute_sql", region()); err != nil && !isStaleDefinition(err) {
+				// A call reads its definition and travels under one token, in
+				// one exchange, so no change of token can come between the two.
+				if _, err := client.CallTool(context.Background(), "execute_sql", region()); err != nil {
 					failures <- err.Error()
 				}
 				if _, err := client.Instructions(context.Background()); err != nil {
@@ -884,10 +885,11 @@ const (
 // newUnequalEndpoint starts an endpoint in front of which callers are not served
 // alike. The caller "alice" is given nothing to mirror a call from, in the way
 // withheld names, and told is run the moment she has been: between that answer
-// and the call it was read for. Every other caller is served by a discovery-era
-// backend that advertises the tool mirroring its region, does not speak the
-// initialize handshake, and is fronted by something that routes on the header:
-// a call that arrives without it is turned away on HTTP's terms.
+// and the call it was read for. Her backend takes the call as she states it.
+// Every other caller is served by a discovery-era backend that advertises the
+// tool mirroring its region, does not speak the initialize handshake, and is
+// fronted by something that routes on the header: a call that arrives without
+// it is turned away on HTTP's terms.
 func newUnequalEndpoint(t *testing.T, withheld string, told func()) *recordingEndpoint {
 	t.Helper()
 	return newRecordingEndpoint(t, func(w http.ResponseWriter, request recordedRequest) {
@@ -914,6 +916,11 @@ func newUnequalEndpoint(t *testing.T, withheld string, told func()) *recordingEn
 			case len(request.id) == 0:
 				told()
 				w.WriteHeader(http.StatusAccepted)
+			case request.method == "tools/call":
+				writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+					"content": []any{map[string]any{"type": "text", "text": "done for alice"}},
+					"isError": false,
+				}}))
 			default:
 				methodNotFound()
 			}
@@ -938,7 +945,7 @@ func newUnequalEndpoint(t *testing.T, withheld string, told func()) *recordingEn
 				"resultType": "complete", "tools": []any{regionMirroringTool()}, "ttlMs": 3600000, "cacheScope": "private",
 			}}))
 		case request.method == "tools/call":
-			if request.headers.Get("Mcp-Param-Region") == "" {
+			if who != "alice" && request.headers.Get("Mcp-Param-Region") == "" {
 				w.Header().Set("Content-Type", "text/plain")
 				w.WriteHeader(http.StatusBadRequest)
 				_, _ = io.WriteString(w, "no route for a request without a region")
@@ -960,13 +967,16 @@ func newUnequalEndpoint(t *testing.T, withheld string, told func()) *recordingEn
 // advertise a tool, that the listing was refused, and that the connection was
 // settled on a revision with no mirrored headers are each the server's answer
 // to the token that asked, exactly as a definition is: the caller behind the
-// next token may be advertised the tool mirroring a parameter. The token
-// changes between the answer and the call it was read for, so a call sent on
-// the strength of that answer reaches the second caller's intermediary without
-// the header it routes on, which shows on the wire and fails the call.
+// next token may be advertised the tool mirroring a parameter.
+//
+// The token changes between the answer and the call it was read for. The call
+// is one exchange, under the token that was settled when it began, so it
+// travels as the answer's own caller and states what she stated; the call after
+// it is the next caller's, reads what that caller is advertised, and carries
+// the header her intermediary routes on.
 func TestHavingNothingToMirrorIsTheAnswerOfOneTokenAlone(t *testing.T) {
 	overDiscovery := []string{
-		"alice server/discover", "alice tools/list",
+		"alice server/discover", "alice tools/list", "alice tools/call",
 		"bob server/discover", "bob tools/list", "bob tools/call",
 	}
 	tests := []struct {
@@ -976,7 +986,7 @@ func TestHavingNothingToMirrorIsTheAnswerOfOneTokenAlone(t *testing.T) {
 		{name: nothingAdvertised, wantWire: overDiscovery},
 		{name: listingRefused, wantWire: overDiscovery},
 		{name: nothingMirrored, wantWire: []string{
-			"alice server/discover", "alice initialize", "alice notifications/initialized",
+			"alice server/discover", "alice initialize", "alice notifications/initialized", "alice tools/call",
 			"alice DELETE", "bob initialize", "bob server/discover", "bob tools/list", "bob tools/call",
 		}},
 	}
@@ -988,38 +998,45 @@ func TestHavingNothingToMirrorIsTheAnswerOfOneTokenAlone(t *testing.T) {
 			endpoint := newUnequalEndpoint(t, tc.name, func() { current.Store("bob") })
 			client := Web(endpoint.URL).WithTokenFunc(func() string { return current.Load().(string) })
 
-			result, err := client.CallTool(context.Background(), "execute_sql", region())
-			if err != nil {
-				t.Fatalf("call: %v (wire = %v)", err, endpoint.wire())
-			}
-			if result.Text() != "done for bob" {
-				t.Fatalf("text = %q, want done for bob", result.Text())
+			for _, who := range []string{"alice", "bob"} {
+				result, err := client.CallTool(context.Background(), "execute_sql", region())
+				if err != nil {
+					t.Fatalf("call of %s: %v (wire = %v)", who, err, endpoint.wire())
+				}
+				if result.Text() != "done for "+who {
+					t.Fatalf("text = %q, want done for %s", result.Text(), who)
+				}
 			}
 			if got := endpoint.wire(); !slices.Equal(got, tc.wantWire) {
 				t.Fatalf("wire = %v, want %v", got, tc.wantWire)
 			}
 			calls := endpoint.requestsFor("tools/call")
-			if len(calls) != 1 {
-				t.Fatalf("tools/call was sent %d times, want once", len(calls))
+			if len(calls) != 2 {
+				t.Fatalf("tools/call was sent %d times, want once for each caller", len(calls))
 			}
-			if got := calls[0].headers.Get("Mcp-Param-Region"); got != "us-west1" {
+			if got := calls[0].headers.Get("Mcp-Param-Region"); got != "" {
+				t.Fatalf("alice's call carried Mcp-Param-Region = %q, want none: she was given nothing to mirror", got)
+			}
+			if got := calls[1].headers.Get("Mcp-Param-Region"); got != "us-west1" {
 				t.Fatalf("bob's call carried Mcp-Param-Region = %q, want us-west1: it was sent on what alice was not given", got)
 			}
 		})
 	}
 }
 
-// TestACallIsNotSentOnAnAnswerItsTokenWasNotGiven asserts the call a client
-// falls back to, once the definition it held is out of date and the catalogue
-// read again has none to give, is held to the connection that had none to give.
-// The token changes twice under one call: the definition read for alice is out
-// of date by the time the call would travel under bob's token, bob is given
-// nothing to mirror from, and the token is carol's by the time the call would
-// be sent with what the caller stated. Carol is advertised the tool mirroring
-// its region, so that call would reach her intermediary without the header. It
-// is refused by the client instead, with nothing sent: a client that declines
-// to guess once more, rather than one that reads the catalogue for ever.
-func TestACallIsNotSentOnAnAnswerItsTokenWasNotGiven(t *testing.T) {
+// TestACallTravelsUnderTheTokenItsDefinitionWasReadFor asserts a call and the
+// definition it is mirrored from are one caller's. The token changes every time
+// a catalogue is read, which is between every definition and the call it was
+// read for: alice is advertised the tool mirroring nothing, bob is given
+// nothing to mirror from, and carol is advertised it mirroring its region,
+// behind an intermediary that routes on the header.
+//
+// A call that read its definition in one exchange and travelled in another
+// would travel under the token of the next caller, on what the one before was
+// told. Here each call is one exchange, so it is sent under the token its
+// definition was read for, whatever the token has become by then, and none is
+// refused for a change that came in between.
+func TestACallTravelsUnderTheTokenItsDefinitionWasReadFor(t *testing.T) {
 	for _, withheld := range []string{nothingAdvertised, listingRefused} {
 		t.Run(withheld, func(t *testing.T) {
 			var current atomic.Value
@@ -1071,25 +1088,174 @@ func TestACallIsNotSentOnAnAnswerItsTokenWasNotGiven(t *testing.T) {
 			})
 			client := Web(endpoint.URL).WithTokenFunc(func() string { return current.Load().(string) })
 
-			result, err := client.CallTool(context.Background(), "execute_sql", region())
-			if err == nil {
-				t.Fatalf("call = %q, want it refused: no caller was given a definition to send it on", result.Text())
-			}
-			if !strings.Contains(err.Error(), "no longer stands") {
-				t.Fatalf("error = %q, want the client's own refusal to send", err.Error())
-			}
-			if calls := endpoint.requestsFor("tools/call"); len(calls) != 0 {
-				t.Fatalf("tools/call reached the wire under the token of %s with Mcp-Param-Region = %q",
-					identityOf(calls[0]), calls[0].headers.Get("Mcp-Param-Region"))
+			for _, who := range []string{"alice", "bob", "carol"} {
+				result, err := client.CallTool(context.Background(), "execute_sql", region())
+				if err != nil {
+					t.Fatalf("call of %s: %v (wire = %v)", who, err, endpoint.wire())
+				}
+				if result.Text() != "done for "+who {
+					t.Fatalf("text = %q, want done for %s", result.Text(), who)
+				}
 			}
 			want := []string{
-				"alice server/discover", "alice tools/list",
-				"bob server/discover", "bob tools/list", "carol server/discover",
+				"alice server/discover", "alice tools/list", "alice tools/call",
+				"bob server/discover", "bob tools/list", "bob tools/call",
+				"carol server/discover", "carol tools/list", "carol tools/call",
 			}
 			if got := endpoint.wire(); !slices.Equal(got, want) {
 				t.Fatalf("wire = %v, want %v", got, want)
 			}
+			for index, call := range endpoint.requestsFor("tools/call") {
+				mirrored := call.headers.Get("Mcp-Param-Region") != ""
+				if who := identityOf(call); (who == "carol") != mirrored {
+					t.Fatalf("call %d under the token of %s carried Mcp-Param-Region = %q",
+						index, who, call.headers.Get("Mcp-Param-Region"))
+				}
+			}
 		})
+	}
+}
+
+// TestACallCompletesHoweverOftenTheConnectionIsSettledAgain asserts a tool call
+// is not refused for what happens to the connection around it. A definition is
+// read for the connection the call travels over while the exchange is held, so
+// nothing can settle another one between the two, and there is no number of
+// times the connection may change before the client gives up on a call that has
+// nothing wrong with it.
+func TestACallCompletesHoweverOftenTheConnectionIsSettledAgain(t *testing.T) {
+	// serve answers a discovery-era server that advertises execute_sql mirroring
+	// its region and gives what it advertises no lifetime at all.
+	serve := func(w http.ResponseWriter, request recordedRequest) {
+		switch request.method {
+		case "server/discover":
+			writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+				"resultType":        "complete",
+				"supportedVersions": []any{LatestProtocolVersion},
+				"capabilities":      map[string]any{"tools": map[string]any{}},
+				"ttlMs":             0,
+			}}))
+		case "tools/list":
+			writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+				"resultType": "complete", "tools": []any{regionMirroringTool()}, "ttlMs": 600000,
+			}}))
+		case "tools/call":
+			writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+				"resultType": "complete",
+				"content":    []any{map[string]any{"type": "text", "text": "done"}},
+				"isError":    false,
+			}}))
+		default:
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}
+
+	tests := []struct {
+		name string
+		// disturb sets up whatever settles the connection again and again.
+		disturb func(c *WebClient)
+	}{
+		{
+			name: "a token minted afresh for every request",
+			disturb: func(c *WebClient) {
+				var minted atomic.Int64
+				c.WithTokenFunc(func() string { return "token-" + strconv.FormatInt(minted.Add(1), 10) })
+			},
+		},
+		{
+			name: "another caller reading what the server advertises after every exchange",
+			disturb: func(c *WebClient) {
+				// What a second goroutine polling the server's capabilities
+				// does, entered on purpose in the one interval it matters in:
+				// every time an exchange has let go of the gate.
+				var inside atomic.Bool
+				c.proto.released = func() {
+					if !inside.CompareAndSwap(false, true) {
+						return
+					}
+					defer inside.Store(false)
+					_, _ = c.Capabilities(context.Background())
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			endpoint := newRecordingEndpoint(t, serve)
+			c := Web(endpoint.URL)
+			tt.disturb(c)
+
+			for range 3 {
+				result, err := c.CallTool(context.Background(), "execute_sql", region())
+				if err != nil {
+					t.Fatalf("call: %v (wire = %v)", err, endpoint.wire())
+				}
+				if result.Text() != "done" {
+					t.Fatalf("text = %q, want done", result.Text())
+				}
+			}
+			calls := endpoint.requestsFor("tools/call")
+			if len(calls) != 3 {
+				t.Fatalf("tools/call was sent %d times, want 3", len(calls))
+			}
+			for index, call := range calls {
+				if got := call.headers.Get("Mcp-Param-Region"); got != "us-west1" {
+					t.Fatalf("call %d carried Mcp-Param-Region = %q, want us-west1", index, got)
+				}
+			}
+		})
+	}
+}
+
+// TestReadingADefinitionHoldsTheGateForOneTimeout asserts the catalogue a call
+// reads while it holds the exchange is given the time one request is. A server
+// that hands out a new cursor with every slow page would otherwise hold the
+// gate, and every caller behind it, for a timeout a page.
+func TestReadingADefinitionHoldsTheGateForOneTimeout(t *testing.T) {
+	var pages atomic.Int64
+	endpoint := newRecordingEndpoint(t, func(w http.ResponseWriter, request recordedRequest) {
+		switch request.method {
+		case "server/discover":
+			writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+				"resultType":        "complete",
+				"supportedVersions": []any{LatestProtocolVersion},
+				"capabilities":      map[string]any{"tools": map[string]any{}},
+				"ttlMs":             600000,
+			}}))
+		case "tools/list":
+			// Each page arrives well within the timeout; only all of them
+			// together outlast it.
+			time.Sleep(40 * time.Millisecond)
+			writeJSON(w, http.StatusOK, jsonFrame(request.id, map[string]any{"result": map[string]any{
+				"resultType": "complete", "tools": []any{}, "ttlMs": 600000,
+				"nextCursor": "page-" + strconv.FormatInt(pages.Add(1), 10),
+			}}))
+		default:
+			w.WriteHeader(http.StatusAccepted)
+		}
+	})
+	c := Web(endpoint.URL)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	c.WithTimeout(300 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.CallTool(context.Background(), "execute_sql", region())
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		var timeoutErr *TimeoutError
+		if !errors.As(err, &timeoutErr) {
+			t.Fatalf("error = %v (%T), want a timeout", err, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the call was still reading the catalogue after 5s with a timeout of 300ms: %d pages read", pages.Load())
+	}
+	if calls := endpoint.requestsFor("tools/call"); len(calls) != 0 {
+		t.Fatalf("the call was sent %d time(s) without the definition it was reading", len(calls))
 	}
 }
 

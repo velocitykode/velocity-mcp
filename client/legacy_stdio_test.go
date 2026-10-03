@@ -37,6 +37,9 @@ func TestMain(m *testing.M) {
 	if os.Getenv(legacyServerEnv) == "1" {
 		os.Exit(runLegacyStdioServer())
 	}
+	if os.Getenv(cancellableServerEnv) == "1" {
+		os.Exit(runCancellableStdioServer())
+	}
 	os.Exit(m.Run())
 }
 

@@ -3,9 +3,13 @@ package server_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/velocitykode/velocity/validation"
+
+	"github.com/velocitykode/velocity-mcp/content"
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
 	"github.com/velocitykode/velocity-mcp/server"
 )
@@ -434,6 +438,195 @@ func TestHostileParamsDoNotBreakTheCachingHints(t *testing.T) {
 				return
 			}
 			assertCacheHints(t, resultMembers(t, res.Response), tt.wantTTL, tt.wantScope)
+		})
+	}
+}
+
+// failingDocResource is a public, long-lived resource whose read can fail in
+// every way a read fails as content: a validation failure, an error response
+// the resource returns itself, and content the read form cannot represent.
+type failingDocResource struct{ mode string }
+
+func (failingDocResource) Name() string        { return "failing-doc" }
+func (failingDocResource) Description() string { return "A public document whose read may fail" }
+func (failingDocResource) URI() string         { return "file://failing.txt" }
+func (failingDocResource) MimeType() string    { return "text/plain" }
+func (failingDocResource) CacheHint() server.CacheHint {
+	return server.CacheHint{TTL: time.Hour, Scope: server.CacheScopePublic}
+}
+func (r failingDocResource) Read(_ context.Context, req *server.Request) (*server.Response, error) {
+	switch r.mode {
+	case "validation":
+		if err := req.Validate(validation.Rules{"lang": {validation.Required()}}); err != nil {
+			return nil, err
+		}
+		return server.Text("doc"), nil
+	case "error response":
+		return server.Error("The document is unavailable."), nil
+	case "unrepresentable":
+		return server.NewResponse(content.NewResourceLink("file://elsewhere", "elsewhere")), nil
+	default:
+		return server.Text("doc"), nil
+	}
+}
+
+// plainFailingResource reports a failure as content without declaring any
+// caching advice of its own, so the hint it would otherwise inherit comes from
+// the operation or the server.
+type plainFailingResource struct{}
+
+func (plainFailingResource) Name() string        { return "plain-failing" }
+func (plainFailingResource) Description() string { return "A document that is never readable" }
+func (plainFailingResource) URI() string         { return "file://plain-failing.txt" }
+func (plainFailingResource) MimeType() string    { return "text/plain" }
+func (plainFailingResource) Read(context.Context, *server.Request) (*server.Response, error) {
+	return server.Error("The document is unavailable."), nil
+}
+
+// TestAResourceReadThatFailsAsContentIsNotCacheable asserts the caching hints
+// describe the result actually returned (2026-07-28, server utilities,
+// caching): a resources/read that reports a failure in its contents carries a
+// lifetime of 0 under private scope, whatever the resource, the operation or the
+// server advertises for the resource itself. Resource results have no error
+// marker, so a cache storing the failure under the resource's public, hour-long
+// hint would serve it as the resource to every caller for the hour.
+func TestAResourceReadThatFailsAsContentIsNotCacheable(t *testing.T) {
+	tests := []struct {
+		name     string
+		mode     string
+		wantText string
+	}{
+		{"a validation failure", "validation", "Invalid params: "},
+		{"an error response from the resource", "error response", "The document is unavailable."},
+		{"content the read form cannot represent", "unrepresentable", "cannot be represented"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := server.New("demo", "1.0.0", server.WithResources(failingDocResource{mode: tt.mode}))
+			members := resultMembers(t, handle(t, s, modernRequest(1, "resources/read", `"uri":"file://failing.txt"`)).Response)
+			assertCacheHints(t, members, "0", `"private"`)
+			if !strings.Contains(string(members["contents"]), tt.wantText) {
+				t.Fatalf("contents = %s, want the failure text %q", members["contents"], tt.wantText)
+			}
+		})
+	}
+}
+
+// TestAResourceReadThatSucceedsKeepsTheResourceHint asserts the rule above is
+// confined to failures: the same resource read with the argument it requires is
+// priced as the resource declares.
+func TestAResourceReadThatSucceedsKeepsTheResourceHint(t *testing.T) {
+	s := server.New("demo", "1.0.0", server.WithResources(failingDocResource{mode: "validation"}))
+	members := resultMembers(t, handle(t, s, modernRequest(1, "resources/read", `"uri":"file://failing.txt","arguments":{"lang":"en"}`)).Response)
+	assertCacheHints(t, members, "3600000", `"public"`)
+	if !strings.Contains(string(members["contents"]), `"doc"`) {
+		t.Fatalf("contents = %s, want the document", members["contents"])
+	}
+}
+
+// TestAFailingReadIgnoresTheOperationAndServerHintsToo asserts the zero hint
+// wins over every level of the configuration, not only over the resource's own
+// advice: a resource declaring none inherits the operation's or the server's
+// public hint for a successful read, and never for a failure.
+func TestAFailingReadIgnoresTheOperationAndServerHintsToo(t *testing.T) {
+	tests := []struct {
+		name string
+		opt  server.Option
+	}{
+		{"the operation hint", server.WithMethodCacheHint("resources/read", server.CacheHint{TTL: time.Hour, Scope: server.CacheScopePublic})},
+		{"the server hint", server.WithCacheHint(server.CacheHint{TTL: time.Hour, Scope: server.CacheScopePublic})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := server.New("demo", "1.0.0", tt.opt, server.WithResources(plainFailingResource{}))
+			members := resultMembers(t, handle(t, s, modernRequest(1, "resources/read", `"uri":"file://plain-failing.txt"`)).Response)
+			assertCacheHints(t, members, "0", `"private"`)
+		})
+	}
+}
+
+// TestCacheHintApplyWritesTheWireMembers asserts the handler-side entry point
+// renders exactly what the envelope would: whole milliseconds rounded down, a
+// negative lifetime as 0, and any scope but public as private; a nil result is
+// left alone rather than written to.
+func TestCacheHintApplyWritesTheWireMembers(t *testing.T) {
+	tests := []struct {
+		name      string
+		hint      server.CacheHint
+		wantTTL   int64
+		wantScope server.CacheScope
+	}{
+		{"zero", server.CacheHint{}, 0, server.CacheScopePrivate},
+		{"public hour", server.CacheHint{TTL: time.Hour, Scope: server.CacheScopePublic}, 3600000, server.CacheScopePublic},
+		{"sub-millisecond", server.CacheHint{TTL: 500 * time.Microsecond, Scope: server.CacheScopePublic}, 0, server.CacheScopePublic},
+		{"negative", server.CacheHint{TTL: -time.Second}, 0, server.CacheScopePrivate},
+		{"misspelled scope", server.CacheHint{TTL: time.Second, Scope: "shared"}, 1000, server.CacheScopePrivate},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := map[string]any{"ttlMs": 99, "cacheScope": "public"}
+			tt.hint.Apply(result)
+			if result["ttlMs"] != tt.wantTTL || result["cacheScope"] != tt.wantScope {
+				t.Fatalf("members = %v, want ttlMs %d cacheScope %s", result, tt.wantTTL, tt.wantScope)
+			}
+		})
+	}
+	var absent map[string]any
+	server.CacheHint{}.Apply(absent)
+}
+
+// mispricedMethod is a handler that writes caching members the protocol does
+// not define, as a handler with a bug would: the raw tokens go out as written.
+type mispricedMethod struct{ ttl, scope string }
+
+func (m mispricedMethod) Handle(_ *server.Context, req *jsonrpc.Request) (*jsonrpc.Response, error) {
+	result := map[string]any{"tools": []any{}}
+	if m.ttl != "" {
+		result["ttlMs"] = json.RawMessage(m.ttl)
+	}
+	if m.scope != "" {
+		result["cacheScope"] = json.RawMessage(m.scope)
+	}
+	return jsonrpc.NewResult(req.ID, result)
+}
+
+// TestHandlerWrittenCacheHintsOutsideTheProtocolAreNarrowed asserts a member a
+// handler wrote is kept only when it is a value the protocol defines (ttlMs an
+// integer of zero or more, cacheScope one of "public" and "private"); anything
+// else is replaced by the zero hint's value for that member, not by the
+// server's configured advice, so a handler's slip can neither extend a
+// lifetime nor widen an audience. The configured hint here is public for an
+// hour, which is what a lenient replacement would have leaked.
+func TestHandlerWrittenCacheHintsOutsideTheProtocolAreNarrowed(t *testing.T) {
+	tests := []struct {
+		name      string
+		ttl       string
+		scope     string
+		wantTTL   string
+		wantScope string
+	}{
+		{"negative lifetime", `-5`, `"public"`, "0", `"public"`},
+		{"fractional lifetime", `1.5`, `"public"`, "0", `"public"`},
+		{"exponent lifetime", `1e3`, `"public"`, "0", `"public"`},
+		{"lifetime as a string", `"3600000"`, `"public"`, "0", `"public"`},
+		{"lifetime as a boolean", `true`, `"public"`, "0", `"public"`},
+		{"lifetime as null", `null`, `"public"`, "0", `"public"`},
+		{"scope outside the protocol", `42`, `"everyone"`, "42", `"private"`},
+		{"scope in upper case", `42`, `"PUBLIC"`, "42", `"private"`},
+		{"scope as a number", `42`, `7`, "42", `"private"`},
+		{"scope as null", `42`, `null`, "42", `"private"`},
+		{"both outside the protocol", `-1`, `"shared"`, "0", `"private"`},
+		{"both as the protocol defines", `42`, `"public"`, "42", `"public"`},
+		{"zero lifetime kept", `0`, `"private"`, "0", `"private"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := server.New("demo", "1.0.0",
+				server.WithCacheHint(server.CacheHint{TTL: time.Hour, Scope: server.CacheScopePublic}),
+				server.WithMethod("tools/list", mispricedMethod{ttl: tt.ttl, scope: tt.scope}),
+			)
+			members := resultMembers(t, handle(t, s, modernRequest(1, "tools/list")).Response)
+			assertCacheHints(t, members, tt.wantTTL, tt.wantScope)
 		})
 	}
 }

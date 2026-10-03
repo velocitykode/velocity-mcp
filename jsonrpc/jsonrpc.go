@@ -53,8 +53,9 @@ const (
 	CodeUnsupportedProtocolVersion = -32022
 )
 
-// ID represents a JSON-RPC request identifier. Per the specification an id MUST
-// be a string, a number, or null. The raw JSON is preserved so the exact client
+// ID represents a JSON-RPC request identifier. JSON-RPC lets an id be a string,
+// a number, or null; MCP narrows that to a string or an integer and forbids
+// null (basic protocol, requests). The raw JSON is preserved so the exact client
 // value (and numeric formatting) is echoed back unchanged in responses.
 type ID struct {
 	// raw holds the original JSON token for the id. A nil raw means the id was
@@ -89,8 +90,13 @@ func (id ID) IsNull() bool {
 	return bytes.Equal(bytes.TrimSpace(id.raw), []byte("null"))
 }
 
-// IsValidRequestID reports whether the id is a non-null string or number, the
-// only forms permitted for a request id by the specification.
+// IsValidRequestID reports whether the id is a string or an integer, the only
+// forms the specification permits for a request id. A JSON null is not one, nor
+// is a number with a fraction or an exponent: an integer is the JSON int
+// production, an optional minus sign followed by digits with no leading zero,
+// and a request whose id is anything else is refused as an invalid request
+// rather than served and answered under an id the specification does not
+// allow.
 func (id ID) IsValidRequestID() bool {
 	if id.IsNull() {
 		return false
@@ -99,14 +105,30 @@ func (id ID) IsValidRequestID() bool {
 	if len(t) == 0 {
 		return false
 	}
-	switch t[0] {
-	case '"': // string
+	if t[0] == '"' {
 		return true
-	case '-', '+', '.':
-		return true
-	default:
-		return t[0] >= '0' && t[0] <= '9'
 	}
+	return isJSONInteger(t)
+}
+
+// isJSONInteger reports whether a token is the JSON int production: an optional
+// "-" followed by "0" or by a digit 1-9 and any digits, with nothing after.
+func isJSONInteger(t []byte) bool {
+	if len(t) > 0 && t[0] == '-' {
+		t = t[1:]
+	}
+	if len(t) == 0 {
+		return false
+	}
+	if t[0] == '0' {
+		return len(t) == 1
+	}
+	for _, b := range t {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // String returns the id rendered for human-readable output. A string id is

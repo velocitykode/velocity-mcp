@@ -901,13 +901,6 @@ func TestWhatACallLearnsOfItsConnectionIsReadBeforeItLetsGo(t *testing.T) {
 		{name: "the liveness check", call: func() error { return client.Ping(ctx) }},
 		{name: "a tool call by name", call: func() error {
 			_, err := client.CallTool(ctx, "execute_sql", nil)
-			// A call whose connection was replaced under it once too often is
-			// refused by the client itself, with nothing sent: that is the
-			// client declining to guess, and says nothing of the kind asserted
-			// here.
-			if isStaleDefinition(err) {
-				return nil
-			}
 			return err
 		}},
 	}

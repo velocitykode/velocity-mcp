@@ -278,7 +278,10 @@ func resourceNotRegisteredCodes() []int {
 
 // assertNotRegistered asserts the reply is the protocol-level not-found error
 // for a missing primitive: an error object carrying one of codes whose message
-// contains want. kind names the primitive in the failure message.
+// is want, whole. The message the server writes for a missing primitive is
+// fully known, so a reply that prepends, appends or respells it is not that
+// reply, and detail that follows it is a leak the assertion has to report.
+// kind names the primitive in the failure message.
 //
 // Only the error object counts. The specification separates a protocol error,
 // which reports that the request could not be served at all, from a tool error
@@ -301,7 +304,7 @@ func (r *Response) assertNotRegistered(kind, want string, codes ...int) *Respons
 			r.method, kind, describeCodes(codes), want, r.resp.Error.Code, r.resp.Error.Message)
 		return r
 	}
-	if !strings.Contains(r.resp.Error.Message, want) {
+	if r.resp.Error.Message != want {
 		r.fatalf("mcptest: %s: expected the %s to be unregistered (error %q), got: %s",
 			r.method, kind, want, r.resp.Error.Message)
 	}

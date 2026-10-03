@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
@@ -71,8 +72,14 @@ func applyResultEnvelope(c *Context, req *jsonrpc.Request, res HandleResult) Han
 // applyCacheHints writes the "ttlMs" and "cacheScope" members onto a complete
 // result of a cacheable operation. A result the handler suspended awaiting
 // client input is left alone: an interim result is not cacheable and carries no
-// hints. A member the handler wrote itself is kept, so a method can price its
-// own result without the envelope overwriting it.
+// hints. A member the handler wrote itself is kept when it is a value the
+// protocol defines, so a method can price its own result without the envelope
+// overwriting it. One that is not (a negative, fractional or non-numeric ttlMs;
+// a cacheScope outside the two the protocol names) is replaced by the zero
+// hint's value for that member, because ttlMs is required to be an integer of
+// zero or more and a scope a client cannot read must not be read as the wider
+// one: the conservative value is the only one that cannot widen the audience or
+// extend the lifetime of a result by a handler's slip.
 func applyCacheHints(c *Context, req *jsonrpc.Request, result map[string]json.RawMessage) {
 	if !resultTypeIsComplete(result["resultType"]) {
 		return
@@ -83,12 +90,44 @@ func applyCacheHints(c *Context, req *jsonrpc.Request, result map[string]json.Ra
 	}
 
 	ttl, scope := hint.members()
-	if _, set := result["ttlMs"]; !set {
+	switch written, set := result["ttlMs"]; {
+	case !set:
 		result["ttlMs"] = ttl
+	case !isNonNegativeInteger(written):
+		result["ttlMs"], _ = CacheHint{}.members()
 	}
-	if _, set := result["cacheScope"]; !set {
+	switch written, set := result["cacheScope"]; {
+	case !set:
 		result["cacheScope"] = scope
+	case !isCacheScope(written):
+		_, result["cacheScope"] = CacheHint{}.members()
 	}
+}
+
+// isNonNegativeInteger reports whether a raw JSON member is the ttlMs the
+// protocol defines: a number token made of digits alone, so no sign, fraction
+// or exponent, and no other JSON type.
+func isNonNegativeInteger(raw json.RawMessage) bool {
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 {
+		return false
+	}
+	for _, b := range t {
+		if b < '0' || b > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isCacheScope reports whether a raw JSON member is one of the two scope
+// strings the protocol defines.
+func isCacheScope(raw json.RawMessage) bool {
+	var scope string
+	if err := json.Unmarshal(raw, &scope); err != nil {
+		return false
+	}
+	return CacheScope(scope) == CacheScopePublic || CacheScope(scope) == CacheScopePrivate
 }
 
 // resultTypeIsComplete reports whether a result's resultType member says the

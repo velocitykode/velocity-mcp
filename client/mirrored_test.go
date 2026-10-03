@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"slices"
 	"strconv"
@@ -25,29 +26,6 @@ func annotatedTool(header string) map[string]any {
 			"properties": map[string]any{
 				"region": map[string]any{"type": "string", mirrorAnnotation: header},
 				"query":  map[string]any{"type": "string"},
-			},
-		},
-	}
-}
-
-// refusedTool builds a tools/list entry whose annotation sits on a property
-// under an array's items, which no property chain reaches: a definition this
-// client refuses to advertise.
-func refusedTool() map[string]any {
-	return map[string]any{
-		"name": "execute_sql",
-		"inputSchema": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"list": map[string]any{
-					"type": "array",
-					"items": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"region": map[string]any{"type": "string", mirrorAnnotation: "Region"},
-						},
-					},
-				},
 			},
 		},
 	}
@@ -1164,80 +1142,166 @@ func TestAListingPrimesCallsByName(t *testing.T) {
 
 // TestAWholeListingReplacesWhatWasKnown asserts a call by name mirrors from the
 // catalogue as it now stands. A whole listing states every tool the server
-// advertises, so a tool it has dropped, and one whose refreshed definition this
-// client refuses, leave nothing behind for a later call to mirror.
+// advertises, so a tool it has dropped leaves nothing behind for a later call
+// to mirror.
 func TestAWholeListingReplacesWhatWasKnown(t *testing.T) {
-	tests := []struct {
-		name string
-		// second is the listing that replaces the one the client read first.
-		second string
-	}{
-		{name: "the server no longer advertises the tool", second: toolsFrame()},
-		{name: "the refreshed definition is one the client refuses", second: toolsFrame(refusedTool())},
-	}
+	c, s := discoveryClient(t, toolsFrame(annotatedTool("Region")), toolsFrame(), toolCallFrame("done"))
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			c, s := discoveryClient(t, toolsFrame(annotatedTool("Region")), tc.second, toolCallFrame("done"))
-
-			for range 2 {
-				if _, err := c.Tools(context.Background()); err != nil {
-					t.Fatalf("tools: %v", err)
-				}
-			}
-			if _, err := c.CallTool(context.Background(), "execute_sql", map[string]any{"region": "us-west1"}); err != nil {
-				t.Fatalf("call: %v", err)
-			}
-
-			want := []string{"server/discover", "tools/list", "tools/list", "tools/call"}
-			if got := s.methods(); !slices.Equal(got, want) {
-				t.Fatalf("methods = %v, want %v", got, want)
-			}
-			if _, present := s.headersAt(3)["Mcp-Param-Region"]; present {
-				t.Fatalf("the call mirrored a definition the catalogue no longer states: %v", s.headersAt(3))
-			}
-		})
+	for range 2 {
+		if _, err := c.Tools(context.Background()); err != nil {
+			t.Fatalf("tools: %v", err)
+		}
 	}
-}
-
-// TestACappedListingDropsWhatItRefused asserts a listing that reads only part
-// of the catalogue settles the tools it did read. A capped listing states
-// nothing about the tools it never reached, so what it did carry is merged into
-// what was known; a tool it refused it did reach, and the definition this
-// client last read of it is one it will not mirror from, so the call states
-// what the caller stated rather than headers read from a definition the client
-// has just turned down.
-func TestACappedListingDropsWhatItRefused(t *testing.T) {
-	c, s := discoveryClient(t,
-		toolsFrame(annotatedTool("Region")),
-		toolsFrame(refusedTool()),
-		toolCallFrame("done"),
-	)
-
-	if _, err := c.Tools(context.Background()); err != nil {
-		t.Fatalf("tools: %v", err)
-	}
-	capped, err := c.Tools(context.Background(), 5)
-	if err != nil {
-		t.Fatalf("capped tools: %v", err)
-	}
-	if len(capped) != 0 {
-		t.Fatalf("the capped listing advertised %d tool(s), want none", len(capped))
-	}
-	excluded := c.ExcludedTools()
-	if len(excluded) != 1 || excluded[0].Name != "execute_sql" {
-		t.Fatalf("excluded tools = %+v, want execute_sql", excluded)
-	}
-
 	if _, err := c.CallTool(context.Background(), "execute_sql", map[string]any{"region": "us-west1"}); err != nil {
 		t.Fatalf("call: %v", err)
 	}
+
 	want := []string{"server/discover", "tools/list", "tools/list", "tools/call"}
 	if got := s.methods(); !slices.Equal(got, want) {
 		t.Fatalf("methods = %v, want %v", got, want)
 	}
 	if _, present := s.headersAt(3)["Mcp-Param-Region"]; present {
-		t.Fatalf("the call mirrored a definition the client refused: %v", s.headersAt(3))
+		t.Fatalf("the call mirrored a definition the catalogue no longer states: %v", s.headersAt(3))
+	}
+}
+
+// halfValidTool is a tool one of whose annotations is valid and the other not:
+// tenant is a string mirrored into a header, and ratio is a number, a type the
+// specification does not let a header mirror. The definition as a whole is
+// invalid, and the valid half of it is exactly what a call sent anyway would
+// leave out.
+func halfValidTool() map[string]any {
+	return map[string]any{
+		"name": "query",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"tenant": map[string]any{"type": "string", mirrorAnnotation: "Tenant"},
+				"ratio":  map[string]any{"type": "number", mirrorAnnotation: "Ratio"},
+			},
+		},
+	}
+}
+
+// validTenantTool is the tool above once its server has repaired it.
+func validTenantTool() map[string]any {
+	return map[string]any{
+		"name": "query",
+		"inputSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"tenant": map[string]any{"type": "string", mirrorAnnotation: "Tenant"},
+			},
+		},
+	}
+}
+
+// TestAToolWhoseDefinitionIsRefusedIsNotCalled asserts a tool this client
+// leaves out of the catalogue for an invalid header annotation cannot be called
+// by name either. The MCP specification (2026-07-28, server/tools, the table of
+// header and body outcomes) makes a request whose value is in the body and not
+// in the header the work of a non-conforming client, and an intermediary has
+// routed and authorized on the missing header before any server can refuse it:
+// the client knows the definition is invalid, so the call is refused before it
+// is sent, with the reason.
+//
+// What the client kept may be a definition the server has repaired since, so a
+// refusal read from the catalogue is read again before it refuses the call; one
+// read for the call itself refuses it as it is.
+func TestAToolWhoseDefinitionIsRefusedIsNotCalled(t *testing.T) {
+	args := map[string]any{"tenant": "acme"}
+	tests := []struct {
+		name string
+		// frames is the script after the handshake.
+		frames []string
+		// before is what the client reads before the call by name.
+		before func(t *testing.T, c *Client)
+		// wantMethods is everything the client sends, and wantSent whether the
+		// call is among it.
+		wantMethods []string
+		wantSent    bool
+	}{
+		{
+			name:        "a call by name with nothing read before it",
+			frames:      []string{toolsFrame(halfValidTool())},
+			wantMethods: []string{"server/discover", "tools/list"},
+		},
+		{
+			name:   "a call by name after a whole listing refused the tool",
+			frames: []string{toolsFrame(halfValidTool()), toolsFrame(halfValidTool())},
+			before: func(t *testing.T, c *Client) {
+				tools, err := c.Tools(context.Background())
+				if err != nil || len(tools) != 0 {
+					t.Fatalf("tools = %v, %v; want the refused tool left out", tools, err)
+				}
+			},
+			wantMethods: []string{"server/discover", "tools/list", "tools/list"},
+		},
+		{
+			name:   "a call by name after a capped listing refused the tool",
+			frames: []string{toolsFrame(validTenantTool()), toolsFrame(halfValidTool()), toolsFrame(halfValidTool())},
+			before: func(t *testing.T, c *Client) {
+				if _, err := c.Tools(context.Background()); err != nil {
+					t.Fatalf("tools: %v", err)
+				}
+				capped, err := c.Tools(context.Background(), 5)
+				if err != nil || len(capped) != 0 {
+					t.Fatalf("capped tools = %v, %v; want the refused tool left out", capped, err)
+				}
+			},
+			wantMethods: []string{"server/discover", "tools/list", "tools/list", "tools/list"},
+		},
+		{
+			name:   "a tool the server has repaired since is called, with its header",
+			frames: []string{toolsFrame(halfValidTool()), toolsFrame(validTenantTool()), toolCallFrame("done")},
+			before: func(t *testing.T, c *Client) {
+				if _, err := c.Tools(context.Background()); err != nil {
+					t.Fatalf("tools: %v", err)
+				}
+			},
+			wantMethods: []string{"server/discover", "tools/list", "tools/list", "tools/call"},
+			wantSent:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, s := discoveryClient(t, tt.frames...)
+			if tt.before != nil {
+				tt.before(t, c)
+			}
+
+			result, err := c.CallTool(context.Background(), "query", args)
+			if got := s.methods(); !slices.Equal(got, tt.wantMethods) {
+				t.Fatalf("methods = %v, want %v", got, tt.wantMethods)
+			}
+			if tt.wantSent {
+				if err != nil {
+					t.Fatalf("call: %v", err)
+				}
+				if result.Text() != "done" {
+					t.Fatalf("text = %q, want done", result.Text())
+				}
+				if got := s.headersAt(len(tt.wantMethods) - 1)["Mcp-Param-Tenant"]; got != "acme" {
+					t.Fatalf("Mcp-Param-Tenant = %q, want acme", got)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("the call was answered %q; a tool whose definition is refused must not be called", result.Text())
+			}
+			var clientErr *Error
+			if !errors.As(err, &clientErr) || !strings.HasPrefix(err.Error(), "tool [query] cannot be called: its definition is invalid: ") {
+				t.Fatalf("error = %v (%T), want the client's refusal with the reason", err, err)
+			}
+			excluded := c.ExcludedTools()
+			if len(excluded) != 1 || excluded[0].Name != "query" || !errors.Is(err, excluded[0].Err) {
+				t.Fatalf("excluded = %+v, want the refusal to carry the reason the catalogue reports", excluded)
+			}
+			if !c.Connected() {
+				t.Fatal("a call refused before it was sent took the connection down")
+			}
+		})
 	}
 }
 
@@ -1680,10 +1744,6 @@ func TestAListingIsStampedWithTheConnectionItTravelledOver(t *testing.T) {
 	if got := c.proto.connectionGeneration(); got != 2 {
 		t.Fatalf("connection = %d, want the second one to be standing", got)
 	}
-	if tools[0].generation == 2 {
-		t.Fatal("the listing was stamped with the connection settled after its page arrived")
-	}
-
 	result, err := tools[0].Call(context.Background(), map[string]any{"region": "us-west1"})
 	if err != nil {
 		t.Fatalf("call: %v", err)

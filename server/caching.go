@@ -77,6 +77,24 @@ func (h CacheHint) members() (ttl, scope json.RawMessage) {
 		json.RawMessage(`"` + string(h.scope()) + `"`)
 }
 
+// Apply writes the hint onto a result as its "ttlMs" and "cacheScope" members,
+// replacing any the result already carries. A method handler uses it to price
+// the result it is about to return when the configured advice does not describe
+// that result: the envelope keeps a hint the handler wrote (see
+// applyResultEnvelope), so the handler's reading of its own result wins over the
+// server's reading of the operation. The zero hint, applied to a failure a
+// cacheable operation reports as content, is how such a result is kept out of
+// every cache: a client that stored it under the resource's own lifetime and
+// audience would serve the failure as the resource to every caller. A nil
+// result is left alone.
+func (h CacheHint) Apply(result map[string]any) {
+	if result == nil {
+		return
+	}
+	result["ttlMs"] = h.ttlMs()
+	result["cacheScope"] = h.scope()
+}
+
 // Cacheable is implemented by a resource that carries its own caching advice.
 // It overrides both the hint configured for "resources/read" and the
 // server-wide one when that resource is the one being read: how long a

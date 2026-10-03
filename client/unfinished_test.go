@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // This file covers the client half of a multi-round-trip request: a result the
@@ -309,14 +310,22 @@ func TestAtMostOneContinuation(t *testing.T) {
 // bytes and holds it to what the specification states about a result offered as
 // a continuation: it is an "input_required" result, it carries at least one of
 // the two members that make a retry meaningful, and its state token reaches the
-// retry exactly as the result stated it and only then. The result is whatever a
-// server sent, so the reader must also never panic on it.
+// retry spelled exactly as the result stated it, byte for byte, and only then.
+// The result is whatever a server sent, so the reader must also never panic on
+// it.
 func FuzzUnfinishedResultState(f *testing.F) {
 	seeds := []string{
 		`{"resultType":"input_required","requestState":"opaque"}`,
 		`{"resultType":"input_required","requestState":""}`,
 		`{"resultType":"input_required","requestState":"état-☕"}`,
 		`{"resultType":"input_required","requestState":"a\u0000b"}`,
+		// Characters the standard encoder rewrites as escapes, written plainly
+		// and written escaped: either spelling goes back as it came.
+		`{"resultType":"input_required","requestState":"a&b"}`,
+		`{"resultType":"input_required","requestState":"<state>"}`,
+		"{\"resultType\":\"input_required\",\"requestState\":\"line\u2028para\u2029end\"}",
+		`{"resultType":"input_required","requestState":"a\u0026b\u003c\u003e\u2028\u2029"}`,
+		`{"resultType":"input_required","requestState":"a\ud800b"}`,
 		`{"resultType":"input_required"}`,
 		`{"resultType":"input_required","requestState":null}`,
 		`{"resultType":"input_required","requestState":7}`,
@@ -333,6 +342,9 @@ func FuzzUnfinishedResultState(f *testing.F) {
 		`{"resultType":"complete","requestState":"opaque"}`,
 		`{"content":[]}`,
 		`  {"resultType":"input_required","requestState":"opaque"}  `,
+		// A vertical tab is whitespace to Go and not to JSON: the document is
+		// not a result at all.
+		"{\"resultType\":\"input_required\",\"requestState\":\"\"}\v",
 		`[]`,
 		`{`,
 		``,
@@ -358,7 +370,51 @@ func FuzzUnfinishedResultState(f *testing.F) {
 		if applyErr := applyContinuation(params, []Continuation{unfinished.Continue(nil)}); applyErr != nil {
 			t.Fatalf("the continuation of the result was refused: %v", applyErr)
 		}
-		sent, present := params["requestState"]
+		for _, version := range []ProtocolVersion{LatestProtocolVersion, ProtocolV20251125} {
+			checkRetryOnTheWire(t, raw, params, version)
+		}
+	})
+}
+
+// frameCapture is a transport that keeps the last frame it was sent and answers
+// nothing, for a test that reads a request off the wire.
+type frameCapture struct{ frame string }
+
+var _ Transport = (*frameCapture)(nil)
+
+func (f *frameCapture) Connect(context.Context) error { return nil }
+func (f *frameCapture) Disconnect() error             { return nil }
+func (f *frameCapture) SetTimeout(time.Duration)      {}
+func (f *frameCapture) Recipe() Recipe                { return Recipe{Driver: "capture"} }
+func (f *frameCapture) Send(_ context.Context, message string) error {
+	f.frame = message
+	return nil
+}
+
+func (f *frameCapture) Receive(context.Context) (string, error) {
+	return "", newError("frame capture: nothing is answered")
+}
+
+// checkRetryOnTheWire sends the retry of an unfinished result through the
+// protocol at the given version and holds the requestState member of the frame
+// that reaches the transport to the member the result stated, byte for byte.
+// The frame is read off the transport, so every encoding step between the
+// continuation and the wire is under test.
+func checkRetryOnTheWire(t *testing.T, raw []byte, params map[string]any, version ProtocolVersion) {
+	t.Helper()
+	capture := &frameCapture{}
+	p := newProtocol(capture, testClientInfo())
+	// Nothing answers, so the attempt fails once the frame is out; the frame is
+	// what is read.
+	_, _ = p.attempt(context.Background(), "tools/call", params, version, nil)
+	var frame struct {
+		Params map[string]json.RawMessage `json:"params"`
+	}
+	if decodeErr := json.Unmarshal([]byte(capture.frame), &frame); decodeErr != nil {
+		t.Fatalf("the retry of %q is not a JSON frame: %v (%q)", raw, decodeErr, capture.frame)
+	}
+	sent, present := frame.Params["requestState"]
+	{
 
 		// What the result stated, read without going through the code above.
 		var members map[string]json.RawMessage
@@ -368,16 +424,18 @@ func FuzzUnfinishedResultState(f *testing.F) {
 		member, stated := members["requestState"]
 		want, wantPresent := "", false
 		if trimmed := bytes.TrimSpace(member); stated && len(trimmed) > 0 && trimmed[0] == '"' {
-			wantPresent = json.Unmarshal(trimmed, &want) == nil
+			var decoded string
+			wantPresent = json.Unmarshal(trimmed, &decoded) == nil
+			want = string(trimmed)
 		}
 
 		if present != wantPresent {
 			t.Fatalf("the retry of %q carries requestState = %v, want %v", raw, present, wantPresent)
 		}
-		if present && sent != want {
-			t.Fatalf("the retry of %q carries requestState %q, want %q", raw, sent, want)
+		if present && string(sent) != want {
+			t.Fatalf("the retry of %q carries requestState %s at [%s], want %s byte for byte", raw, sent, version, want)
 		}
-	})
+	}
 }
 
 // TestCompleteResultsAreAnswers asserts the rule does not stand in the way of a
@@ -599,5 +657,61 @@ func TestUnfinishedResultLeavesTheConnectionUp(t *testing.T) {
 	}
 	if _, disconnects, _ := s.lifecycle(); disconnects != 0 {
 		t.Fatalf("the transport was torn down %d time(s)", disconnects)
+	}
+}
+
+// TestContinuationEchoesTheStateTokenByteForByte asserts the token goes back in
+// the spelling it arrived in, not merely with the value a Go string holds of it.
+// The specification requires the member back exactly as it arrived, and a
+// spelling the decoder has to replace (a lone surrogate escape) or would
+// normalize (an escaped letter) is lost the moment it is read into a string. A
+// token the caller replaced by hand is the caller's own, and is sent as set.
+func TestContinuationEchoesTheStateTokenByteForByte(t *testing.T) {
+	tests := []struct {
+		name string
+		// arrived is the requestState member as the server wrote it.
+		arrived string
+		// replace, when set, is the token the caller puts in the continuation
+		// in place of the one that arrived.
+		replace *string
+		// want is the member as it must go back on the wire.
+		want string
+	}{
+		{name: "a lone surrogate escape", arrived: `"a\ud800b"`, want: `"a\ud800b"`},
+		{name: "an escaped letter", arrived: `"\u0041BC"`, want: `"\u0041BC"`},
+		{name: "an escaped slash", arrived: `"a\/b"`, want: `"a\/b"`},
+		{name: "an ampersand and angle brackets written plainly", arrived: `"a&b<c>d"`, want: `"a&b<c>d"`},
+		{name: "line and paragraph separators written plainly", arrived: "\"a\u2028b\u2029c\"", want: "\"a\u2028b\u2029c\""},
+		{name: "the same characters written as escapes", arrived: `"\u0026\u003c\u003e\u2028\u2029"`, want: `"\u0026\u003c\u003e\u2028\u2029"`},
+		{name: "a token the caller replaced", arrived: `"opaque"`, replace: stateToken("mine"), want: `"mine"`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			frame := `{"jsonrpc":"2.0","id":` + scriptRequestID +
+				`,"result":{"resultType":"input_required","requestState":` + tc.arrived + `}}`
+			c, s := discoveryClient(t, emptyToolsFrame(), frame, toolCallFrame("done"))
+
+			_, err := c.CallTool(context.Background(), "execute_sql", nil)
+			var unfinished *UnfinishedResultError
+			if !errors.As(err, &unfinished) {
+				t.Fatalf("error = %v, want an unfinished result", err)
+			}
+			continuation := unfinished.Continue(nil)
+			if tc.replace != nil {
+				continuation.RequestState = tc.replace
+			}
+			if _, err := c.CallTool(context.Background(), "execute_sql", nil, continuation); err != nil {
+				t.Fatalf("continuation: %v", err)
+			}
+
+			var params map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(s.rawMember(t, 3, "params")), &params); err != nil {
+				t.Fatalf("params: %v", err)
+			}
+			if got := string(params["requestState"]); got != tc.want {
+				t.Fatalf("the retry carried requestState %s, want %s byte for byte", got, tc.want)
+			}
+		})
 	}
 }

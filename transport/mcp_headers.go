@@ -40,16 +40,38 @@ const (
 // Which rules a request falls under is settled from the header and the body
 // together. A legacy request, one carrying no protocol metadata in params._meta
 // and either no MCP-Protocol-Version header or one naming a revision the
-// initialize handshake still negotiates, is exempt: those clients predate the
-// headers. A request whose header declares a discovery-era revision while its
-// body declares none is refused rather than exempted, because the two halves
-// describe different protocols and an intermediary authorizing the call from
-// its headers would be reading a declaration the server itself does not honour.
-// A header naming any other revision is answered with HTTP 400 and -32022, as
-// the streamable HTTP transport requires of a protocol version the server does
-// not speak. Anything that is not a JSON-RPC request with a usable id and method
-// is passed through untouched, so the server produces the proper parse or
-// invalid-request error rather than a header complaint.
+// initialize handshake still negotiates, is exempt from having to send the
+// headers: those clients predate them. It is not exempt from the headers it does
+// send agreeing with its body. The specification requires a server that
+// processes the body to refuse a request whose header values do not match it,
+// and says nothing about the revision the request is made under, so an
+// Mcp-Method or Mcp-Name a legacy request carries is compared exactly as a
+// discovery request's is; only its absence is forgiven. Without that, a client
+// could route or bill a call past an intermediary under one name and have the
+// server run it under another simply by leaving its metadata out. A request
+// whose header declares a discovery-era revision while its body declares none is
+// refused rather than exempted, because the two halves describe different
+// protocols and an intermediary authorizing the call from its headers would be
+// reading a declaration the server itself does not honour: it is held to that
+// revision's rules in full, under which a body stating no protocol version is a
+// malformed request and is answered with HTTP 400 and -32602, the code the
+// specification assigns to a request missing a required _meta member. A header
+// naming any other revision is answered with HTTP 400 and -32022, as the
+// streamable HTTP transport requires of a protocol version the server does not
+// speak. Anything
+// that is not a JSON-RPC request with a usable id and method is passed through
+// untouched, so the server produces the proper parse or invalid-request error
+// rather than a header complaint.
+//
+// Before any of that, a request carrying a body must declare it as
+// application/json (parameters such as charset are allowed); one that does not,
+// or declares nothing, is refused with HTTP 415 by the framework's
+// router.ContentTypeJSON before the body is read. The streamable HTTP transport
+// carries JSON-RPC and nothing else, and the media types a browser may send
+// cross-site without a preflight (text/plain, form encodings; see the Fetch
+// standard's CORS-safelisted request-headers) are exactly the ones this refuses,
+// so a page on another origin cannot drive the endpoint with a request the
+// browser sends blind.
 //
 // The body is read here and handed on intact, bounded by the same cap the
 // handler applies (DefaultMaxBodyBytes unless WithMaxBodyBytes overrides it),
@@ -62,11 +84,11 @@ func ValidateHeaders(opts ...HandlerOption) router.MiddlewareFunc {
 	}
 
 	return func(next router.HandlerFunc) router.HandlerFunc {
-		return func(c *router.Context) error {
+		return router.ContentTypeJSON()(func(c *router.Context) error {
 			raw, err := readBody(c, o.maxBodyBytes)
 			if err != nil {
 				logf(c, err)
-				return writeParseError(c, err)
+				return bodyReadError(err)
 			}
 			// Hand the buffered body on: the handler reads it again.
 			c.Request.Body = io.NopCloser(bytes.NewReader(raw))
@@ -82,13 +104,13 @@ func ValidateHeaders(opts ...HandlerOption) router.MiddlewareFunc {
 				return next(c)
 			}
 			if info.Legacy {
-				return legacyRequest(c, info, next)
+				return legacyRequest(c, o, info, next)
 			}
 			if message := headerMismatch(c, info); message != "" {
 				return writeHeaderMismatch(c, info.ID, message)
 			}
 			return next(c)
-		}
+		})
 	}
 }
 
@@ -112,28 +134,58 @@ func inspectedMessage(c *router.Context, raw []byte) (server.MessageInfo, bool) 
 //
 // A request stating no version is served: the header postdates the revisions
 // that omit it. A version the initialize handshake still negotiates is served
-// too, without the mirrored Mcp-Method and Mcp-Name checks, because a client of
-// that revision has no metadata in its body for them to mirror. A header naming
-// the discovery revision contradicts a body declaring none, which is the
-// disagreement these headers exist to rule out. Anything else names a protocol
-// this server does not speak, and is refused with -32022 rather than run under
-// the exemption: the exemption speaks for the revisions listed above and for no
-// others, and a request admitted through it is one no header check has seen.
-func legacyRequest(c *router.Context, info server.MessageInfo, next router.HandlerFunc) error {
+// too. Neither is required to carry Mcp-Method or Mcp-Name, because a client of
+// those revisions has no metadata in its body for them to mirror, but either
+// header it does carry is held to the body like any other (see serveLegacy). A
+// header naming a revision this server accepts in a request's metadata (see
+// WithProtocolVersions) holds the request to that revision, whose every request
+// restates its protocol version in params._meta: the mirrored headers are
+// required and compared in full, and a body that then states no version is the
+// malformed discovery request the specification answers with -32602, not an
+// older client's. The server cannot draw that distinction on its own, because
+// the body alone is indistinguishable from a legacy one, so the refusal is
+// written here. Anything else names a protocol this server does not speak, and
+// is refused with -32022 rather than run under the exemption: the exemption
+// speaks for the revisions listed above and for no others, and a request
+// admitted through it is one no header check has seen.
+//
+// The initialize revisions are consulted before the metadata-bearing ones, so a
+// server configured to accept one of them in a request's metadata as well still
+// serves the older client that states it in the header alone.
+func legacyRequest(c *router.Context, o httpOptions, info server.MessageInfo, next router.HandlerFunc) error {
 	declared, message := statedProtocolVersion(c)
 	if message != "" {
 		return writeHeaderMismatch(c, info.ID, message)
 	}
 	switch {
 	case declared == "":
-		return next(c)
-	case server.HandshakeFor(declared) == server.HandshakeDiscovery:
-		return writeHeaderMismatch(c, info.ID, undeclaredProtocolMessage(declared))
+		return serveLegacy(c, info, next)
 	case supportsVersion(server.InitializeSupportedVersions(), declared):
-		return next(c)
+		return serveLegacy(c, info, next)
+	case supportsVersion(metadataProtocolVersions(o), declared):
+		if message := mirroredHeaderMismatch(c, info, true); message != "" {
+			return writeHeaderMismatch(c, info.ID, message)
+		}
+		return writeHeaderError(c, info.ID, server.MissingProtocolVersionError())
 	default:
-		return writeUnsupportedProtocolVersion(c, info.ID, declared)
+		return writeUnsupportedProtocolVersion(c, o, info.ID, declared)
 	}
+}
+
+// serveLegacy hands on a request admitted under the legacy exemption, once the
+// mirrored headers it carries anyway have been compared with its body. The
+// exemption forgives a missing Mcp-Method or Mcp-Name, not a present one that
+// names a different method or target than the body: a header that is there is
+// what an intermediary routes or authorizes on, whatever revision the client
+// speaks, and the specification's rule that a processed body must agree with
+// its headers is not scoped to a revision. A header this server cannot read at
+// all (one stated twice, or carrying a value the encoding does not define) is
+// refused on the same grounds.
+func serveLegacy(c *router.Context, info server.MessageInfo, next router.HandlerFunc) error {
+	if message := mirroredHeaderMismatch(c, info, false); message != "" {
+		return writeHeaderMismatch(c, info.ID, message)
+	}
+	return next(c)
 }
 
 // statedProtocolVersion returns the protocol revision the MCP-Protocol-Version
@@ -166,22 +218,14 @@ func supportsVersion(list []server.ProtocolVersion, version string) bool {
 	return false
 }
 
-// headerProtocolVersions returns the revisions the MCP-Protocol-Version header
-// may name: the ones whose requests mirror their metadata into these headers,
-// and the ones the initialize handshake still negotiates. It is what a -32022
-// reports as supported, so a client reading it learns every version it may
-// state here.
-func headerProtocolVersions() []server.ProtocolVersion {
-	return append(server.ServerSupportedVersions(), server.InitializeSupportedVersions()...)
-}
-
-// undeclaredProtocolMessage builds the complaint about a request whose header
-// declares a discovery-era revision that its body does not. The version named is
-// one of the revisions this server knows, so nothing of the request's own making
-// is echoed back.
-func undeclaredProtocolMessage(declared string) string {
-	return "Header mismatch: The [" + HeaderProtocolVersion + "] header declares protocol version [" +
-		declared + "] but the request body declares no protocol version."
+// metadataProtocolVersions returns the revisions the served server accepts in a
+// request's protocol metadata: the list WithProtocolVersions supplied, or the
+// package default when none was.
+func metadataProtocolVersions(o httpOptions) []server.ProtocolVersion {
+	if len(o.versions) > 0 {
+		return o.versions
+	}
+	return server.ServerSupportedVersions()
 }
 
 // headerMismatch returns the complaint about the first header that is absent or
@@ -192,10 +236,21 @@ func headerMismatch(c *router.Context, info server.MessageInfo) string {
 	if m := checkHeader(c, HeaderProtocolVersion, info.ProtocolVersion, info.HasProtocolVersion, true, false); m != "" {
 		return m
 	}
-	if m := checkHeader(c, HeaderMethod, info.Method, true, true, false); m != "" {
+	return mirroredHeaderMismatch(c, info, true)
+}
+
+// mirroredHeaderMismatch returns the complaint about the first of Mcp-Method and
+// Mcp-Name that contradicts the body, or "" when both mirror it. With required
+// set, an absent Mcp-Method is a failure, as is an absent Mcp-Name on a method
+// that addresses a named target; without it, an absent header is forgiven and
+// only a present one is compared. The comparison itself is the same either way:
+// which revision a request is made under decides what it must send, never what
+// the headers it did send may say.
+func mirroredHeaderMismatch(c *router.Context, info server.MessageInfo, required bool) string {
+	if m := checkHeader(c, HeaderMethod, info.Method, true, required, false); m != "" {
 		return m
 	}
-	return checkHeader(c, HeaderName, info.Name, info.HasName, info.RequiresName, true)
+	return checkHeader(c, HeaderName, info.Name, info.HasName, required && info.RequiresName, true)
 }
 
 // checkHeader compares one header against the body value it mirrors. An absent
@@ -291,12 +346,6 @@ func malformedHeaderMessage(name, fault string) string {
 	return "Header mismatch: The [" + name + "] header value " + fault + "."
 }
 
-// msgUnsupportedProtocolVersion is the message of the -32022 a header names a
-// protocol version this server does not speak with. The stated and the accepted
-// versions travel in the error data rather than the message, matching the -32022
-// the server itself raises over a request's protocol metadata.
-const msgUnsupportedProtocolVersion = "Unsupported protocol version"
-
 // writeHeaderMismatch answers a header failure with HTTP 400 and a JSON-RPC
 // error carrying the mismatch code. The message names the header and the two
 // values in conflict, both of which came from the request itself, so nothing
@@ -307,21 +356,20 @@ func writeHeaderMismatch(c *router.Context, rawID []byte, message string) error 
 
 // writeUnsupportedProtocolVersion answers an MCP-Protocol-Version header naming
 // a revision this server does not speak with HTTP 400 and -32022, carrying the
-// versions the header may name and the one it stated so the client can restate
-// it. The stated value has already been checked to be a well-formed field value,
-// and it is the client's own, so echoing it discloses nothing.
-func writeUnsupportedProtocolVersion(c *router.Context, rawID []byte, stated string) error {
-	return writeHeaderError(c, rawID, jsonrpc.NewError(jsonrpc.CodeUnsupportedProtocolVersion, msgUnsupportedProtocolVersion).
-		WithData(map[string]any{
-			"supported": headerProtocolVersions(),
-			"requested": stated,
-		}))
+// versions the server supports and the one the header stated so the client can
+// restate it. The error is the server package's own, built from the same list
+// the server reports when it refuses a version declared in a request's
+// metadata, so a client is told one thing whichever layer answers. The stated
+// value has already been checked to be a well-formed field value, and it is the
+// client's own, so echoing it discloses nothing.
+func writeUnsupportedProtocolVersion(c *router.Context, o httpOptions, rawID []byte, stated string) error {
+	return writeHeaderError(c, rawID, server.UnsupportedProtocolVersionError(metadataProtocolVersions(o), stated))
 }
 
-// writeHeaderError writes a header failure as HTTP 400 and a JSON-RPC error
-// correlated to the request id exactly as it arrived. The body echoes
-// request-controlled text, so it is served with the same content-type pinning as
-// every other reply this transport writes.
+// writeHeaderError writes a refusal the header validation settled as HTTP 400
+// and a JSON-RPC error correlated to the request id exactly as it arrived. The
+// body may echo request-controlled text, so it is served with the same
+// content-type pinning as every other reply this transport writes.
 func writeHeaderError(c *router.Context, rawID []byte, rpcErr *jsonrpc.Error) error {
 	id := jsonrpc.NullID()
 	// The id token is preserved as it arrived, so a numeric id stays numeric and

@@ -68,8 +68,8 @@ func TestStdio_Run_RequestResponse(t *testing.T) {
 	}
 
 	// The session id from initialize must be propagated to the second call.
-	if st.SessionID() != "fixed-session" {
-		t.Fatalf("session id not retained: %q", st.SessionID())
+	if sid := st.SessionID(); !strings.HasPrefix(sid, "fixed-session.") || !srv.IssuedSessionID(sid) {
+		t.Fatalf("session id not retained: %q", sid)
 	}
 }
 

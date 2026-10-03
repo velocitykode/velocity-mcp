@@ -243,6 +243,32 @@ func methodOf(t *testing.T, body string) string {
 	return msg.Method
 }
 
+// nameOf reads the named target a test body states: params.name for tools/call
+// and prompts/get, params.uri for resources/read, and "" for any other method or
+// a target that is not a string. It is this file's own reading of which member
+// Mcp-Name mirrors, kept apart from the code under test.
+func nameOf(t *testing.T, body string) string {
+	t.Helper()
+	var msg struct {
+		Params struct {
+			Name any `json:"name"`
+			URI  any `json:"uri"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		t.Fatalf("decode body %q: %v", body, err)
+	}
+	var target any
+	switch methodOf(t, body) {
+	case "tools/call", "prompts/get":
+		target = msg.Params.Name
+	case "resources/read":
+		target = msg.Params.URI
+	}
+	name, _ := target.(string)
+	return name
+}
+
 // metaMember reads a string member of a body's params._meta object.
 func metaMember(t *testing.T, body, key string) string {
 	t.Helper()

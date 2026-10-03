@@ -64,6 +64,16 @@ func requiresProtocolMeta(method string) bool {
 	}
 }
 
+// predatesProtocolMeta reports whether a method exists only in the initialize
+// handshake. The discovery revision replaced initialize with server/discover
+// and has no sessions, so a request that declares that revision in its _meta
+// and calls initialize names a method its own protocol does not have: serving
+// it would open a session, and mint and echo a session id, on a request made
+// under the revision that forbids both.
+func predatesProtocolMeta(method string) bool {
+	return method == "initialize"
+}
+
 // readsArgumentBag reports whether the specification gives a method an
 // [arguments] member: the bag a tool call, a prompt render, or a resource read
 // is invoked with. Every other method, including one a server registers itself,
@@ -180,8 +190,9 @@ type MessageInfo struct {
 
 // InspectMessage decodes a raw inbound message far enough to describe it,
 // reporting ok=false when the message is not a JSON-RPC request that carries
-// both a usable id (a non-null string or number) and a string method (a
-// notification, a reply, or malformed input). Callers treat a false result as
+// both a usable id (a string or an integer) and a string method (a
+// notification, a reply, a request under an id the specification does not
+// permit, or malformed input). Callers treat a false result as
 // "not mine to validate" and let the server produce the proper JSON-RPC error.
 func InspectMessage(raw []byte) (MessageInfo, bool) {
 	var body map[string]json.RawMessage
@@ -189,8 +200,9 @@ func InspectMessage(raw []byte) (MessageInfo, bool) {
 		return MessageInfo{}, false
 	}
 
-	// A usable id is one the specification permits for a request: a non-null
-	// string or number. It is the same rule the server applies before echoing an
+	// A usable id is one the specification permits for a request: a string or
+	// an integer, so not a null and not a number with a fraction or an
+	// exponent. It is the same rule the server applies before echoing an
 	// id back, so a message this reports as a request is one the server will
 	// answer with that very id, and nothing else is ever echoed.
 	var id jsonrpc.ID
@@ -297,7 +309,10 @@ func requestMeta(req *jsonrpc.Request) (rawMembers, bool) {
 // client capabilities; a missing or ill-typed member is CodeInvalidParams
 // (-32602). A well-formed version the server does not speak is
 // CodeUnsupportedProtocolVersion (-32022), carrying the supported list and the
-// requested value so the client can renegotiate. That answer is also how a
+// requested value so the client can renegotiate (see
+// UnsupportedProtocolVersionError). A version the server speaks only through
+// the initialize handshake is in that list, so declaring it per request is not
+// an unsupported version but a misplaced one, and is CodeInvalidParams too. That answer is also how a
 // client discovers which revisions the server speaks when its opening
 // server/discover names one the server does not.
 func validateProtocolMeta(c *Context, req *jsonrpc.Request) *jsonrpc.Error {
@@ -317,15 +332,46 @@ func validateProtocolMeta(c *Context, req *jsonrpc.Request) *jsonrpc.Error {
 		return jsonrpc.NewError(jsonrpc.CodeInvalidParams, missingMetaMessage(MetaKeyClientCapabilities))
 	}
 
-	supported := c.SupportedProtocolVersions()
-	if !containsVersion(supported, requested) {
-		return jsonrpc.NewError(jsonrpc.CodeUnsupportedProtocolVersion, msgUnsupportedVersion).
-			WithData(map[string]any{
-				"supported": supported,
-				"requested": requested,
-			})
+	accepted := c.SupportedProtocolVersions()
+	switch {
+	case containsVersion(accepted, requested):
+		return nil
+	case containsVersion(InitializeSupportedVersions(), requested):
+		return jsonrpc.NewError(jsonrpc.CodeInvalidParams, handshakeVersionInMetaMessage(requested))
+	default:
+		return UnsupportedProtocolVersionError(accepted, requested)
 	}
-	return nil
+}
+
+// UnsupportedProtocolVersionError returns the error a request is refused with
+// when it names a protocol version the server does not speak:
+// CodeUnsupportedProtocolVersion (-32022), carrying the requested value and the
+// versions the server does support so the client can retry with one of them.
+// metadata is the list the server accepts in a request's protocol metadata
+// (Server.SupportedProtocolVersions); the supported list reported is
+// SpokenProtocolVersions of it.
+//
+// It is the same error validateProtocolMeta raises over a request's metadata,
+// exported for a transport that refuses a request over the version its
+// envelope states (the MCP-Protocol-Version header) before the server sees the
+// body. Both layers build the error here, so one server never reports two
+// different lists.
+func UnsupportedProtocolVersionError(metadata []ProtocolVersion, requested string) *jsonrpc.Error {
+	return jsonrpc.NewError(jsonrpc.CodeUnsupportedProtocolVersion, msgUnsupportedVersion).
+		WithData(map[string]any{
+			"supported": SpokenProtocolVersions(metadata),
+			"requested": requested,
+		})
+}
+
+// handshakeVersionInMetaMessage is the message of the -32602 answering a
+// request that declares, in its params._meta, a revision this server speaks
+// only through the initialize handshake. The revision is supported, so -32022
+// (which would list it as supported and as the one refused) would be untrue;
+// what is wrong is where the request states it. The version echoed is one of
+// the server's own constants, not arbitrary client text.
+func handshakeVersionInMetaMessage(version string) string {
+	return "Invalid params: The protocol version [" + version + "] is negotiated by the initialize handshake and cannot be declared in [" + MetaKeyProtocolVersion + "]."
 }
 
 // RequestProtocolVersion returns the protocol revision a request declares in
@@ -351,6 +397,19 @@ func RequestProtocolVersion(req *jsonrpc.Request) (ProtocolVersion, bool) {
 func missingMetaMessage(key string) string {
 	const prefix = "Invalid params: The request [_meta] is missing the required ["
 	return prefix + key + "] member."
+}
+
+// MissingProtocolVersionError returns the error a request made under the
+// discovery handshake is refused with when its params._meta states no protocol
+// version: CodeInvalidParams (-32602), the code the specification assigns to a
+// request missing a required _meta member. It is the same error
+// validateProtocolMeta raises, exported for a transport that learns the
+// revision a request is made under from somewhere other than the body (the
+// MCP-Protocol-Version header) and so can tell that a body declaring no
+// metadata at all is a malformed discovery request, where the server, reading
+// the body alone, would take it for a legacy one and serve it.
+func MissingProtocolVersionError() *jsonrpc.Error {
+	return jsonrpc.NewError(jsonrpc.CodeInvalidParams, missingMetaMessage(MetaKeyProtocolVersion))
 }
 
 // msgInvalidArguments is the message of the -32602 error reporting an

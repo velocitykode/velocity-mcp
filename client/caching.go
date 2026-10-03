@@ -1,7 +1,6 @@
 package client
 
 import (
-	"bytes"
 	"encoding/json"
 	"math"
 	"strconv"
@@ -40,7 +39,7 @@ func lifetimeOf(result json.RawMessage) time.Duration {
 	if err := json.Unmarshal(result, &hints); err != nil {
 		return 0
 	}
-	text := string(bytes.TrimSpace(hints.TTL))
+	text := string(trimJSONSpace(hints.TTL))
 	milliseconds, err := strconv.ParseInt(text, 10, 64)
 	if err != nil {
 		whole, isWhole := integralNumber(text)

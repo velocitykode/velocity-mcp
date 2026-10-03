@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -182,19 +183,25 @@ func TestInspectorWebTransport(t *testing.T) {
 		name    string
 		url     string
 		wantURL string
+		// wantShown is the url the guidance prints: the one the inspector
+		// dials, with every query value withheld, since a query value is
+		// where an access token travels and the terminal is a log.
+		wantShown string
 		// wantHint is the certificate guidance the run must print, empty for a
 		// url that carries no certificate.
 		wantHint string
 	}{
-		{"http carries no certificate guidance", "http://localhost:8080/mcp", "http://localhost:8080/mcp", ""},
-		{"https on localhost keeps verification on", "https://localhost:8443/mcp", "https://localhost:8443/mcp", localCertHint},
-		{"https on a development domain keeps verification on", "https://demo.test/mcp", "https://demo.test/mcp", localCertHint},
-		{"https on a remote host keeps verification on", "https://api.example.com/mcp", "https://api.example.com/mcp", remoteCertHint},
-		{"https on an mdns host keeps verification on", "https://mac.local/mcp", "https://mac.local/mcp", remoteCertHint},
-		{"query string survives", "http://localhost:8080/mcp?tenant=acme", "http://localhost:8080/mcp?tenant=acme", ""},
+		{"http carries no certificate guidance", "http://localhost:8080/mcp", "http://localhost:8080/mcp", "http://localhost:8080/mcp", ""},
+		{"https on localhost keeps verification on", "https://localhost:8443/mcp", "https://localhost:8443/mcp", "https://localhost:8443/mcp", localCertHint},
+		{"https on a development domain keeps verification on", "https://demo.test/mcp", "https://demo.test/mcp", "https://demo.test/mcp", localCertHint},
+		{"https on a remote host keeps verification on", "https://api.example.com/mcp", "https://api.example.com/mcp", "https://api.example.com/mcp", remoteCertHint},
+		{"https on an mdns host keeps verification on", "https://mac.local/mcp", "https://mac.local/mcp", "https://mac.local/mcp", remoteCertHint},
+		{"query string survives", "http://localhost:8080/mcp?tenant=acme", "http://localhost:8080/mcp?tenant=acme", "http://localhost:8080/mcp?tenant=xxxxx", ""},
 		// Several parameters mean an "&" in the url: it must reach the
-		// inspector as one ampersand, neither escaped away nor doubled.
-		{"multi parameter query string survives", "http://localhost:8080/mcp?tenant=acme&region=eu", "http://localhost:8080/mcp?tenant=acme&region=eu", ""},
+		// inspector as one ampersand, neither escaped away nor doubled, and
+		// the guidance shows the parameters that were passed without their
+		// values.
+		{"multi parameter query string survives", "http://localhost:8080/mcp?tenant=acme&region=eu", "http://localhost:8080/mcp?tenant=acme&region=eu", "http://localhost:8080/mcp?tenant=xxxxx&region=xxxxx", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -222,7 +229,7 @@ func TestInspectorWebTransport(t *testing.T) {
 
 			assertVerifiesCertificates(t, rec.launch.Env)
 
-			wantGuidance := []string{"Transport Type => Streamable HTTP\n", "URL => " + tc.wantURL + "\n"}
+			wantGuidance := []string{"Transport Type => Streamable HTTP\n", "URL => " + tc.wantShown + "\n"}
 			if tc.wantHint != "" {
 				wantGuidance = append(wantGuidance, "Certificates => "+tc.wantHint+"\n")
 			}
@@ -1112,4 +1119,356 @@ func TestRunInspectorProcess(t *testing.T) {
 			t.Fatal("the inspector ran despite the cancelled context")
 		}
 	})
+}
+
+// The inspector runs under node and is fetched by npm, and both read their
+// settings from the environment. Any inherited setting that would change what
+// the launch verified and announced is withheld, as a class rather than by
+// name: node's own settings (NODE_OPTIONS injects any flag, NODE_PATH and
+// NODE_COMPILE_CACHE load code from elsewhere, NODE_EXTRA_CA_CERTS adds a
+// trust anchor the guidance never named), npm's (registry, strict-ssl, trust
+// store, the config file that could set them), the OpenSSL stack node links,
+// and the inspector's own auth and binding switches. Names are compared
+// case-folded: Windows resolves variables without regard to case and npm reads
+// its settings that way everywhere, so one spelling must not slip through
+// where another is blocked.
+func TestInspectorEnvironWithholdsInheritedRuntimeSettings(t *testing.T) {
+	withheld := []string{
+		"NODE_TLS_REJECT_UNAUTHORIZED=0",
+		"node_tls_reject_unauthorized=0",
+		"Node_TLS_Reject_Unauthorized=0",
+		"NODE_OPTIONS=--tls-min-v1.0 --insecure-http-parser --require /tmp/x.js",
+		"node_options=--tls-min-v1.0",
+		"NODE_EXTRA_CA_CERTS=/tmp/rogue-ca.pem",
+		"NODE_PATH=/tmp/modules",
+		"NODE_COMPILE_CACHE=/tmp/cache",
+		"NODE_USE_ENV_PROXY=1",
+		"npm_config_strict_ssl=false",
+		"NPM_CONFIG_STRICT_SSL=false",
+		"npm_config_strict-ssl=false",
+		"Npm_Config_Registry=http://registry.evil.test/",
+		"npm_config_registry=http://registry.evil.test/",
+		"npm_config_ca=-----BEGIN CERTIFICATE-----",
+		"npm_config_cafile=/tmp/rogue-ca.pem",
+		"npm_config_userconfig=/tmp/evil.npmrc",
+		"npm_config_globalconfig=/tmp/evil.npmrc",
+		"OPENSSL_CONF=/tmp/openssl.cnf",
+		"openssl_conf=/tmp/openssl.cnf",
+		"SSL_CERT_FILE=/tmp/rogue-ca.pem",
+		"SSL_CERT_DIR=/tmp/rogue-certs",
+		"DANGEROUSLY_OMIT_AUTH=true",
+		"dangerously_omit_auth=true",
+		"MCP_PROXY_AUTH_TOKEN=known-token",
+		"ALLOWED_ORIGINS=*",
+		"HOST=0.0.0.0",
+		"Host=0.0.0.0",
+		"MCP_PROXY_FULL_ADDRESS=http://attacker.test:6277",
+	}
+	inherited := []string{
+		"PATH=/usr/bin",
+		"HOME=/home/dev",
+		"MCP_INSPECTOR_TEST_MARKER=inherited",
+		"CLIENT_PORT=6000",
+		"SERVER_PORT=6277",
+		"MCP_SERVER_REQUEST_TIMEOUT=10000",
+		"MCP_AUTO_OPEN_ENABLED=false",
+		"HTTPS_PROXY=http://proxy.corp.test:3128",
+		"NPM_TOKEN=secret",
+		"npm_execpath=/usr/lib/node_modules/npm/bin/npm-cli.js",
+		"NODEJS_HOME=/opt/node",
+		"MY_NODE_OPTIONS=x",
+		"HOSTNAME=dev-box",
+	}
+	parent := append(append([]string{}, withheld...), inherited...)
+
+	got := inspectorEnviron(parent, nil)
+	for _, entry := range withheld {
+		if slices.Contains(got, entry) {
+			t.Errorf("inherited %q reached the inspector; it must be withheld", entry)
+		}
+	}
+	for _, entry := range inherited {
+		if !slices.Contains(got, entry) {
+			t.Errorf("inherited %q was dropped; only runtime, npm, TLS stack and inspector security settings are withheld", entry)
+		}
+	}
+	if len(got) != len(inherited) {
+		t.Errorf("child environment = %q, want exactly the inherited entries", got)
+	}
+}
+
+// A variable the launch sets itself replaces every inherited spelling of it,
+// so the child reads one value and it is the one the command decided on.
+func TestInspectorEnvironOverlayReplacesInheritedSpellings(t *testing.T) {
+	parent := []string{"client_port=1", "Client_Port=2", "CLIENT_PORT=3", "PATH=/usr/bin", "host=inherited"}
+	overlay := map[string]string{"CLIENT_PORT": "6274", "HOST": "127.0.0.1", "NODE_EXTRA_CA_CERTS": "/ca.pem"}
+
+	got := inspectorEnviron(parent, overlay)
+	want := []string{"PATH=/usr/bin", "CLIENT_PORT=6274", "HOST=127.0.0.1", "NODE_EXTRA_CA_CERTS=/ca.pem"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("child environment = %q, want %q", got, want)
+	}
+}
+
+// A --url may carry an access token: as the password, as the user name (the
+// usual form for a bearer token in a url), in a query parameter or in the
+// fragment. The inspector needs the url whole, so the configuration file
+// carries it as written; the guidance printed to the terminal, which ends up
+// in scrollback and CI logs, must not.
+func TestInspectorGuidanceWithholdsURLSecrets(t *testing.T) {
+	const full = "https://admin:hunter2@mcp.example.com:8443/mcp/v1?api_key=sk-live-123&tenant=acme&bare-token#frag-token"
+	rec := &runRecorder{}
+	cmd, out, _ := newInspector(t, rec)
+
+	if err := cmd.Handle(nil, []string{"--url", full}); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if got := rec.config.Servers["demo"].URL; got != full {
+		t.Fatalf("configured url = %q, want the url as written", got)
+	}
+
+	printed := out.String()
+	for _, secret := range []string{"admin", "hunter2", "sk-live-123", "acme", "bare-token", "frag-token"} {
+		if strings.Contains(printed, secret) {
+			t.Errorf("the guidance printed %q:\n%s", secret, printed)
+		}
+	}
+	want := "URL => https://xxxxx@mcp.example.com:8443/mcp/v1?api_key=xxxxx&tenant=xxxxx&xxxxx#xxxxx\n"
+	if !strings.Contains(printed, want) {
+		t.Errorf("guidance = %q, want it to carry %q", printed, want)
+	}
+	// A url without secrets is printed as it is, so the operator can check it.
+	rec, out = &runRecorder{}, nil
+	cmd, out, _ = newInspector(t, rec)
+	if err := cmd.Handle(nil, []string{"--url", "https://mcp.example.com/mcp"}); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if !strings.Contains(out.String(), "URL => https://mcp.example.com/mcp\n") {
+		t.Errorf("guidance = %q, want the plain url", out.String())
+	}
+}
+
+// No error, guidance line or question of the command may show an argument
+// value that can carry a url credential. The operator can put a url after any
+// flag, or after none, so the rule is exercised as a class: every value below
+// is passed in every position the command line has, and whatever the command
+// then says, in its error, on its output or in a question it asks, must hold
+// none of the value's secrets.
+func TestInspectorNeverShowsAnArgumentThatMayCarryCredentials(t *testing.T) {
+	values := []struct {
+		name  string
+		value string
+		// secrets are the parts of value that must never be shown.
+		secrets []string
+		// program reports a value that is not a url by its text and could
+		// name a program; --command prints the program it is given, which is
+		// what that flag is for, so such a value is not passed to it.
+		program bool
+	}{
+		{name: "a url with credentials everywhere", value: "https://admin:hunter2@mcp.example.com:8443/mcp/v1?api_key=sk-live-123&tenant=acme&bare-token#frag-token",
+			secrets: []string{"admin", "hunter2", "sk-live-123", "acme", "bare-token", "frag-token"}},
+		{name: "a wrong scheme", value: "ftp://admin:hunter2@files.example.com/x?token=sk-live-123#frag-token", secrets: []string{"admin", "hunter2", "sk-live-123", "frag-token"}},
+		{name: "no host", value: "http://admin:hunter2@/mcp?token=sk-live-123", secrets: []string{"admin", "hunter2", "sk-live-123"}},
+		// A url without "//" has no host; everything after the scheme is one
+		// opaque part, and a secret written there is as secret as anywhere.
+		{name: "an opaque url", value: "https:admin:hunter2@mcp.example.com/mcp?token=sk-live-123#frag-token", secrets: []string{"admin", "hunter2", "sk-live-123", "frag-token"}},
+		{name: "no scheme, with a password", value: "admin:hunter2@mcp.example.com/mcp?token=sk-live-123", secrets: []string{"admin", "hunter2", "sk-live-123"}, program: true},
+		{name: "no scheme, with a token as the user", value: "sk-live-123@mcp.example.com/mcp", secrets: []string{"sk-live-123"}, program: true},
+		{name: "a network path", value: "//admin:hunter2@mcp.example.com/mcp", secrets: []string{"admin", "hunter2"}, program: true},
+		{name: "a secret where the port goes", value: "https://admin@mcp.example.com:hunter2/mcp", secrets: []string{"admin", "hunter2"}},
+		{name: "a broken escape in the password", value: "https://admin:hunter2%zz@mcp.example.com/mcp?token=sk-live-123", secrets: []string{"admin", "hunter2", "%zz", "sk-live-123"}},
+		{name: "a broken escape in the path", value: "https://admin:hunter2@mcp.example.com/%zz?token=sk-live-123", secrets: []string{"admin", "hunter2", "sk-live-123"}},
+		{name: "an unterminated route parameter", value: "https://admin:hunter2@mcp.example.com/mcp/{org?token=sk-live-123", secrets: []string{"admin", "hunter2", "sk-live-123"}},
+		{name: "an unnamed route parameter", value: "https://admin:hunter2@mcp.example.com/{}?token=sk-live-123", secrets: []string{"admin", "hunter2", "sk-live-123"}},
+		{name: "braces in the password", value: "https://admin:hu{nter2}x@mcp.example.com/mcp", secrets: []string{"admin", "nter2"}},
+		{name: "a control character", value: "https://admin:hunter2@mcp.example.com/\x7fmcp?token=sk-live-123", secrets: []string{"admin", "hunter2", "sk-live-123"}},
+		{name: "a query behind an escaped question mark", value: "https://mcp.example.com/mcp%3Ftoken=sk-live-123", secrets: []string{"sk-live-123"}},
+		{name: "path parameters", value: "https://mcp.example.com/mcp;token=sk-live-123/v1;session=hunter2", secrets: []string{"sk-live-123", "hunter2"}},
+		{name: "an escaped separator in a query key", value: "https://mcp.example.com/mcp?a%3Dsk-live-123=1&b%26token%3Dhunter2=2", secrets: []string{"sk-live-123", "hunter2"}},
+		{name: "a query split at semicolons", value: "https://mcp.example.com/mcp?sk-live-123;x=hunter2&api_key=frag-token;bare-token", secrets: []string{"sk-live-123", "hunter2", "frag-token", "bare-token"}},
+	}
+	placements := []struct {
+		name string
+		args func(value string) []string
+		// command reports the placement that hands the value to --command.
+		command bool
+	}{
+		{name: "after --url", args: func(v string) []string { return []string{"--url", v} }},
+		{name: "inline with --url", args: func(v string) []string { return []string{"--url=" + v} }},
+		{name: "after a flag in the wrong case", args: func(v string) []string { return []string{"--Url", v} }},
+		{name: "inline with a flag in the wrong case", args: func(v string) []string { return []string{"--Url=" + v} }},
+		{name: "as a flag", args: func(v string) []string { return []string{"--" + v} }},
+		{name: "as a stray argument", args: func(v string) []string { return []string{v} }},
+		{name: "as a stray argument after a flag", args: func(v string) []string { return []string{"--port", "6274", v} }},
+		{name: "after --port", args: func(v string) []string { return []string{"--port", v} }},
+		{name: "inline with --port", args: func(v string) []string { return []string{"--port=" + v} }},
+		{name: "after --inspector-version", args: func(v string) []string { return []string{"--inspector-version", v} }},
+		{name: "after --ca-cert", args: func(v string) []string { return []string{"--ca-cert", v} }},
+		{name: "after --host", args: func(v string) []string { return []string{"--host", v} }},
+		{name: "after --command", args: func(v string) []string { return []string{"--command", v} }, command: true},
+	}
+	for _, value := range values {
+		for _, placement := range placements {
+			if value.program && placement.command {
+				continue
+			}
+			t.Run(value.name+"/"+placement.name, func(t *testing.T) {
+				rec := &runRecorder{}
+				cmd, out, asked := newInspector(t, rec, "value")
+				err := cmd.Handle(nil, placement.args(value.value))
+
+				shown := map[string]string{"output": out.String(), "questions": strings.Join(*asked, "\n")}
+				if err != nil {
+					shown["error"] = err.Error()
+				}
+				for where, text := range shown {
+					for _, secret := range value.secrets {
+						if strings.Contains(text, secret) {
+							t.Errorf("the %s shows %q: %s", where, secret, text)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+// The refusals still say what is wrong and where, without the value.
+func TestInspectorArgumentErrorsNameTheProblemWithoutTheValue(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"a flag in the wrong case", []string{"--Url=https://admin:hunter2@h/mcp?api_key=sk-live-123"}, `unknown flag "--Url" (the value is not shown`},
+		{"a url as a flag", []string{"--port", "6274", "--https://admin:hunter2@h/mcp"}, "unknown flag at position 3 (the value is not shown"},
+		{"a plain unknown flag", []string{"--force"}, `unknown flag "--force" (the value is not shown`},
+		{"a stray argument", []string{"--port", "6274", "https://admin:hunter2@h/mcp"}, "unexpected argument at position 3 (the value is not shown"},
+		{"a port", []string{"--port", "https://admin:hunter2@h/mcp"}, "--port must be a number between 1 and 65535 (the value is not shown"},
+		{"a version", []string{"--inspector-version", "https://admin:hunter2@h/mcp"}, "--inspector-version must be an npm version or tag (the value is not shown"},
+		{"a version that is too old", []string{"--inspector-version", "1.9.0"}, "--inspector-version must be 2.0.0 or newer, got major version 1:"},
+		{"a certificate that is not there", []string{"--ca-cert", "https://admin:hunter2@h/mcp"}, "--ca-cert must name a readable certificate file (the value is not shown, since an argument may carry a url with credentials): no such file or directory"},
+		{"a certificate that is a directory", []string{"--ca-cert", dir}, "--ca-cert must name a regular file (the value is not shown"},
+		{"a url as the command", []string{"--command", "https://admin:hunter2@h/mcp"}, "--command must name a program, not a url; pass a url with --url (the value is not shown"},
+		{"an opaque url as the command", []string{"--command", "HTTPS:admin:hunter2@h/mcp"}, "--command must name a program, not a url; pass a url with --url (the value is not shown"},
+		{"a wrong scheme", []string{"--url", "ftp://admin:hunter2@h/x"}, "mcp: --url must be an absolute http or https url (the value is not shown"},
+		{"no host", []string{"--url", "http://admin:hunter2@/mcp"}, "mcp: --url is missing a host (the value is not shown"},
+		{"an invalid url", []string{"--url", "https://admin@h:hunter2/mcp"}, "mcp: --url is not a valid url (the value is not shown"},
+		{"an unterminated route parameter", []string{"--url", "https://h/mcp/{org"}, "mcp: unterminated route parameter in --url (the value is not shown"},
+		{"an unnamed route parameter", []string{"--url", "https://h/mcp/{}"}, "mcp: unnamed route parameter in --url (the value is not shown"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &runRecorder{}
+			cmd, _, _ := newInspector(t, rec, "value")
+			err := cmd.Handle(nil, tc.args)
+			if err == nil {
+				t.Fatalf("arguments %q accepted, want an error", tc.args)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to say %q", err, tc.want)
+			}
+			if rec.calls != 0 {
+				t.Fatal("the inspector was launched with refused arguments")
+			}
+		})
+	}
+}
+
+// The url shown in the guidance keeps the query keys and the separators as
+// written and replaces every value, whichever separator the parameters are
+// told apart by.
+func TestRedactedQuery(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{"one parameter", "api_key=sk-live-123", "api_key=xxxxx"},
+		{"two parameters", "a=1&b=2", "a=xxxxx&b=xxxxx"},
+		{"a bare parameter", "sk-live-123", "xxxxx"},
+		{"semicolons", "a=1;b=2", "a=xxxxx;b=xxxxx"},
+		{"a bare parameter before a semicolon", "sk-live-123;x=hunter2&api_key=frag", "xxxxx;x=xxxxx&api_key=xxxxx"},
+		{"a bare parameter after a semicolon", "x=1;sk-live-123", "x=xxxxx;xxxxx"},
+		{"an empty value", "a=&b=2", "a=xxxxx&b=xxxxx"},
+		{"empty parameters", "a=1&&b=2;", "a=xxxxx&&b=xxxxx;"},
+		{"a value holding an equals sign", "a=b=c", "a=xxxxx"},
+		{"only separators", "&;", "&;"},
+		{"a key with an escape", "a%3Dsk-live-123=1", "xxxxx=xxxxx"},
+		{"a key with brackets", "filter[name]=x&plain.key_1~-=y", "xxxxx=xxxxx&plain.key_1~-=xxxxx"},
+		{"an empty key", "=x", "=xxxxx"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := redactedQuery(tc.query); got != tc.want {
+				t.Fatalf("redactedQuery(%q) = %q, want %q", tc.query, got, tc.want)
+			}
+		})
+	}
+}
+
+// Route parameters are looked for after the user information only, wherever
+// the url puts it.
+func TestUserInfoEnd(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		// want is the text before the index reported.
+		want string
+	}{
+		{"no user information", "https://mcp.example.com/mcp/{org}", ""},
+		{"a user and a password", "https://admin:p{ss}w@mcp.example.com/{org}", "https://admin:p{ss}w@"},
+		{"an at sign in the password", "https://admin:p@ss@mcp.example.com/mcp", "https://admin:p@ss@"},
+		{"an at sign in the path only", "https://mcp.example.com/mcp/@{org}", ""},
+		{"an at sign in the query only", "https://mcp.example.com/mcp?to=a@b", ""},
+		{"no scheme", "admin:p{ss}w@mcp.example.com/mcp", "admin:p{ss}w@"},
+		{"a network path", "//admin:p{ss}w@mcp.example.com/mcp", "//admin:p{ss}w@"},
+		{"an opaque url", "https:admin:p{ss}w@mcp.example.com/mcp", "https:admin:p{ss}w@"},
+		{"two slashes later in the path", "/mcp//admin@x/{org}", ""},
+		{"empty", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.raw[:userInfoEnd(tc.raw)]; got != tc.want {
+				t.Fatalf("userInfoEnd(%q) ends after %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// The route is shown in the guidance so the operator can check it, but only
+// the segments that are plain text: a segment holding an escape or a
+// delimiter may carry a parameter for a parser that splits the url
+// differently, and is withheld like a value.
+func TestInspectorGuidanceShowsOnlyPlainPathSegments(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{"a plain route", "https://mcp.example.com/mcp/v1.2/tenant_a~b-c", "https://mcp.example.com/mcp/v1.2/tenant_a~b-c"},
+		{"no path", "https://mcp.example.com", "https://mcp.example.com"},
+		{"a trailing slash", "https://mcp.example.com/mcp/", "https://mcp.example.com/mcp/"},
+		{"an escaped question mark", "https://mcp.example.com/mcp%3Ftoken=sk-live-123/v1", "https://mcp.example.com/xxxxx/v1"},
+		{"path parameters", "https://mcp.example.com/mcp;token=sk-live-123/v1", "https://mcp.example.com/xxxxx/v1"},
+		{"an escaped slash", "https://mcp.example.com/mcp/acme%2Feu", "https://mcp.example.com/mcp/xxxxx"},
+		{"an at sign", "https://mcp.example.com/mcp/admin:hunter2@x", "https://mcp.example.com/mcp/xxxxx"},
+		{"an equals sign", "https://mcp.example.com/mcp/token=sk-live-123", "https://mcp.example.com/mcp/xxxxx"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &runRecorder{}
+			cmd, out, _ := newInspector(t, rec)
+			if err := cmd.Handle(nil, []string{"--url", tc.url}); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if got := rec.config.Servers["demo"].URL; got != tc.url {
+				t.Fatalf("configured url = %q, want the url as written", got)
+			}
+			if want := "URL => " + tc.want + "\n"; !strings.Contains(out.String(), want) {
+				t.Fatalf("guidance = %q, want it to carry %q", out.String(), want)
+			}
+		})
+	}
 }

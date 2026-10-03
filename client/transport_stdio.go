@@ -2,15 +2,26 @@ package client
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"io"
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
+
+// shutdownGrace is how long each stage of stopping the subprocess is given. The
+// MCP specification (basic/lifecycle#shutdown) has a client close the input
+// stream of the server, wait for it to exit, ask it to terminate if it has not
+// within a reasonable time, and kill it only if it still has not.
+const shutdownGrace = 2 * time.Second
+
+// pipeGrace is how long the output of a subprocess that has exited is still
+// waited for. A descendant it left running holds the pipes open for as long as
+// it lives, and a disconnect must not wait on a process it never started.
+const pipeGrace = time.Second
 
 // StdioTransport speaks newline-delimited JSON-RPC to a server subprocess over
 // its stdin/stdout. A background reader drains stdout into a buffered channel so
@@ -24,32 +35,69 @@ type StdioTransport struct {
 	timeout time.Duration
 	cmd     *exec.Cmd
 	stdin   io.WriteCloser
-	stderr  *syncBuffer
+	stderr  *tailBuffer
 	lines   chan string
 	readErr chan error
+	// done is closed when the subprocess is given up, which releases whoever
+	// is waiting on its output: the reader, and a Receive in flight.
+	done chan struct{}
 }
 
-// syncBuffer is a bytes.Buffer safe for the concurrent writes performed by the
-// exec stderr copier and the reads performed by closedError.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
+// maxStderrBytes caps how much of the subprocess's standard error is kept. A
+// server logs there by design, for as long as it runs, and the only reader is
+// the report of a subprocess that ended early, which wants the last thing it
+// said: the tail is kept and everything before it let go.
+const maxStderrBytes = 64 << 10
+
+// maxFrameBytes caps one frame read from the subprocess. It is the bound the
+// HTTP transport already reads a response body under, so a server cannot make
+// the client buffer more over one channel than over the other.
+const maxFrameBytes = 32 << 20
+
+// tailBuffer keeps the last limit bytes written to it. It is safe for the
+// concurrent writes of the exec stderr copier and the reads of closedError.
+type tailBuffer struct {
+	mu    sync.Mutex
+	limit int
+	buf   []byte
 }
 
-func (b *syncBuffer) Write(p []byte) (int, error) {
+// Write keeps the tail of everything written so far. It always reports the
+// whole of p as written: the copier it serves stops at a short write, and the
+// subprocess would then block on a pipe nobody drains.
+func (b *tailBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.buf.Write(p)
+	if len(p) >= b.limit {
+		b.buf = append(b.buf[:0], p[len(p)-b.limit:]...)
+		return len(p), nil
+	}
+	if overflow := len(b.buf) + len(p) - b.limit; overflow > 0 {
+		b.buf = append(b.buf[:0], b.buf[overflow:]...)
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
 }
 
-func (b *syncBuffer) String() string {
+// String returns what is kept.
+func (b *tailBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.buf.String()
+	return string(b.buf)
 }
 
-// Compile-time assertion that *StdioTransport satisfies Transport.
-var _ Transport = (*StdioTransport)(nil)
+// Compile-time assertions that *StdioTransport satisfies Transport and the
+// optional hook it takes part in.
+var (
+	_ Transport         = (*StdioTransport)(nil)
+	_ CancellationAware = (*StdioTransport)(nil)
+)
+
+// NotifiesCancellation reports that a request abandoned over stdio is withdrawn
+// by a notifications/cancelled frame, whatever the revision: the subprocess is
+// one server for every request, and the specification has the client cancel a
+// request rather than end the process that holds all the others.
+func (t *StdioTransport) NotifiesCancellation(ProtocolVersion) bool { return true }
 
 // NewStdioTransport builds a stdio transport that will run command with args.
 func NewStdioTransport(command string, args ...string) *StdioTransport {
@@ -65,6 +113,14 @@ func (t *StdioTransport) SetTimeout(d time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.timeout = d
+}
+
+// Timeout returns the receive timeout, which the client also holds a whole
+// exchange to.
+func (t *StdioTransport) Timeout() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.timeout
 }
 
 // Recipe returns the transport's serializable description.
@@ -91,8 +147,9 @@ func (t *StdioTransport) Connect(ctx context.Context) error {
 	if err != nil {
 		return wrapError(err, "unable to open subprocess stdout")
 	}
-	t.stderr = &syncBuffer{}
+	t.stderr = &tailBuffer{limit: maxStderrBytes}
 	cmd.Stderr = t.stderr
+	cmd.WaitDelay = pipeGrace
 
 	if err := cmd.Start(); err != nil {
 		return wrapError(err, "failed to start process ["+t.command+"]; make sure the command exists")
@@ -102,39 +159,102 @@ func (t *StdioTransport) Connect(ctx context.Context) error {
 	t.stdin = stdin
 	t.lines = make(chan string, 16)
 	t.readErr = make(chan error, 1)
-	go t.readLoop(stdout, t.lines, t.readErr)
+	t.done = make(chan struct{})
+	go t.readLoop(stdout, t.lines, t.readErr, t.done)
 	return nil
 }
 
 // readLoop reads newline-delimited frames from stdout until the stream ends,
 // forwarding each frame and finally the terminating error.
-func (t *StdioTransport) readLoop(stdout io.Reader, lines chan<- string, readErr chan<- error) {
+//
+// It ends with the stream and with nothing else, so it cannot outlive the
+// subprocess: once done is closed nobody receives a frame any more, and what
+// the subprocess still writes is read and dropped. The reading goes on because
+// a server asked to shut down may still be writing, and one blocked on a pipe
+// nobody drains never gets to exit.
+//
+// A frame larger than maxFrameBytes ends the delivery as the end of the stream
+// does: the stream cannot be put back in step past a frame that was not read to
+// its end.
+func (t *StdioTransport) readLoop(stdout io.Reader, lines chan<- string, readErr chan<- error, done <-chan struct{}) {
 	reader := bufio.NewReader(stdout)
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := readFrame(reader, maxFrameBytes)
 		if trimmed := strings.TrimRight(line, "\r\n"); trimmed != "" {
-			lines <- trimmed
+			select {
+			case lines <- trimmed:
+			case <-done:
+				_, _ = io.Copy(io.Discard, reader)
+				return
+			}
 		}
 		if err != nil {
 			readErr <- err
+			if errors.Is(err, errFrameTooLarge) {
+				// The stream has not ended, only the reading of it as frames.
+				_, _ = io.Copy(io.Discard, reader)
+			}
 			return
 		}
 	}
 }
 
+// errFrameTooLarge ends the reading of a subprocess that sent a frame larger
+// than the transport takes.
+var errFrameTooLarge = errors.New("a frame exceeded the size this client reads")
+
+// readFrame reads one line, giving up with errFrameTooLarge once it has read
+// more than limit bytes of it. What was read of an oversized line is dropped,
+// so nothing of it is taken for a frame.
+func readFrame(reader *bufio.Reader, limit int) (string, error) {
+	var frame []byte
+	for {
+		chunk, err := reader.ReadSlice('\n')
+		if len(frame)+len(chunk) > limit {
+			return "", errFrameTooLarge
+		}
+		frame = append(frame, chunk...)
+		if err != bufio.ErrBufferFull {
+			return string(frame), err
+		}
+	}
+}
+
 // Send writes a single frame followed by a newline to the subprocess stdin.
+//
+// The write is bounded by the timeout, by a deadline of ctx that comes sooner,
+// and by ctx ending: a server that has stopped reading its input leaves the pipe
+// full, and a write into it would otherwise never return.
 func (t *StdioTransport) Send(ctx context.Context, message string) error {
 	t.mu.Lock()
-	stdin := t.stdin
+	stdin, timeout := t.stdin, t.timeout
 	t.mu.Unlock()
 	if stdin == nil {
 		return newError("transport is not connected")
 	}
+	if bounded, ok := stdin.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		// The timeout is the bound, and a deadline of ctx only ever shortens
+		// it. The context an exchange runs under states the maximum of the
+		// exchange as its deadline, which is many timeouts away, and a write
+		// held to that would hold the exchange gate with it.
+		deadline := time.Now().Add(timeout)
+		if stated, ok := ctx.Deadline(); ok && stated.Before(deadline) {
+			deadline = stated
+		}
+		// A platform whose pipes take no deadline leaves the write unbounded,
+		// as it was.
+		_ = bounded.SetWriteDeadline(deadline)
+		// A write blocked on a full pipe does not watch the context, so a
+		// context that ends first ends the write through its deadline.
+		stop := context.AfterFunc(ctx, func() { _ = bounded.SetWriteDeadline(time.Now()) })
+		defer stop()
+	}
 	if _, err := io.WriteString(stdin, message+"\n"); err != nil {
 		// A pipe that will not take the frame is the subprocess having gone
-		// away, not a server refusing the request, so it is reported as the
-		// channel failure it is and the subprocess is torn down: the next
-		// Connect has to start a new one rather than adopt the dead one.
+		// away or stopped reading, not a server refusing the request, so it is
+		// reported as the channel failure it is and the subprocess is torn
+		// down: part of a frame may have been written, and the next Connect has
+		// to start a new server rather than adopt this one.
 		_ = t.Disconnect()
 		return NewTransportError("unable to write to subprocess ["+t.command+"]", err)
 	}
@@ -145,7 +265,7 @@ func (t *StdioTransport) Send(ctx context.Context, message string) error {
 // context/timeout elapses or the subprocess closes its output.
 func (t *StdioTransport) Receive(ctx context.Context) (string, error) {
 	t.mu.Lock()
-	lines, readErr, timeout := t.lines, t.readErr, t.timeout
+	lines, readErr, done, timeout := t.lines, t.readErr, t.done, t.timeout
 	t.mu.Unlock()
 	if lines == nil {
 		return "", newError("transport is not connected")
@@ -164,11 +284,21 @@ func (t *StdioTransport) Receive(ctx context.Context) (string, error) {
 			return line, nil
 		default:
 		}
+		select {
+		case <-done:
+			// The output ended because the subprocess was given up, which is
+			// not the server closing it on a request.
+			return "", newError("transport is not connected")
+		default:
+		}
 		return "", t.closedError(err)
+	case <-done:
+		// The subprocess was given up while this wait was in flight.
+		return "", newError("transport is not connected")
 	case <-ctx.Done():
 		return "", t.abandonedError(ctx.Err())
 	case <-timer.C:
-		return "", t.timeoutError(nil)
+		return "", timeoutError(nil)
 	}
 }
 
@@ -176,20 +306,22 @@ func (t *StdioTransport) Receive(ctx context.Context) (string, error) {
 // timeout like any other; a cancelled context is the caller withdrawing the
 // request, which is neither a timeout nor a failure of the channel, so it is a
 // plain client error that no other handshake would do better with.
+//
+// The subprocess is left running either way. It serves every request of the
+// connection, and the one that was abandoned is withdrawn by the client with a
+// notifications/cancelled frame: whatever the server still sends for it carries
+// the id of a request nobody is waiting for, and is passed over by whoever
+// reads next.
 func (t *StdioTransport) abandonedError(cause error) error {
 	if errors.Is(cause, context.Canceled) {
-		_ = t.Disconnect()
 		return wrapError(cause, "the wait for a response from subprocess ["+t.command+"] was cancelled")
 	}
-	return t.timeoutError(cause)
+	return timeoutError(cause)
 }
 
-// timeoutError tears the subprocess down and reports the timeout. The
-// subprocess is stopped because a server that owes a reply and has not sent it
-// cannot be trusted to keep the stream in step: the next frame read would
-// belong to the abandoned exchange.
-func (t *StdioTransport) timeoutError(cause error) error {
-	_ = t.Disconnect()
+// timeoutError reports a wait that outlasted the timeout or the deadline of its
+// context.
+func timeoutError(cause error) error {
 	return NewTimeoutError("timed out while waiting for server response", cause)
 }
 
@@ -207,34 +339,76 @@ func (t *StdioTransport) closedError(err error) error {
 		err = nil
 	}
 	t.mu.Lock()
-	stderr := ""
-	if t.stderr != nil {
-		stderr = strings.TrimSpace(t.stderr.String())
-	}
+	captured := t.stderr
 	t.mu.Unlock()
+	// The subprocess is reaped before its standard error is read, so what it
+	// said last is in the report however the two streams raced each other.
 	_ = t.Disconnect()
 
 	msg := "subprocess [" + t.command + "] closed its output before sending a complete response"
-	if stderr != "" {
-		msg += "; stderr: " + stderr
+	if errors.Is(err, errFrameTooLarge) {
+		msg = "subprocess [" + t.command + "] sent a frame this client does not read to its end"
+	}
+	if captured != nil {
+		if stderr := strings.TrimSpace(captured.String()); stderr != "" {
+			msg += "; stderr: " + stderr
+		}
 	}
 	return NewTransportError(msg, err)
 }
 
-// Disconnect closes stdin and stops the subprocess. It is safe to call when not
-// connected.
+// Disconnect stops the subprocess the way the specification has a client stop
+// a server it started: its input is closed, which is the request to shut down,
+// and it is given shutdownGrace to exit by itself; a server that has not is
+// asked to terminate and given as long again, and only one that still has not
+// is killed. It is safe to call when not connected.
+//
+// It returns within a bound however the subprocess behaves. A launcher such as
+// a shell or a package runner commonly leaves the server as a descendant
+// holding the pipes it inherited, and waiting for those to close would wait for
+// a process this transport never started: once the subprocess itself has
+// exited its output is waited for no longer than pipeGrace.
 func (t *StdioTransport) Disconnect() error {
 	t.mu.Lock()
-	cmd, stdin := t.cmd, t.stdin
-	t.cmd, t.stdin, t.lines, t.readErr = nil, nil, nil, nil
+	cmd, stdin, done := t.cmd, t.stdin, t.done
+	t.cmd, t.stdin, t.lines, t.readErr, t.done = nil, nil, nil, nil, nil
 	t.mu.Unlock()
 
+	if done != nil {
+		close(done)
+	}
 	if stdin != nil {
 		_ = stdin.Close()
 	}
-	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
+	if cmd == nil || cmd.Process == nil {
+		return nil
 	}
+
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		_ = cmd.Wait()
+	}()
+	if exitedWithin(exited, shutdownGrace) {
+		return nil
+	}
+	// A platform that cannot deliver the signal goes straight to the kill.
+	if cmd.Process.Signal(syscall.SIGTERM) == nil && exitedWithin(exited, shutdownGrace) {
+		return nil
+	}
+	_ = cmd.Process.Kill()
+	<-exited
 	return nil
+}
+
+// exitedWithin reports whether the subprocess was reaped within the grace.
+func exitedWithin(exited <-chan struct{}, grace time.Duration) bool {
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-exited:
+		return true
+	case <-timer.C:
+		return false
+	}
 }

@@ -98,3 +98,36 @@ func (e *TimeoutError) Unwrap() error {
 	}
 	return e.cause
 }
+
+// unanswered marks, in the chain of a transport failure, that the peer gave no
+// answer at all: the request timed out, or the connection failed under it. It
+// is what tells a failure that says something about the server from one that
+// says nothing. An HTTP endpoint that turns a request away has answered, and a
+// client may put the request another way; one that did not answer in time has
+// said nothing of what it speaks, and a client that read its silence as the
+// answer of an older server would settle the older handshake with a server
+// that speaks the newer one. The message and the chain are those of the
+// failure it marks.
+type unanswered struct{ err error }
+
+// Error implements the error interface.
+func (u *unanswered) Error() string {
+	if u == nil || u.err == nil {
+		return "the peer gave no answer"
+	}
+	return u.err.Error()
+}
+
+// Unwrap exposes the failure itself for errors.Is/As.
+func (u *unanswered) Unwrap() error {
+	if u == nil {
+		return nil
+	}
+	return u.err
+}
+
+// isUnanswered reports whether a failure carries the mark.
+func isUnanswered(err error) bool {
+	var mark *unanswered
+	return errors.As(err, &mark)
+}

@@ -112,13 +112,13 @@ func TestDiscoverRequiresProtocolMetadata(t *testing.T) {
 // the supported set without ever reading the discovery document.
 func TestDiscoverRenegotiatesAnUnsupportedRevision(t *testing.T) {
 	s := server.New("demo", "1.0.0")
-	res := handle(t, s, `{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2025-11-25","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	res := handle(t, s, `{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}`)
 
 	encoded, err := json.Marshal(res.Response)
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
 	}
-	const want = `{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"requested":"2025-11-25","supported":["2026-07-28"]}}}`
+	const want = `{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"requested":"1900-01-01","supported":["2026-07-28","2025-11-25","2025-06-18"]}}}`
 	if string(encoded) != want {
 		t.Fatalf("wire form =\n%s\nwant\n%s", encoded, want)
 	}

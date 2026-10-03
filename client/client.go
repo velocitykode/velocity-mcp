@@ -21,49 +21,53 @@ type Client struct {
 	clientInfo schema.Implementation
 	name       string
 
-	// mu guards the record of the tools the last listing refused and the
-	// mirrored parameters read from the definitions it accepted. catalogued
-	// reports whether a listing has read the whole catalogue, which is what
-	// makes a name it does not carry a name the server does not advertise, and
-	// cataloguedUntil the moment that stops being so: the first of its pages to
-	// go stale takes the claim with it. listedOn is the connection those
-	// definitions were read over: they describe the server that stated them and
-	// nothing beyond it.
-	//
-	// changes counts the times the server has said its catalogue changed. A
-	// definition belongs to the count it was read at: the specification has
-	// that notification outdate a listing at once, however much of its lifetime
-	// is left.
+	// mu guards what the client keeps of the server's tools: the tools the
+	// last listing refused, the catalogue, and changes, the count of the times
+	// the server has said its catalogue changed. What is kept belongs to the
+	// count it was read at: the specification has that notification outdate a
+	// listing at once, however much of its lifetime is left.
 	//
 	// excludedFor is the authorization context the listing that refused those
 	// tools was asked for in. Which tools a server advertises may depend on who
 	// is asking, so the names it refused are shown in that context alone. The
-	// definitions need no such mark: a change of credential is a change of
-	// connection, and they are dropped with the connection they were read over.
-	mu              sync.Mutex
-	excluded        []ExcludedTool
-	excludedFor     int64
-	mirrored        map[string]statedDefinition
-	catalogued      bool
-	cataloguedUntil time.Time
-	listedOn        int64
-	changes         int64
+	// catalogue needs no such mark: a change of credential is a change of
+	// connection, and it is dropped with the connection it was read over.
+	mu          sync.Mutex
+	excluded    []ExcludedTool
+	excludedFor int64
+	catalogue   catalogue
+	changes     int64
 }
 
 // toolsChangedNotification is the notification a server sends when the list of
 // tools it advertises has changed.
 const toolsChangedNotification = "notifications/tools/list_changed"
 
-// statedDefinition is what one listing read of a tool: the parameters its
-// definition asks to be mirrored, the moment the page that stated them stops
-// being fresh, and the count of changes the server had announced to its
-// catalogue when the listing set out. The server gave the page that lifetime,
-// and past it, or past the next change, the definition is what the server said
-// once rather than what it says.
-type statedDefinition struct {
+// catalogue is what the client keeps of the tools one connection stated, which
+// is what a call by name is mirrored from. It describes the server that stated
+// it and nothing beyond: generation is the connection it was read over, and a
+// handshake settled since has it dropped.
+//
+// whole reports that a listing read the catalogue to its end, which is what
+// makes a name it does not carry a name the server does not advertise, and
+// wholeUntil the moment that stops being so: the first of its pages to go stale
+// takes the claim with it.
+type catalogue struct {
+	generation int64
+	tools      map[string]definition
+	whole      bool
+	wholeUntil time.Time
+}
+
+// definition is what a listing stated for one tool: the parameters its schema
+// asks to be mirrored into headers, or the reason this client refuses the
+// schema, and the moment the page that stated it stops being fresh. The server
+// gave the page that lifetime, and past it the definition is what the server
+// said once rather than what it says.
+type definition struct {
 	params     mirroredParameters
+	refused    error
 	staleAfter time.Time
-	changes    int64
 }
 
 // crossedGeneration stands for the connection a listing belongs to when it
@@ -103,9 +107,7 @@ func (c *Client) serverNotified(method string) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.mirrored = nil
-	c.catalogued = false
-	c.cataloguedUntil = time.Time{}
+	c.catalogue = catalogue{generation: c.catalogue.generation}
 	c.changes++
 }
 
@@ -234,9 +236,30 @@ func (c *Client) Instructions(ctx context.Context) (string, error) {
 // connection: what a server told one caller is not shown to the next.
 func (c *Client) DiscoverResult() *DiscoverResult { return c.proto.discoverResult() }
 
-// WithTimeout sets the per-operation timeout on the transport.
+// WithTimeout sets the timeout of a request whose context carries no deadline
+// of its own. It runs from the request going out, and only a progress
+// notification for that request starts it over: a server sending log
+// notifications, or progress on something else, cannot keep the client waiting
+// past it (see WithMaxTimeout for the bound that holds regardless of progress).
+// The transport is given the same value as its own bound on the wait for any
+// one frame. A timeout set on the
+// transport itself, as the recipe of a named client sets it, bounds the
+// exchange the same way.
 func (c *Client) WithTimeout(d time.Duration) *Client {
 	c.transport.SetTimeout(d)
+	c.proto.setTimeout(d)
+	return c
+}
+
+// WithMaxTimeout sets the longest a request whose context carries no deadline
+// may take, whatever progress the server reports for it. The timeout itself
+// starts over each time the server reports progress on the request, so a call
+// that is being worked on is not cut while it says so; the maximum is what ends
+// a request that goes on reporting progress without ever finishing. It defaults
+// to ten times the timeout, and a duration of zero or less restores that. A
+// deadline on the caller's context is the bound in place of both.
+func (c *Client) WithMaxTimeout(d time.Duration) *Client {
+	c.proto.setMaxTimeout(d)
 	return c
 }
 
@@ -287,50 +310,42 @@ func (c *Client) Ping(ctx context.Context) error {
 // such tool must not cost the rest of the catalogue, so the others are returned
 // as usual and the reasons are available from ExcludedTools.
 func (c *Client) Tools(ctx context.Context, limit ...int) ([]Tool, error) {
-	tools, _, err := c.listTools(ctx, limit)
-	return tools, err
-}
-
-// listTools reads the catalogue and reports the connection the definitions it
-// returns were read over, so a call weighing itself against one of them knows
-// which server stated it.
-//
-// A listing whose pages did not all travel over the same connection is the
-// catalogue of no server, and is stamped as belonging to none. Its entries are
-// still returned, because they are what the server answered with and a caller
-// reading the catalogue has nothing better; what they may not do is settle the
-// headers of a later call without being read again.
-func (c *Client) listTools(ctx context.Context, limit []int) ([]Tool, int64, error) {
 	// The count is read before the first page is asked for, so a change the
 	// server announces while the listing is being read outdates it as well:
 	// nothing says which of its pages the server had already put together.
 	changes := c.catalogueChanges()
 	read, err := c.listOn(ctx, "tools", limit)
 	if err != nil {
-		return nil, crossedGeneration, err
+		return nil, err
 	}
+	tools, stated, excluded, err := c.toolsOf(read)
+	if err != nil {
+		return nil, err
+	}
+	c.recordListing(stated, excluded, len(limit) == 0, read, changes)
+	return tools, nil
+}
+
+// toolsOf decodes the entries of a tools listing: the tools this client offers,
+// what the listing stated for every tool by name, the refused ones included,
+// and the tools it refused with the reasons.
+func (c *Client) toolsOf(read listing) ([]Tool, map[string]definition, []ExcludedTool, error) {
 	tools := make([]Tool, 0, len(read.entries))
+	stated := make(map[string]definition, len(read.entries))
 	var excluded []ExcludedTool
-	mirrored := make(map[string]statedDefinition, len(read.entries))
 	for _, e := range read.entries {
 		t, err := parseTool(c, e.payload)
 		if err != nil {
-			return nil, crossedGeneration, err
+			return nil, nil, nil, err
 		}
+		stated[t.Name] = definition{params: t.mirrored, refused: t.mirrorErr, staleAfter: e.staleAfter}
 		if t.mirrorErr != nil {
 			excluded = append(excluded, ExcludedTool{Name: t.Name, Err: t.mirrorErr})
 			continue
 		}
-		t.staleAfter = e.staleAfter
-		t.changes = changes
-		mirrored[t.Name] = statedDefinition{params: t.mirrored, staleAfter: e.staleAfter}
 		tools = append(tools, t)
 	}
-	generation := c.recordListing(excluded, mirrored, len(limit) == 0, read, changes)
-	for index := range tools {
-		tools[index].generation = generation
-	}
-	return tools, generation, nil
+	return tools, stated, excluded, nil
 }
 
 // ExcludedTool is a tool the server advertised that this client refuses to use,
@@ -355,105 +370,77 @@ func (c *Client) ExcludedTools() []ExcludedTool {
 	return append([]ExcludedTool(nil), c.excluded...)
 }
 
-// recordListing records what one listing found: the tools it refused, and the
-// mirrored parameters of the definitions it accepted. A whole listing is the
-// catalogue as it now stands and replaces what was known, so a tool the server
-// has dropped, or whose refreshed definition this client now refuses, leaves no
-// stale parameters behind for a later call to mirror. A capped listing is only
-// a part of the catalogue, so what it did carry is merged into the rest; a tool
-// it refused is dropped there too, because the definition this client last read
-// of it is one it will not mirror from.
+// recordListing records what one listing found: the tools it refused, and what
+// it stated for each tool. A whole listing is the catalogue as it now stands
+// and replaces what was known, so a tool the server has dropped leaves nothing
+// behind for a later call to mirror. A capped listing is only a part of the
+// catalogue, so what it did carry is merged into the rest.
 //
 // The record belongs to the connection the listing was read over, which the
 // listing states: the one every page travelled over, or crossedGeneration when
 // they did not all travel over one. A listing that crossed a handshake read its
-// pages from more than one server, so it records nothing and reports that it
-// belongs to no connection. What an earlier listing settled over the connection
-// now standing is left as it was, being the one thing here that describes it.
+// pages from more than one server, so it records nothing. What an earlier
+// listing settled over the connection now standing is left as it was, being the
+// one thing here that describes it.
 //
-// Every definition is recorded with the moment the page that stated it stops
-// being fresh, and a whole listing with the moment the first of its pages does:
-// the record is what the server said, for as long as the server said it may be
-// kept. A listing the server outdated while it was being read, by announcing
-// that its catalogue had changed, records nothing either: changes is the count
-// of such announcements the listing set out at.
-//
-// It returns the connection the listing belongs to: the one now standing when
-// that is the one it was read over, and crossedGeneration when it is not.
-func (c *Client) recordListing(excluded []ExcludedTool, mirrored map[string]statedDefinition, whole bool, read listing, changes int64) int64 {
+// A listing the server outdated while it was being read, by announcing that its
+// catalogue had changed, records nothing either: changes is the count of such
+// announcements the listing set out at.
+func (c *Client) recordListing(stated map[string]definition, excluded []ExcludedTool, whole bool, read listing, changes int64) {
 	generation := c.proto.connectionGeneration()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.forgetOtherConnection(generation)
 	c.excluded, c.excludedFor = excluded, read.authorization
-	if read.readOn != generation {
-		return crossedGeneration
-	}
-	if changes != c.changes {
-		// The listing did travel over this connection, so that is what it
-		// reports; what dates its definitions is the count they set out at.
-		return generation
+	if read.readOn != generation || changes != c.changes {
+		return
 	}
 	if whole {
-		c.mirrored = mirrored
-		c.catalogued = true
-		c.cataloguedUntil = read.staleAfter
-		return generation
+		c.catalogue = catalogue{generation: generation, tools: stated, whole: true, wholeUntil: read.staleAfter}
+		return
 	}
-	if c.mirrored == nil {
-		c.mirrored = make(map[string]statedDefinition, len(mirrored))
+	if c.catalogue.tools == nil {
+		c.catalogue.tools = make(map[string]definition, len(stated))
 	}
-	for name, stated := range mirrored {
-		c.mirrored[name] = stated
+	for name, definition := range stated {
+		c.catalogue.tools[name] = definition
 	}
-	for _, tool := range excluded {
-		delete(c.mirrored, tool.Name)
-	}
-	return generation
 }
 
-// knownMirrored returns the definition a listing stated for a tool addressed by
-// name and the connection it was read over, reporting false when no listing has
-// read one that settles it over the connection now standing, or when the one
+// statedFor returns what the catalogue kept of the connection identified by
+// generation states for a tool, reporting false when it states nothing that
+// still stands: no listing has read the tool over that connection, or the one
 // that did has outlived the lifetime the server gave it. The specification has
 // a stale result read again the next time it is needed, and the headers of a
 // call are what a definition is needed for.
 //
 // The record is dropped the moment the server announces a change, so whatever
 // it holds was read at the count of changes now standing.
-func (c *Client) knownMirrored(name string) (statedDefinition, int64, bool) {
-	generation := c.proto.connectionGeneration()
+func (c *Client) statedFor(name string, generation int64) (definition, bool) {
 	now := c.proto.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.forgetOtherConnection(generation)
-	if stated, known := c.mirrored[name]; known {
-		stated.changes = c.changes
-		return stated, generation, now.Before(stated.staleAfter)
+	if stated, known := c.catalogue.tools[name]; known {
+		return stated, now.Before(stated.staleAfter)
 	}
 	// A whole catalogue that does not carry the name advertises nothing to
 	// mirror under it, which is as settled an answer as a definition, and
 	// stands for as long as every page it was read from does.
-	settled := c.catalogued && now.Before(c.cataloguedUntil)
-	return statedDefinition{staleAfter: c.cataloguedUntil, changes: c.changes}, generation, settled
+	return definition{}, c.catalogue.whole && now.Before(c.catalogue.wholeUntil)
 }
 
-// forgetOtherConnection drops the mirrored record when it was read over another
+// forgetOtherConnection drops the catalogue when it was read over another
 // connection than the one identified by generation. A definition is the server
 // speaking, and a handshake settles who is speaking: a restarted server may
 // declare another type for a mirrored property, or stop mirroring it at all,
-// and a call weighed against what the previous one said would be refused
-// locally for input the server would accept. Nothing reaches the server to
-// correct it, since a call refused before it is sent earns no answer, so the
-// record is dropped and the catalogue read again. The caller holds c.mu.
+// and the server reached under another credential may advertise other tools
+// altogether. The caller holds c.mu.
 func (c *Client) forgetOtherConnection(generation int64) {
-	if c.listedOn == generation {
+	if c.catalogue.generation == generation {
 		return
 	}
-	c.mirrored = nil
-	c.catalogued = false
-	c.cataloguedUntil = time.Time{}
-	c.listedOn = generation
+	c.catalogue = catalogue{generation: generation}
 }
 
 // CallTool invokes a tool by name. A nil arguments map is sent as an empty
@@ -468,173 +455,172 @@ func (c *Client) forgetOtherConnection(generation int64) {
 // something that answers on HTTP's terms rather than the protocol's, so the
 // call must not be sent in the hope of being told what it is missing.
 //
+// A tool whose definition this client refuses, as ExcludedTools reports it, is
+// not called at all: the definition is invalid, the headers it asks for cannot
+// be told from it, and the call would go out without them.
+//
 // An optional Continuation repeats a call the server left unfinished, carrying
 // the inputs it asked for; see UnfinishedResultError.
 func (c *Client) CallTool(ctx context.Context, name string, arguments map[string]any, continuation ...Continuation) (*ToolResult, error) {
 	if err := checkContinuation(continuation); err != nil {
 		return nil, err
 	}
-	held, err := c.mirroredParametersOf(ctx, name)
-	if err != nil {
+	return c.callTool(ctx, name, arguments, continuation)
+}
+
+// callTool performs a tools/call, mirrored from the definition the server
+// states for the tool over the connection the call travels on.
+//
+// A server that refuses the headers it was sent, with a header mismatch, may
+// have changed the definition since the client read it. The definition is read
+// again and the call repeated once, but only when what it now mirrors differs
+// from what was sent: repeating the call with the same headers would only fail
+// the same way. Where no newer definition is to be had the server's refusal
+// stands as the answer to the call.
+func (c *Client) callTool(ctx context.Context, name string, arguments map[string]any, continuation []Continuation) (*ToolResult, error) {
+	if arguments == nil {
+		arguments = map[string]any{}
+	}
+	params := map[string]any{"name": name, "arguments": arguments}
+	if err := applyContinuation(params, continuation); err != nil {
 		return nil, err
 	}
-	return c.callTool(ctx, name, arguments, held, continuation)
-}
-
-// heldDefinition is what a call weighs its mirrored headers against: what a
-// listing stated for the tool, the connection that listing was read over, and
-// whether it was read from the server for this very call. A definition just
-// read states the terms the server states now, so a call it cannot render is
-// refused on them rather than sending the client back for the same answer, and
-// it is as current as the server can state it however short a lifetime it was
-// given and whatever the server announced while it was being read: a server
-// that gives its definitions no lifetime is asked for them before every call,
-// not twice for one.
-//
-// bound reports that the definition describes one connection and no other. It
-// is what tells an attempt travelling over a connection the definition was not
-// read over to refuse rather than send: a definition that mirrors nothing
-// refuses nothing by itself, so a server that has since begun mirroring a
-// parameter would be sent the call without the header it now asks for. The same
-// holds for a definition that has outlived its lifetime or the catalogue it was
-// read from, whose server may have done the same while the connection stood.
-type heldDefinition struct {
-	statedDefinition
-	generation int64
-	bound      bool
-	fresh      bool
-}
-
-// held records what a listing stated for a tool and the connection it was read
-// over. A transport with no header channel carries no mirrored header whatever
-// a definition says, so one read over it is bound to nothing: neither a
-// reconnection nor a newer definition could change the headers of a call that
-// has none.
-func (c *Client) held(stated statedDefinition, generation int64) heldDefinition {
+	// A transport with no header channel carries no mirrored header whatever a
+	// definition says, so nothing is read where its answer could not be used.
 	if _, carriesHeaders := c.transport.(HeaderSender); !carriesHeaders {
-		return heldDefinition{statedDefinition: statedDefinition{params: stated.params}}
+		return c.dispatchToolCall(ctx, params, nil)
 	}
-	return heldDefinition{statedDefinition: stated, generation: generation, bound: true}
+
+	first := &mirroredAttempt{}
+	result, err := c.dispatchToolCall(ctx, params, c.mirroring(name, first, nil))
+	if !isHeaderMismatch(err) || !first.rendered {
+		return result, err
+	}
+	again, repeatErr := c.dispatchToolCall(ctx, params, c.mirroring(name, &mirroredAttempt{}, first))
+	if errors.Is(repeatErr, errNothingNewToMirror) {
+		return nil, err
+	}
+	return again, repeatErr
 }
 
-// outlived reports whether a held definition no longer states what the server
-// does: the connection it was read over has been replaced, the lifetime the
-// server gave it has run out, or the server has announced a change to its
-// catalogue since. It is asked by the attempt itself, which holds the exchange,
-// so the connection it weighs is the one the attempt travels over and the time
-// the one it is sent at.
-func (c *Client) outlived(held heldDefinition) bool {
-	if c.proto.connectionGeneration() != held.generation {
-		return true
-	}
-	if held.fresh {
-		return false
-	}
-	return !c.proto.now().Before(held.staleAfter) || c.catalogueChanges() != held.changes
+// mirroredAttempt is what one attempt at a tools/call put into mirrored
+// headers: whether it rendered any at all, which only a revision that carries
+// headers does, and the headers it rendered.
+type mirroredAttempt struct {
+	rendered bool
+	headers  map[string]string
 }
 
-// headersFor renders the mirrored headers of one attempt from the definition
-// this call holds, deferred so the work happens only if the negotiated protocol
-// carries headers at all.
+// errNothingNewToMirror ends the repeat of a call the server refused for its
+// headers when reading the definition again brought nothing the first attempt
+// did not already send. Nothing is sent, and the refusal stands.
+var errNothingNewToMirror = errors.New("client: the definition read again mirrors what was already sent")
+
+// mirroring renders the mirrored headers of one attempt at calling a tool by
+// name, and records them in attempt. It runs with the exchange held, over the
+// connection the call is about to travel on, so the definition it mirrors from
+// is that connection's: one the catalogue kept of it still states, or one read
+// over it now, in the same exchange, under the same credential. Nothing can
+// replace the connection between the definition being read and the call being
+// sent, so a call is never mirrored from what another server, or the same
+// server answering another caller, stated.
 //
-// An attempt travelling over another connection than the definition was read
-// over is refused before it is sent. A handshake settles who is speaking, and a
-// server reached again may be another one: it may mirror a parameter the
-// definition in hand says nothing about, and the call would reach it without
-// the header an intermediary in front of it routes and authorizes on. The
-// refusal is the client's own, so nothing has been sent and the catalogue can
-// still be read again and the call repeated with what the server now states.
+// What the catalogue kept is only ever what the server last stated. When a call
+// cannot be rendered from it, because it declares for a mirrored property a
+// type the argument does not carry or because this client refuses the
+// definition, the catalogue is read again before the call is refused: the
+// server may have changed the definition since, and no request would reach it
+// to say so. A definition read for this very call is as current as the server
+// can state it, and a call it cannot render is refused on it.
 //
-// An attempt whose definition has outlived the lifetime the server gave it, or
-// the catalogue the server has since said it changed, is refused the same way,
-// for the same reason: the specification has a stale result read again the next
-// time it is needed, and an intermediary refusing the call on HTTP's terms
-// would never say which header it went without.
-func (c *Client) headersFor(held heldDefinition) headerFunc {
-	if !held.bound && len(held.params) == 0 {
-		return nil
-	}
-	return func(encoded json.RawMessage) (map[string]string, error) {
-		if held.bound && c.outlived(held) {
-			return nil, &staleDefinition{}
+// The server refusing the listing on protocol terms is an answer: the catalogue
+// is not to be had, and the call is made with what the caller stated rather
+// than not at all, as it is when the catalogue does not advertise the tool. A
+// failure of the channel is not an answer and fails the call: sending it anyway
+// would send it without the headers an intermediary routes on.
+//
+// rejected is the attempt the server refused for its headers, when this one
+// repeats it: the definition is then read again whatever the catalogue kept,
+// and the attempt is given up with errNothingNewToMirror unless it mirrors
+// something the rejected one did not.
+func (c *Client) mirroring(name string, attempt, rejected *mirroredAttempt) mirrorFunc {
+	return func(ctx context.Context, under heldConnection, encoded json.RawMessage) (map[string]string, error) {
+		stated, known := definition{}, false
+		if rejected == nil {
+			stated, known = c.statedFor(name, under.generation)
 		}
-		headers, err := held.params.headers(encoded)
+		read := !known
+		if read {
+			var advertised bool
+			var err error
+			stated, advertised, err = c.readDefinition(ctx, under, name)
+			switch {
+			case err != nil && !isServerRefusal(err):
+				return nil, err
+			case (err != nil || !advertised) && rejected != nil:
+				return nil, errNothingNewToMirror
+			}
+		}
+
+		headers, err := stated.headers(name, encoded)
+		if err != nil && !read {
+			current, advertised, readErr := c.readDefinition(ctx, under, name)
+			switch {
+			case readErr != nil && !isServerRefusal(readErr):
+				return nil, readErr
+			case readErr != nil || !advertised:
+				// No newer definition is to be had, so the refusal of the one
+				// in hand is the answer to the call.
+				return nil, err
+			}
+			headers, err = current.headers(name, encoded)
+		}
 		if err != nil {
-			return nil, &mirrorRefusal{err: err}
+			return nil, err
 		}
+		if rejected != nil && sameHeaders(headers, rejected.headers) {
+			return nil, errNothingNewToMirror
+		}
+		attempt.rendered, attempt.headers = true, headers
 		return headers, nil
 	}
 }
 
-// mirroredParametersOf reads the mirrored parameters of a tool addressed by
-// name alone: from a listing this client has already read, or from the one it
-// reads here. The catalogue is read once for as long as the server said it may
-// be kept, not once per call, and nothing is read where its answer could not be
-// used: a transport with no header channel carries no mirrored header, and
-// neither does a revision that does not define them.
-//
-// The server refusing the listing on protocol terms is an answer: the catalogue
-// is not to be had, and the call is made with what the caller stated rather
-// than not at all. A failure of the channel is not an answer, and is reported
-// to the caller: sending the call anyway would send it without the headers an
-// intermediary routes on, which is the very thing the definition was read for.
-//
-// What it returns says which of the two it is, so a call the parameters refuse
-// knows whether a newer definition could still be had.
-//
-// Whatever it returns belongs to one connection, which the exchange that read
-// it reports: the revision is the one the connection found standing here was
-// settled on, read together with the count that identifies it, and a call with
-// nothing to mirror is held to the connection that had nothing to give it (see
-// unstated).
-func (c *Client) mirroredParametersOf(ctx context.Context, name string) (heldDefinition, error) {
-	if _, carriesHeaders := c.transport.(HeaderSender); !carriesHeaders {
-		return heldDefinition{}, nil
+// headers renders the mirrored headers of a call to the tool from its encoded
+// params. A definition this client refuses renders none and reports why: the
+// annotations it carries are invalid, so which headers the server expects
+// cannot be told from it, and a call sent without them is the non-conforming
+// request the specification describes.
+func (d definition) headers(name string, encoded json.RawMessage) (map[string]string, error) {
+	if d.refused != nil {
+		return nil, wrapError(d.refused, "tool ["+name+"] cannot be called: its definition is invalid")
 	}
-	found, err := c.proto.connect(ctx)
+	return d.params.headers(encoded)
+}
+
+// readDefinition reads the catalogue over the held connection and returns what
+// it states for one tool, reporting false when it does not advertise the tool.
+// Whatever fails the listing is returned for the caller to weigh. The catalogue
+// read is recorded as any whole listing is, so the calls after this one find it.
+//
+// The exchange is held while the catalogue is read, so the whole of the reading
+// is given the time one request is: a server that pages its catalogue slowly
+// cannot hold the gate for a timeout a page.
+func (c *Client) readDefinition(ctx context.Context, under heldConnection, name string) (definition, bool, error) {
+	ctx, cancel := c.proto.boundedOnce(ctx)
+	defer cancel()
+	changes := c.catalogueChanges()
+	read, err := readPages(ctx, under.asked, "tools", 0, false)
 	if err != nil {
-		return heldDefinition{}, err
+		return definition{}, false, err
 	}
-	if handshakeFor(found.version) != handshakeDiscovery {
-		return c.unstated(found.generation), nil
+	_, stated, excluded, err := c.toolsOf(read)
+	if err != nil {
+		return definition{}, false, err
 	}
-	if stated, generation, known := c.knownMirrored(name); known {
-		return c.held(stated, generation), nil
-	}
-	tool, advertised, generation, err := c.refreshedTool(ctx, name)
-	switch {
-	case isServerRefusal(err), err == nil && !advertised:
-		return c.unstated(generation), nil
-	case err != nil:
-		return heldDefinition{}, err
-	}
-	return c.held(tool.stated(), tool.generation).freshlyRead(), nil
-}
-
-// unstated is what a call holds when the connection identified by generation
-// had no definition to give it: the revision it was settled on mirrors nothing
-// into headers, the server refused the listing on protocol terms, or its
-// catalogue does not advertise the tool. The call is then made with what the
-// caller stated, and over that connection alone.
-//
-// Having nothing to mirror is an answer like a definition is, given by one
-// server to the caller whose credential the connection was settled under. The
-// server reached by a later handshake may be another one, or the same one
-// answering another caller, and may advertise the tool mirroring a parameter:
-// sent there on the strength of what the connection before it lacked, the call
-// would arrive without the header an intermediary routes and authorizes on. So
-// the answer is bound to its connection as a definition is, and an attempt over
-// another one is refused before it is sent and the catalogue read again. It was
-// read for this very call, so nothing else outdates it.
-func (c *Client) unstated(generation int64) heldDefinition {
-	return c.held(statedDefinition{}, generation).freshlyRead()
-}
-
-// freshlyRead marks a held definition as one read from the server for the very
-// call that holds it.
-func (h heldDefinition) freshlyRead() heldDefinition {
-	h.fresh = true
-	return h
+	c.recordListing(stated, excluded, true, read, changes)
+	found, advertised := stated[name]
+	return found, advertised, nil
 }
 
 // isServerRefusal reports whether a failure is the server answering on protocol
@@ -645,181 +631,13 @@ func isServerRefusal(err error) bool {
 	return errors.As(err, &rpcErr)
 }
 
-// callTool performs a tools/call with a known set of mirrored parameters. On a
-// header mismatch it re-reads the tool's definition and repeats the call once,
-// but only when the refreshed definition mirrors something the first attempt did
-// not: retrying with the same headers would only fail the same way.
-//
-// A definition this client holds can also refuse the call before it is sent, by
-// declaring for a mirrored property a type the argument does not carry. That
-// refusal is weighed the same way, because a definition is only ever what the
-// server last stated: one it has since changed refuses input the server would
-// now accept, and no request reaches it to say so. The definition is read again
-// and the call repeated with it, unless it was read for this very call, which is
-// as current as the server can state it.
-//
-// An attempt refused for travelling over a connection the definition was not
-// read over is weighed the same way again, and is read again however fresh the
-// definition was: what settles it is the handshake that has happened since, not
-// how recently the definition was read before it. So is one refused because the
-// definition has outlived the lifetime the server gave it, or the catalogue the
-// server has since announced a change to. None of these refusals reached the
-// server, so whatever the definition read again asks for, including nothing at
-// all, is the first set of headers this call puts on the wire. The definition
-// read again was read for this very call, so the repeat is held to the
-// connection it travels over and to nothing else: a server that gives its
-// definitions no lifetime at all, or announces a change with every listing, is
-// read once more, not for ever.
-//
-// The re-reads are weighed the way the one before the call is. A failure of the
-// channel is reported as itself: the connection is down by then, and answering
-// with the first outcome would tell the caller to fix its call when what it has
-// to fix is the connection. The server refusing the listing on protocol terms,
-// or no longer advertising the tool, leaves the first outcome standing as the
-// answer to the call where there is one: a header the definition in hand could
-// not render, or the server's own refusal of the headers it was sent. An attempt
-// refused only because its definition had gone out of date has no outcome to
-// leave standing, since nothing about the call itself was wrong, so it is made
-// with what the caller stated, exactly as a call by name is when the catalogue
-// has no definition to give it: over the connection that had none to give, and
-// no other.
-func (c *Client) callTool(ctx context.Context, name string, arguments map[string]any, held heldDefinition, continuation []Continuation) (*ToolResult, error) {
-	if arguments == nil {
-		arguments = map[string]any{}
-	}
-	params := map[string]any{"name": name, "arguments": arguments}
-	if err := applyContinuation(params, continuation); err != nil {
-		return nil, err
-	}
-
-	result, err := c.dispatchToolCall(ctx, params, c.headersFor(held))
-	refused := isMirrorRefusal(err)
-	stale := isStaleDefinition(err)
-	unsent := refused || stale
-	if !unsent && !isHeaderMismatch(err) {
-		return result, err
-	}
-	if refused && held.fresh {
-		return nil, err
-	}
-
-	refreshed, found, generation, listErr := c.refreshedTool(ctx, name)
-	switch {
-	case listErr != nil && !isServerRefusal(listErr):
-		return nil, listErr
-	case (listErr != nil || !found) && stale:
-		return c.dispatchToolCall(ctx, params, c.headersFor(c.unstated(generation)))
-	case listErr != nil, !found:
-		return nil, err
-	}
-	// A call the held definition could not render carries no headers yet, so
-	// whatever the refreshed one renders, including none at all, is the first
-	// set this call would put on the wire.
-	if !unsent && !headersWouldDiffer(params, held.params, refreshed.mirrored) {
-		return nil, err
-	}
-	current := c.held(refreshed.stated(), refreshed.generation).freshlyRead()
-	return c.dispatchToolCall(ctx, params, c.headersFor(current))
-}
-
-// headersWouldDiffer reports whether the refreshed definition mirrors anything
-// the definition the first attempt used did not. Both sets are rendered from
-// one encoding of the call's params, so what is weighed is the same body read
-// two ways rather than two encodings of it; the headers that travel are
-// rendered by the attempt itself, from the body they travel with.
-func headersWouldDiffer(params map[string]any, sent, refreshed mirroredParameters) bool {
-	encoded, err := json.Marshal(params)
-	if err != nil {
-		return false
-	}
-	before, beforeErr := sent.headers(encoded)
-	after, afterErr := refreshed.headers(encoded)
-	if beforeErr != nil || afterErr != nil {
-		return false
-	}
-	return !sameHeaders(before, after)
-}
-
 // dispatchToolCall sends one tools/call exchange and decodes its result.
-func (c *Client) dispatchToolCall(ctx context.Context, params map[string]any, extra headerFunc) (*ToolResult, error) {
+func (c *Client) dispatchToolCall(ctx context.Context, params map[string]any, extra mirrorFunc) (*ToolResult, error) {
 	raw, err := c.proto.dispatchWith(ctx, "tools/call", params, extra)
 	if err != nil {
 		return nil, err
 	}
 	return parseToolResult(raw)
-}
-
-// refreshedTool re-reads one tool's definition from the server, reporting false
-// when the catalogue no longer advertises it and returning whatever failed the
-// listing, which is the caller's to weigh.
-//
-// It also reports the connection its answer describes, since having no
-// definition to give is the answer of one connection as much as a definition
-// is. For a catalogue that was read, that is the connection the listing states.
-// A listing the server refused brings back no result to state one, so it is the
-// connection found standing when the listing was asked for. A handshake settled
-// between the two can only make that the connection before the one that
-// refused, never one after it, and an answer held to a connection already
-// replaced is read again rather than sent on: the mistake it allows is a
-// listing too many, and not a call sent on another connection's terms.
-func (c *Client) refreshedTool(ctx context.Context, name string) (Tool, bool, int64, error) {
-	found, err := c.proto.connect(ctx)
-	if err != nil {
-		return Tool{}, false, crossedGeneration, err
-	}
-	tools, generation, err := c.listTools(ctx, nil)
-	if err != nil {
-		return Tool{}, false, found.generation, err
-	}
-	for _, tool := range tools {
-		if tool.Name == name {
-			return tool, true, generation, nil
-		}
-	}
-	return Tool{}, false, generation, nil
-}
-
-// staleDefinition marks an attempt this client refused to send because the
-// definition it was weighed against no longer states what the server does: the
-// connection the attempt would travel on is not the one the definition was read
-// over, the definition has outlived the lifetime the server gave it, or the
-// server has announced a change to its catalogue since. Nothing reached the
-// server, so the connection stands and the definition can be read again over
-// it.
-type staleDefinition struct{}
-
-// Error implements the error interface.
-func (e *staleDefinition) Error() string {
-	return "the tool definition this call mirrors no longer stands: the connection it was read over " +
-		"has been replaced, the lifetime the server gave it has run out, or the server has changed its catalogue"
-}
-
-// isStaleDefinition reports whether a failure is this client refusing an
-// attempt because the definition behind its headers is out of date.
-func isStaleDefinition(err error) bool {
-	var stale *staleDefinition
-	return errors.As(err, &stale)
-}
-
-// mirrorRefusal marks a call this client refused to send because the definition
-// it weighed the call against cannot render one of the headers that definition
-// mirrors. It carries the failure unchanged, so the caller is told the same
-// either way; the marker is only what tells the call that a definition it holds
-// is what stood in the way, and that reading a newer one may clear it.
-type mirrorRefusal struct{ err error }
-
-// Error implements the error interface.
-func (e *mirrorRefusal) Error() string { return e.err.Error() }
-
-// Unwrap exposes the refusal itself for errors.Is/As.
-func (e *mirrorRefusal) Unwrap() error { return e.err }
-
-// isMirrorRefusal reports whether a failure is this client refusing to render
-// the mirrored headers of a call. Nothing reached the server, so the connection
-// stands and the definition can be read again.
-func isMirrorRefusal(err error) bool {
-	var refusal *mirrorRefusal
-	return errors.As(err, &refusal)
 }
 
 // isHeaderMismatch reports whether a failure is the server refusing a request

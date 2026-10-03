@@ -44,6 +44,13 @@ const (
 	defaultCatalogMaxOutputBytes = 65536
 	// minCatalogMaxToolCalls is the floor for the per-batch call cap.
 	minCatalogMaxToolCalls = 1
+	// maxCatalogMaxToolCalls is the ceiling for the per-batch call cap, and
+	// maxCatalogMaxOutputBytes the ceiling for the output size cap. The reply
+	// of a batch is measured as it is serialized after every call, so the
+	// work of one request grows with both limits; the ceilings keep a
+	// generous configuration from making one request arbitrarily expensive.
+	maxCatalogMaxToolCalls   = 100
+	maxCatalogMaxOutputBytes = 4 << 20
 	// minCatalogMaxOutputBytes is the floor for the output size cap. A limit
 	// the catalog cannot report within is worse than no limit at all, so the
 	// floor leaves room for the smallest report the catalog can be reduced to:
@@ -58,6 +65,13 @@ const (
 	maxCatalogQueryChars = 4096
 	// maxCatalogSearchLimit is the largest result count a client may request.
 	maxCatalogSearchLimit = 50
+	// maxCatalogQueryTerms is the number of distinct terms of a query that are
+	// matched. The work of a search is the number of its terms times the
+	// catalog text, and a query of the accepted length can be split into
+	// thousands of terms, so without the cap one request would cost as much
+	// as thousands of ordinary searches. Terms past the cap are ignored, which
+	// the search tool's schema states.
+	maxCatalogQueryTerms = 32
 	// maxCatalogCallNameChars is the accepted length of a call's tool name, in
 	// characters.
 	maxCatalogCallNameChars = 255
@@ -115,6 +129,11 @@ type toolCatalog struct {
 	// maxOutputBytes caps a catalog tool's reply, measured as that reply is
 	// serialized.
 	maxOutputBytes int
+	// requestedLimits holds the values the last WithToolCatalogLimits was
+	// given, as given, so a limit that had to be moved to its floor or
+	// ceiling can be reported once every option has been applied. It is nil
+	// when the limits are the defaults.
+	requestedLimits *[2]int
 	// installed reports whether the two meta tools have been appended to the
 	// server's tool list. They are installed by the first option that registers
 	// a catalog entry, so a server that only configures limits (or registers no
@@ -178,15 +197,48 @@ func WithToolCatalog(tools ...Tool) Option {
 // not subtract: the result member a client receives is that many bytes wider
 // than the limit, the same handful of bytes for every reply of a given server.
 //
+// Values above the ceilings (100 calls, 4 MiB) are lowered to them: the batch
+// reply is measured as it is serialized after every call, so the work of one
+// request grows with both limits, and the ceilings bound it for every
+// configuration. A value that had to be moved to a floor or a ceiling is
+// reported once, as a warning naming what was asked for and what applies,
+// through the logger set with WithLogger; the limits themselves are the same
+// with or without a logger.
+//
 // It configures the catalog without populating it: on its own it registers no
 // meta tools, so the limits apply whether it is applied before or after
 // WithToolCatalog.
 func WithToolCatalogLimits(maxToolCalls, maxOutputBytes int) Option {
 	return func(s *Server) {
 		c := catalogFor(s)
-		c.maxToolCalls = max(minCatalogMaxToolCalls, maxToolCalls)
-		c.maxOutputBytes = max(minCatalogMaxOutputBytes, maxOutputBytes)
+		c.maxToolCalls = min(max(minCatalogMaxToolCalls, maxToolCalls), maxCatalogMaxToolCalls)
+		c.maxOutputBytes = min(max(minCatalogMaxOutputBytes, maxOutputBytes), maxCatalogMaxOutputBytes)
+		c.requestedLimits = &[2]int{maxToolCalls, maxOutputBytes}
 	}
+}
+
+// reportAdjustedCatalogLimits logs, once, a tool catalog limit that is not the
+// one the server was configured with. WithToolCatalogLimits holds both limits
+// between a floor and a ceiling, and an option has no error to return, so
+// without this a server asked for a batch of 500 calls would serve batches of
+// 100 with nothing saying so. It runs after every option has been applied:
+// the logger may be set after the limits, and when the limits are set more
+// than once only the last ones stand, so only they are reported.
+func reportAdjustedCatalogLimits(s *Server) {
+	c := s.catalog
+	if c == nil || c.requestedLimits == nil || s.logger == nil {
+		return
+	}
+	requestedCalls, requestedBytes := c.requestedLimits[0], c.requestedLimits[1]
+	if requestedCalls == c.maxToolCalls && requestedBytes == c.maxOutputBytes {
+		return
+	}
+	s.logger.Warn("mcp: tool catalog limits adjusted to their bounds",
+		"requested_max_tool_calls", requestedCalls,
+		"max_tool_calls", c.maxToolCalls,
+		"requested_max_output_bytes", requestedBytes,
+		"max_output_bytes", c.maxOutputBytes,
+	)
 }
 
 // catalogFor returns the server's catalog, creating it on first use so either
@@ -200,12 +252,19 @@ func catalogFor(s *Server) *toolCatalog {
 
 // finalizeToolCatalog checks the server's tool names once every option has been
 // applied. The MCP specification requires tool names to be unique within a
-// server, and the catalog contributes two generated names, so a collision is a
-// server misconfiguration. New has no error return and library code never
-// panics, so the collision is recorded on the catalog (both meta tools then
-// report it as a tool error result) and logged when a logger is configured. The
-// colliding tools stay in the list: dropping one silently would hide the
-// misconfiguration instead of surfacing it.
+// server, and the catalog contributes two generated names plus its entries,
+// which are tools of the server even though tools/list does not carry them,
+// so a collision anywhere in that set is a server misconfiguration: the same
+// name would reach one tool through tools/call and another through
+// execute_tools, the events of the two could not be told apart, and
+// search_tools could hand out a name that resolves to something else on the
+// direct path. New has no error return and library code never panics, so the
+// collision is recorded on the catalog (both meta tools then report it as a
+// tool error result) and logged when a logger is configured. The colliding
+// tools stay in the list: dropping one silently would hide the
+// misconfiguration instead of surfacing it. Two catalog entries sharing a name
+// are reported by prepare, with the catalog named, since that collision is
+// confined to it.
 func finalizeToolCatalog(s *Server) {
 	c := s.catalog
 	if c == nil || !c.installed {
@@ -213,17 +272,43 @@ func finalizeToolCatalog(s *Server) {
 	}
 	c.prepare()
 
-	seen := make(map[string]struct{}, len(s.tools))
+	seen := make(map[string]struct{}, len(s.tools)+len(c.tools))
 	for _, t := range s.tools {
-		name := t.Name()
-		if _, dup := seen[name]; dup {
-			c.configErr = "Duplicate server tool name [" + name + "]."
-			if s.logger != nil {
-				s.logger.Error("mcp: duplicate server tool name", "tool", name)
-			}
+		if name := t.Name(); !c.noteName(seen, name) {
+			s.reportDuplicateToolName(name)
 			return
 		}
-		seen[name] = struct{}{}
+	}
+	inCatalog := make(map[string]struct{}, len(c.tools))
+	for _, t := range c.tools {
+		name := t.Name()
+		if !c.noteName(inCatalog, name) {
+			// A name repeated inside the catalog is prepare's to report; it
+			// is not a second collision with the server's tools.
+			continue
+		}
+		if !c.noteName(seen, name) {
+			s.reportDuplicateToolName(name)
+			return
+		}
+	}
+}
+
+// noteName records name in seen, reporting false when it was already there.
+func (c *toolCatalog) noteName(seen map[string]struct{}, name string) bool {
+	if _, dup := seen[name]; dup {
+		return false
+	}
+	seen[name] = struct{}{}
+	return true
+}
+
+// reportDuplicateToolName records a name shared by two of the server's tools
+// as the catalog's misconfiguration and logs it.
+func (s *Server) reportDuplicateToolName(name string) {
+	s.catalog.configErr = "Duplicate server tool name [" + name + "]."
+	if s.logger != nil {
+		s.logger.Error("mcp: duplicate server tool name", "tool", name)
 	}
 }
 
@@ -240,9 +325,10 @@ type catalogEntry struct {
 	// size is the encoded byte size of payload, the unit the output limit is
 	// measured in.
 	size int
-	// name, description and schemaText are the case-folded text a query term is
-	// matched against, in descending search weight.
+	// name, title, description and schemaText are the case-folded text a query
+	// term is matched against, in descending search weight.
 	name        string
+	title       string
 	description string
 	schemaText  string
 	// nameTerms are the search terms of the tool name, compared against the
@@ -280,22 +366,29 @@ func (c *toolCatalog) prepare() {
 			payload:     payload,
 			size:        size,
 			name:        str.Lower(payload.Name),
+			title:       str.Lower(payload.Title),
 			description: str.Lower(payload.Description),
 			schemaText:  str.Lower(string(schemaText)),
-			nameTerms:   catalogTerms(payload.Name),
+			nameTerms:   catalogDistinctTerms(payload.Name),
 		})
 	}
 }
 
-// catalogToolPayload is one entry of a search result: the tool's exact name,
-// description, and complete input schema, plus its behavior-hint annotations
-// when it declares any. The payload is read by a model, so the fields are
-// written in the order they are read in rather than alphabetically.
+// catalogToolPayload is one entry of a search result: the tool definition
+// tools/list would advertise for the tool, member for member, so a tool moved
+// behind the catalog loses nothing a client reads from a definition. That is
+// the exact name, the title, the description, the complete input schema, the
+// output schema when the tool declares one (a client validates
+// structuredContent against it), and the behavior-hint annotations when it
+// declares any. The payload is read by a model, so the fields are written in
+// the order they are read in rather than alphabetically.
 type catalogToolPayload struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"inputSchema"`
-	Annotations map[string]any `json:"annotations,omitempty"`
+	Name         string         `json:"name"`
+	Title        string         `json:"title"`
+	Description  string         `json:"description"`
+	InputSchema  map[string]any `json:"inputSchema"`
+	OutputSchema map[string]any `json:"outputSchema,omitempty"`
+	Annotations  map[string]any `json:"annotations,omitempty"`
 }
 
 // catalogSearchOutput is the payload "search_tools" returns as JSON text: the
@@ -511,6 +604,12 @@ func catalogReplySize(resp *Response) (int, error) {
 // the channels a tool result carries: the bookkeeping the report states, the
 // content items forwarded to the batch result, the structured content, and the
 // metadata forwarded to the batch result's metadata channel.
+//
+// The forwarded content items and the metadata are measured once, when the
+// entry is built, and the sizes are kept beside them: the batch reply is
+// measured after every call, and re-encoding every item already held at each
+// of those measurements would make a batch of n results encode n squared
+// results' worth of bytes (see catalogBatch.render).
 type catalogBatchEntry struct {
 	index      int
 	name       string
@@ -518,6 +617,14 @@ type catalogBatchEntry struct {
 	content    []map[string]any
 	structured map[string]any
 	meta       map[string]any
+	// contentSizes holds the serialized size of each item of content, as the
+	// encoder that puts the reply on the wire would write it in place.
+	contentSizes []int
+	// metaSize is the serialized size of meta, when there is any.
+	metaSize int
+	// unencodable reports that an item or the metadata could not be
+	// serialized, so no reply carrying this entry can be rendered.
+	unencodable bool
 }
 
 // catalogBatchEntryFor splits one inner "tools/call" result into its channels.
@@ -531,22 +638,36 @@ func catalogBatchEntryFor(index int, name string, result map[string]any) catalog
 	structured, _ := result["structuredContent"].(map[string]any)
 	meta, _ := result["_meta"].(map[string]any)
 
-	items, _ := result["content"].([]any)
-	shapes := make([]map[string]any, 0, len(items))
-	for _, item := range items {
-		if shape, ok := item.(map[string]any); ok {
-			shapes = append(shapes, shape)
-		}
-	}
-
-	return catalogBatchEntry{
+	entry := catalogBatchEntry{
 		index:      index,
 		name:       name,
 		isError:    isError,
-		content:    shapes,
 		structured: structured,
 		meta:       meta,
 	}
+	items, _ := result["content"].([]any)
+	entry.content = make([]map[string]any, 0, len(items))
+	entry.contentSizes = make([]int, 0, len(items))
+	for _, item := range items {
+		shape, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		size, err := catalogWireSize(shape)
+		if err != nil {
+			entry.unencodable = true
+		}
+		entry.content = append(entry.content, shape)
+		entry.contentSizes = append(entry.contentSizes, size)
+	}
+	if len(meta) > 0 {
+		size, err := catalogWireSize(meta)
+		if err != nil {
+			entry.unencodable = true
+		}
+		entry.metaSize = size
+	}
+	return entry
 }
 
 // record renders the entry's bookkeeping for the report.
@@ -615,6 +736,46 @@ func (c catalogContent) MergeMeta(meta map[string]any) {
 	c.shape["_meta"] = merged
 }
 
+// catalogPlaceholder stands in for a forwarded content item, or for an inner
+// result's metadata, in the copy of a reply that is measured rather than sent.
+// It serializes to an empty object, two bytes, in the place the real value
+// takes; the real value's own size, measured once when its entry was built,
+// is added back for it (see catalogBatch.render).
+type catalogPlaceholder struct{}
+
+// Compile-time assertion that a placeholder is ordinary response content.
+var _ content.Content = catalogPlaceholder{}
+
+// catalogPlaceholderShape is the empty object every placeholder serializes
+// to. It is shared and never written to.
+var catalogPlaceholderShape = map[string]any{}
+
+// catalogPlaceholderSize is the serialized size of catalogPlaceholderShape.
+const catalogPlaceholderSize = len("{}")
+
+// MarshalJSON writes the empty object.
+func (catalogPlaceholder) MarshalJSON() ([]byte, error) { return []byte("{}"), nil }
+
+// ToTool returns the empty object, which stands where the real item would be.
+func (catalogPlaceholder) ToTool() (map[string]any, error) { return catalogPlaceholderShape, nil }
+
+// ToPrompt refuses: a placeholder is never rendered as a prompt message.
+func (catalogPlaceholder) ToPrompt() (map[string]any, error) { return nil, content.ErrNotAllowed }
+
+// ToResource refuses: a placeholder is never rendered as a resource.
+func (catalogPlaceholder) ToResource(string, string) (map[string]any, error) {
+	return nil, content.ErrNotAllowed
+}
+
+// String names the placeholder.
+func (catalogPlaceholder) String() string { return "placeholder" }
+
+// SetMeta is a no-op: a placeholder carries nothing.
+func (catalogPlaceholder) SetMeta(string, any) {}
+
+// MergeMeta is a no-op: a placeholder carries nothing.
+func (catalogPlaceholder) MergeMeta(map[string]any) {}
+
 // catalogBatch renders the outcome of an execute batch. Every reply the batch
 // can return is built here and measured as it is serialized, so the report, the
 // forwarded content and the metadata are weighed against the output limit
@@ -646,10 +807,23 @@ func (b *catalogBatch) report(ok bool) catalogExecuteReport {
 // completeness flag are derived from the counters here too: they can never
 // disagree with them, and the flag is part of every reply that is weighed
 // against the output limit rather than a member added to one afterwards.
+//
+// The size is measured on a copy of the reply in which every forwarded item
+// and every inner result's metadata is replaced by a placeholder of known
+// size, plus the measured size of each real value in its place. A JSON value
+// serializes to the same bytes wherever it sits in a document, so the sum is
+// the size of the real reply, byte for byte, measured by the same encoder;
+// what it saves is re-encoding every item already held each time the batch
+// grows by one, which made the work of a batch quadratic in its results. The
+// report text itself is encoded afresh each time: it is the one part that
+// changes, and a record is a few dozen bytes.
 func (b *catalogBatch) render(rep catalogExecuteReport, kept []catalogBatchEntry) (*Response, int, error) {
 	rep.Results = make([]catalogResultRecord, 0, len(kept))
 	items := 0
 	for _, entry := range kept {
+		if entry.unencodable {
+			return nil, 0, errors.New("mcp: catalog result cannot be encoded")
+		}
 		rep.Results = append(rep.Results, entry.record())
 		items += len(entry.content)
 	}
@@ -661,44 +835,62 @@ func (b *catalogBatch) render(rep catalogExecuteReport, kept []catalogBatchEntry
 	if err != nil {
 		return nil, 0, err
 	}
+	report := content.NewText(string(text))
 
 	contents := make([]content.Content, 0, 1+items)
-	contents = append(contents, content.NewText(string(text)))
+	measured := make([]content.Content, 0, 1+items)
+	contents = append(contents, report)
+	measured = append(measured, report)
+	held := 0
 	for _, entry := range kept {
-		for _, shape := range entry.content {
+		for i, shape := range entry.content {
 			contents = append(contents, catalogContent{shape: shape})
+			measured = append(measured, catalogPlaceholder{})
+			held += entry.contentSizes[i] - catalogPlaceholderSize
+		}
+		if len(entry.meta) > 0 {
+			held += entry.metaSize - catalogPlaceholderSize
 		}
 	}
 
 	resp := NewResponse(contents...)
-	if meta := catalogBatchMeta(kept); meta != nil {
+	standIn := NewResponse(measured...)
+	if meta := catalogBatchMeta(kept, false); meta != nil {
 		resp = resp.WithMeta(catalogMetaKey, meta)
+		standIn = standIn.WithMeta(catalogMetaKey, catalogBatchMeta(kept, true))
 	}
 	if !rep.OK {
 		resp = resp.AsError()
+		standIn = standIn.AsError()
 	}
 
-	size, err := catalogReplySize(resp)
+	size, err := catalogReplySize(standIn)
 	if err != nil {
 		return nil, 0, err
 	}
-	return resp, size, nil
+	return resp, size + held, nil
 }
 
 // catalogBatchMeta collects the metadata of the inner results that carried any,
 // keyed by the call it belongs to so a host can tell whose metadata it is
 // reading. Nothing is returned when no call attached metadata, so a batch of
-// ordinary results adds no metadata channel of its own.
-func catalogBatchMeta(kept []catalogBatchEntry) map[string]any {
+// ordinary results adds no metadata channel of its own. With placeholders set
+// each result's metadata is stood in for by the placeholder object, for the
+// copy of the reply that is measured rather than sent.
+func catalogBatchMeta(kept []catalogBatchEntry, placeholders bool) map[string]any {
 	results := make([]any, 0, len(kept))
 	for _, entry := range kept {
 		if len(entry.meta) == 0 {
 			continue
 		}
+		meta := entry.meta
+		if placeholders {
+			meta = catalogPlaceholderShape
+		}
 		results = append(results, map[string]any{
 			"index": entry.index,
 			"name":  entry.name,
-			"meta":  entry.meta,
+			"meta":  meta,
 		})
 	}
 	if len(results) == 0 {
@@ -814,7 +1006,7 @@ func (t *catalogSearchTool) Annotations() ToolAnnotations {
 
 // Schema declares the search arguments: an optional query and result limit.
 func (t *catalogSearchTool) Schema(s *schema.Object) {
-	s.String("query").Max(maxCatalogQueryChars).Description("Search terms. An empty query browses the catalog.")
+	s.String("query").Max(maxCatalogQueryChars).Description("Search terms; the first " + strconv.Itoa(maxCatalogQueryTerms) + " distinct terms are matched. An empty query browses the catalog.")
 	s.Integer("limit").Min(1).Max(maxCatalogSearchLimit).Description("Maximum results to return. Defaults to 10.")
 }
 
@@ -944,13 +1136,14 @@ func (c *toolCatalog) search(query string, limit int) (*Response, error) {
 // rank scores the catalog against the query and returns the matching entry
 // indexes, best first.
 //
-// Scoring is additive over the query terms: a query whose terms are exactly the
-// tool's name terms takes a large head start, then each term scores again for
-// appearing in the name, the description, and the rendered input schema, in
-// descending weight. Equal scores keep registration order. An empty query
-// scores nothing and browses the whole catalog.
+// Scoring is additive over the query's distinct terms (see catalogQueryTerms):
+// a query whose terms are exactly the tool's name terms takes a large head
+// start, then each term scores again for appearing in the name, the title, the
+// description, and the rendered input schema, in descending weight. Equal
+// scores keep registration order. An empty query scores nothing and browses
+// the whole catalog.
 func (c *toolCatalog) rank(query string) []int {
-	terms := catalogTerms(query)
+	terms := catalogQueryTerms(query)
 
 	type candidate struct {
 		index int
@@ -966,6 +1159,9 @@ func (c *toolCatalog) rank(query string) []int {
 		for _, term := range terms {
 			if str.Contains(entry.name, term) {
 				score += 4
+			}
+			if str.Contains(entry.title, term) {
+				score += 3
 			}
 			if str.Contains(entry.description, term) {
 				score += 2
@@ -1004,22 +1200,25 @@ func (c *toolCatalog) payloads(indexes []int) []catalogToolPayload {
 	return out
 }
 
-// catalogPayloadFor renders a catalog tool for a search result: its exact name,
-// description, and complete input schema, plus its behavior-hint annotations
-// when it declares any. The payload carries everything a client needs to build
-// a well-formed call, and nothing it does not.
+// catalogPayloadFor renders a catalog tool for a search result: the tool
+// definition tools/list advertises, member for member. The title is the one
+// tools/list derives for a tool that declares none, a headline of its name;
+// the output schema is carried when the tool declares one, in the shape
+// tools/list gives it; the annotations are carried when the tool declares any
+// hint. The payload carries everything a client needs to build a well-formed
+// call and to read its result, and nothing it does not.
 func catalogPayloadFor(t Tool) catalogToolPayload {
-	obj := schema.NewObject()
-	t.Schema(obj)
-	input := obj.ToMap()
-	if _, ok := input["properties"]; !ok {
-		input["properties"] = map[string]any{}
-	}
-
 	payload := catalogToolPayload{
 		Name:        t.Name(),
+		Title:       catalogTitle(t),
 		Description: t.Description(),
-		InputSchema: input,
+		InputSchema: catalogSchemaMap(t.Schema),
+	}
+	if so, ok := t.(StructuredOutput); ok {
+		obj := schema.NewObject()
+		if so.OutputSchema(obj) {
+			payload.OutputSchema = catalogSchemaMap(func(*schema.Object) {}, obj)
+		}
 	}
 	if a, ok := t.(Annotated); ok {
 		if annotations := a.Annotations().ToMap(); len(annotations) > 0 {
@@ -1029,6 +1228,34 @@ func catalogPayloadFor(t Tool) catalogToolPayload {
 	return payload
 }
 
+// catalogTitle is the title a tool is advertised under: its own when it
+// declares a non-empty one, otherwise a headline derived from its name, which
+// is the derivation tools/list applies.
+func catalogTitle(t Tool) string {
+	if titled, ok := t.(Titled); ok {
+		if title := titled.Title(); title != "" {
+			return title
+		}
+	}
+	return str.Headline(t.Name())
+}
+
+// catalogSchemaMap renders a schema the way tools/list renders one: declared
+// by build on a fresh object (or on built, when one is given), and always
+// carrying a "properties" object, even when none were declared.
+func catalogSchemaMap(build func(*schema.Object), built ...*schema.Object) map[string]any {
+	obj := schema.NewObject()
+	if len(built) > 0 {
+		obj = built[0]
+	}
+	build(obj)
+	m := obj.ToMap()
+	if _, ok := m["properties"]; !ok {
+		m["properties"] = map[string]any{}
+	}
+	return m
+}
+
 // catalogTerms splits text into case-folded search terms on runs of characters
 // that are neither letters nor numbers, so punctuation, separators, and control
 // characters all act as boundaries regardless of script.
@@ -1036,6 +1263,35 @@ func catalogTerms(text string) []string {
 	return strings.FieldsFunc(str.Lower(text), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
 	})
+}
+
+// catalogDistinctTerms returns the terms of text with repeats removed, in
+// order of first appearance. A term says the same thing however often it is
+// written, so a repeat neither multiplies a score nor the work of matching it.
+func catalogDistinctTerms(text string) []string {
+	terms := catalogTerms(text)
+	seen := make(map[string]struct{}, len(terms))
+	distinct := terms[:0]
+	for _, term := range terms {
+		if _, dup := seen[term]; dup {
+			continue
+		}
+		seen[term] = struct{}{}
+		distinct = append(distinct, term)
+	}
+	return distinct
+}
+
+// catalogQueryTerms returns the terms of a query that are matched: its
+// distinct terms, the first maxCatalogQueryTerms of them. The cap is what
+// bounds the work of one request to a fixed multiple of a one-term search,
+// whatever the query spells.
+func catalogQueryTerms(query string) []string {
+	terms := catalogDistinctTerms(query)
+	if len(terms) > maxCatalogQueryTerms {
+		terms = terms[:maxCatalogQueryTerms]
+	}
+	return terms
 }
 
 // catalogExecuteTool is the "execute_tools" meta tool: it runs a batch of
@@ -1240,12 +1496,14 @@ func catalogParseCalls(raw []any) ([]catalogCall, error) {
 			catalogMergeFieldErrors(fields, key+".", err)
 		}
 
-		arguments := map[string]any{}
-		switch v := obj["arguments"].(type) {
-		case nil:
-		case map[string]any:
-			arguments = v
-		default:
+		// The member is held to the shape rule a direct tools/call applies
+		// (see validateArguments): omitted means no arguments, and so does an
+		// empty array, which some encoders write for an empty map; null, a
+		// scalar and a non-empty array are refused. A batch entry must not
+		// accept what the direct path refuses, or null would reach a handler
+		// through the catalog alone, nor refuse what it accepts.
+		arguments, ok := catalogCallArguments(obj)
+		if !ok {
 			fields[key+".arguments"] = append(fields[key+".arguments"], "The "+key+".arguments field must be an object.")
 			continue
 		}
@@ -1258,6 +1516,26 @@ func catalogParseCalls(raw []any) ([]catalogCall, error) {
 		return nil, fmt.Errorf("%w: %w", ErrValidation, contract.ValidationErrors{Errors: fields})
 	}
 	return calls, nil
+}
+
+// catalogCallArguments reads a batch entry's "arguments" member as the
+// argument bag the call runs with, reporting false for a member that is
+// present but not an object. An omitted member and an empty array both yield
+// an empty bag, which is what the direct path makes of them.
+func catalogCallArguments(entry map[string]any) (map[string]any, bool) {
+	raw, present := entry["arguments"]
+	if !present {
+		return map[string]any{}, true
+	}
+	switch v := raw.(type) {
+	case map[string]any:
+		return v, true
+	case []any:
+		if len(v) == 0 {
+			return map[string]any{}, true
+		}
+	}
+	return nil, false
 }
 
 // catalogMergeFieldErrors folds the field messages of a validation error into

@@ -10,6 +10,7 @@ import (
 
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
 	"github.com/velocitykode/velocity-mcp/server"
+	"github.com/velocitykode/velocity/contract"
 	"github.com/velocitykode/velocity/router"
 )
 
@@ -31,6 +32,10 @@ const contentTypeJSON = "application/json"
 // httpOptions holds the tunable knobs for the HTTP transport handler.
 type httpOptions struct {
 	maxBodyBytes int64
+	// versions are the protocol revisions the served server accepts in a
+	// request's protocol metadata, or nil for the package default. See
+	// WithProtocolVersions.
+	versions []server.ProtocolVersion
 }
 
 // HandlerOption configures the HTTP transport handler returned by Handler.
@@ -47,14 +52,45 @@ func WithMaxBodyBytes(n int64) HandlerOption {
 	}
 }
 
+// WithProtocolVersions tells the header validation which protocol revisions the
+// served server accepts in a request's protocol metadata, so a -32022 it writes
+// lists the versions that server speaks (the specification requires the error to
+// name the versions the server does support) and a header naming one of them is
+// read as a discovery-era declaration. It matters to a ValidateHeaders mounted
+// on its own; Handler reads the list from the server it serves and ignores this
+// option, because a list that disagreed with the server would make the
+// transport misreport what it supports. Without it the package default,
+// server.ServerSupportedVersions(), is assumed.
+func WithProtocolVersions(versions ...server.ProtocolVersion) HandlerOption {
+	return func(o *httpOptions) {
+		o.versions = append([]server.ProtocolVersion(nil), versions...)
+	}
+}
+
+// protocolVersionsOf reads the protocol versions srv accepts in a request's
+// metadata, as an option Handler applies after the caller's so the server's
+// own list wins. A server that does not expose its list (a stub) leaves the
+// default in place.
+func protocolVersionsOf(srv MCPServer) HandlerOption {
+	lister, ok := srv.(interface {
+		SupportedProtocolVersions() []server.ProtocolVersion
+	})
+	if !ok {
+		return func(*httpOptions) {}
+	}
+	return WithProtocolVersions(lister.SupportedProtocolVersions()...)
+}
+
 // Handler returns a velocity router handler that serves the MCP server srv over
 // streamable HTTP. Mount it on a POST route:
 //
 //	r.Post("/mcp", transport.Handler(srv))
 //
-// One POST carries one JSON-RPC message in its body. The handler reads the body
-// (always wrapped in http.MaxBytesReader, default DefaultMaxBodyBytes), drives
-// it through srv.Handle, and writes the reply:
+// One POST carries one JSON-RPC message in its body, declared as
+// application/json: a request declaring another media type, or none, is refused
+// with HTTP 415 before the body is read (see ValidateHeaders). The handler reads
+// the body (always wrapped in http.MaxBytesReader, default DefaultMaxBodyBytes),
+// drives it through srv.Handle, and writes the reply:
 //
 //   - A request (has an id) yields a JSON-RPC response: HTTP 200 with the
 //     response as the body (Content-Type application/json, or a single SSE
@@ -68,18 +104,30 @@ func WithMaxBodyBytes(n int64) HandlerOption {
 //     HTTP 200, so a client that predates that rule still reads the JSON-RPC
 //     error object rather than treating the reply as a transport failure.
 //
-// Session semantics: the inbound "Mcp-Session-Id" header (if any) is supplied
-// to srv.Handle as the existing session id; an initialize response
-// assigns a new session id which is echoed back in the "Mcp-Session-Id"
-// response header. The per-route handler holds no session map of its own (the
-// server owns session state), so there is no shared map to guard here; concrete
-// transports that retain a session (Stdio, Fake) already mutex-protect it.
+// Session semantics: an initialize response assigns a new session id, echoed
+// back in the "Mcp-Session-Id" response header. The inbound "Mcp-Session-Id"
+// header is supplied to srv.Handle as the existing session id only when the
+// server vouches for it as one it issued (see server.Server.IssuedSessionID)
+// and the request is made under a revision that has sessions: a client can
+// write anything into the header, and application code reading
+// server.Request.SessionID or the tool events is promised the session that
+// issued the request, not a value of the caller's choosing. A request that
+// restates its protocol metadata in params._meta is a 2026-07-28 request, which
+// has no sessions, so its header is ignored. A server that cannot vouch for ids
+// (one that does not implement the check) is handed none. The per-route handler
+// holds no session map of its own, so there is no shared map to guard here;
+// concrete transports that retain a session (Stdio, Fake) already
+// mutex-protect it.
 //
-// Errors are never leaked to the client: a body read failure (including an
-// oversized body) becomes a generic JSON-RPC parse/invalid-request error with
-// no internal detail, and the real cause is logged server-side via the wired
-// velocity logger when available. Malformed JSON is handled inside srv.Handle,
-// which returns a JSON-RPC parse-error response (HTTP 200, error object).
+// Errors are never leaked to the client: a body that exceeds the cap is
+// answered 413 and one that cannot be read is answered 400, both by the
+// framework's error boundary from the error the handler returns (see
+// bodyReadError), with no internal detail and the real cause logged
+// server-side via the wired velocity logger when available. Neither is a
+// JSON-RPC parse error: a body the server never parsed was not invalid JSON,
+// and a client told it was would resend the same bytes. Malformed JSON is
+// handled inside srv.Handle, which returns a JSON-RPC parse-error response
+// (HTTP 200, error object).
 //
 // Authentication and authorization are deliberately NOT this handler's job.
 // Apps attach their own velocity middleware to the route (auth guards, rate
@@ -94,19 +142,18 @@ func Handler(srv MCPServer, opts ...HandlerOption) func(*router.Context) error {
 	// Every served request passes through the MCP header validation middleware
 	// first, so a discovery-handshake request whose headers contradict its body
 	// is refused before it reaches a handler.
-	return ValidateHeaders(opts...)(func(c *router.Context) error {
+	return ValidateHeaders(append(append([]HandlerOption(nil), opts...), protocolVersionsOf(srv))...)(func(c *router.Context) error {
 		raw, readErr := readBody(c, o.maxBodyBytes)
 		if readErr != nil {
-			// An oversized or unreadable body is a client error. Report a
-			// generic JSON-RPC parse error (no id context is recoverable from a
-			// body we could not read) and log the real cause server-side. We
-			// return the response with HTTP 200 so the JSON-RPC error object,
-			// not an opaque transport status, reaches the client.
+			// The header middleware has already read and replaced the body, so
+			// this is reached only when a handler is mounted without it or the
+			// buffered body cannot be re-read; either way the body was never
+			// parsed and the status says so.
 			logf(c, readErr)
-			return writeParseError(c, readErr)
+			return bodyReadError(readErr)
 		}
 
-		sessionID := inboundSessionID(c)
+		sessionID := inboundSessionID(c, srv, raw)
 
 		// Carry the caller's identity on the request context so handlers can
 		// read it back through server.Request.User.
@@ -177,10 +224,35 @@ func readBody(c *router.Context, maxBytes int64) ([]byte, error) {
 	return raw, nil
 }
 
-// inboundSessionID reads the MCP session id from the request header. Header
-// lookup is case-insensitive, so a client sending any casing matches.
-func inboundSessionID(c *router.Context) string {
-	return strings.TrimSpace(c.Request.Header.Get(sessionHeader))
+// sessionIssuer is the optional check a server offers over the session ids it
+// issued. *server.Server implements it; a stub that does not is handed no
+// session id, because nothing can vouch for one.
+type sessionIssuer interface {
+	IssuedSessionID(id string) bool
+}
+
+// inboundSessionID returns the session id a request is handled under: the
+// Mcp-Session-Id header (matched whatever its casing) when the request belongs
+// to a revision that has sessions and srv vouches for the id as one it issued,
+// and "" otherwise. A 2026-07-28 request (one restating its metadata in
+// params._meta) is stateless and its header is ignored; a legacy request
+// carrying an id the server never issued is served without a session rather
+// than under the one the client named. The header is read but never answered
+// with a refusal here: this server does not require sessions, and the
+// initialize handshake lets a client without one simply initialize again.
+func inboundSessionID(c *router.Context, srv MCPServer, raw []byte) string {
+	if isModernRequest(c, raw) {
+		return ""
+	}
+	id := strings.TrimSpace(c.Request.Header.Get(sessionHeader))
+	if id == "" {
+		return ""
+	}
+	issuer, ok := srv.(sessionIssuer)
+	if !ok || !issuer.IssuedSessionID(id) {
+		return ""
+	}
+	return id
 }
 
 // wantsEventStream reports whether the client asked for a Server-Sent Events
@@ -377,17 +449,23 @@ func hasProgressToken(raw []byte) bool {
 	return len(m.Params.Meta.ProgressToken) > 0
 }
 
-// writeParseError writes a generic JSON-RPC parse-error response with HTTP 200.
-// No id can be recovered from a body we could not read, so a null id is used,
-// matching how srv.Handle reports an unparseable message. No internal detail
-// from the underlying read error reaches the client.
-func writeParseError(c *router.Context, cause error) error {
-	const body = `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error: Invalid JSON was received by the server."}}`
-	c.SetHeader("Content-Type", contentTypeJSON)
-	c.SetHeader("X-Content-Type-Options", "nosniff")
-	c.Response.WriteHeader(http.StatusOK)
-	_, err := c.Response.Write([]byte(body + "\n"))
-	return err
+// msgBodyUnreadable is the client-facing text of the 400 a body that cannot be
+// read is answered with. It names the condition and nothing of the cause.
+const msgBodyUnreadable = "The request body could not be read."
+
+// bodyReadError turns a failure to read the request body into the error the
+// framework's error boundary renders: the *http.MaxBytesError of a body over
+// the cap as it is, which the framework answers with 413 (RFC 9110 section
+// 15.5.14), and any other read failure as a 400 carrying a fixed message with
+// the cause attached for the log alone. No JSON-RPC error is written, because
+// none describes the condition: the body was never parsed, so it was not
+// invalid JSON, and no id can be recovered from bytes that were never read. A
+// client reading the status learns whether to shrink the message or resend it.
+func bodyReadError(cause error) error {
+	if maxBytesError(cause) {
+		return cause
+	}
+	return contract.NewHTTPError(http.StatusBadRequest, msgBodyUnreadable).WithCause(cause)
 }
 
 // writeInternalError writes a generic JSON-RPC internal-error response,

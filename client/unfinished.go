@@ -67,6 +67,13 @@ type UnfinishedResultError struct {
 	// Result is the whole unfinished result as it arrived, for a caller that
 	// needs a member this type does not name.
 	Result json.RawMessage
+
+	// rawState is the state token exactly as it was written on the wire. A Go
+	// string holds the token's value and not its spelling: an escape the
+	// decoder had to replace (a lone surrogate, say) would be written back
+	// changed, and the specification requires the member back exactly as it
+	// arrived. Continue carries the spelling into the continuation.
+	rawState json.RawMessage
 }
 
 // Error implements the error interface.
@@ -87,7 +94,7 @@ func (e *UnfinishedResultError) Continue(responses map[string]any) Continuation 
 	if e == nil {
 		return Continuation{InputResponses: responses}
 	}
-	return Continuation{RequestState: e.RequestState, InputResponses: responses}
+	return Continuation{RequestState: e.RequestState, InputResponses: responses, rawState: e.rawState}
 }
 
 // Continuation carries what the client owes the server after an unfinished
@@ -102,6 +109,12 @@ type Continuation struct {
 	// InputResponses answers UnfinishedResultError.InputRequests under the same
 	// keys. It may be empty when the server asked for nothing.
 	InputResponses map[string]any
+
+	// rawState is the spelling of RequestState on the wire it arrived on, set
+	// by Continue and nil for a continuation built by hand. It is written back
+	// as it stands for as long as it still spells RequestState: a caller that
+	// replaced the token is sending a token of its own.
+	rawState json.RawMessage
 }
 
 // checkContinuation reports a request given more than one continuation: two
@@ -124,7 +137,7 @@ func applyContinuation(params map[string]any, continuation []Continuation) error
 		return nil
 	}
 	if state := continuation[0].RequestState; state != nil {
-		params["requestState"] = *state
+		params["requestState"] = stateOnTheWire(*state, continuation[0].rawState)
 	}
 	if responses := continuation[0].InputResponses; len(responses) > 0 {
 		params["inputResponses"] = responses
@@ -132,10 +145,24 @@ func applyContinuation(params map[string]any, continuation []Continuation) error
 	return nil
 }
 
+// stateOnTheWire renders the state token of a continuation: the spelling it
+// arrived in when the continuation still carries the token it arrived with, and
+// the token itself otherwise.
+func stateOnTheWire(state string, raw json.RawMessage) any {
+	if arrived, isString := jsonString(raw); isString && arrived == state {
+		return raw
+	}
+	return state
+}
+
 // unfinishedResult reports a result the server did not complete, or nil for one
 // that carries the whole answer. A result is never read as an answer unless it
 // says it is one: an unfinished result decoded as a success would report a call
 // that never ran as a call that returned nothing.
+//
+// Every result the protocol defines is an object, so one of any other type
+// (null among them, which every decoder here would otherwise read as an empty
+// success) is invalid before its result type is even asked for.
 //
 // Only the two result types the specification defines are recognized. Anything
 // else the server states, a result type that is not a string included, is
@@ -146,7 +173,7 @@ func applyContinuation(params map[string]any, continuation []Continuation) error
 func unfinishedResult(method string, raw json.RawMessage) error {
 	members, ok := jsonObject(raw)
 	if !ok {
-		return nil
+		return invalidResult(method, "it is not an object")
 	}
 	stated, present := members["resultType"]
 	if !present {
@@ -184,6 +211,7 @@ func inputRequired(method string, members map[string]json.RawMessage, raw json.R
 			return invalidResult(method, "its state token is not a string")
 		}
 		err.RequestState = &state
+		err.rawState = trimJSONSpace(stated)
 	}
 
 	if stated, present := members["inputRequests"]; present {
@@ -224,12 +252,20 @@ func invalidResult(method, reason string) error {
 	return newError("the server answered [" + method + "] with an invalid result: " + reason)
 }
 
+// trimJSONSpace trims the whitespace JSON defines, and no other, from around a
+// value: a space, a tab, a line feed and a carriage return. A wider trim would
+// take a character JSON does not allow there, as a vertical tab is, for
+// padding, and let a document that is not JSON be read as one.
+func trimJSONSpace(raw []byte) []byte {
+	return bytes.Trim(raw, " \t\n\r")
+}
+
 // jsonObject decodes a JSON object into its members, each kept in the form it
 // arrived in, reporting false for anything that is not an object. Members stay
 // raw so a value no Go type can hold (a number outside float64's range, say)
 // costs only itself rather than the whole decode.
 func jsonObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
-	trimmed := bytes.TrimSpace(raw)
+	trimmed := trimJSONSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '{' {
 		return nil, false
 	}
@@ -245,7 +281,7 @@ func jsonObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
 // inspected first because encoding/json reads a JSON null into a string without
 // complaint.
 func jsonString(raw json.RawMessage) (string, bool) {
-	trimmed := bytes.TrimSpace(raw)
+	trimmed := trimJSONSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '"' {
 		return "", false
 	}

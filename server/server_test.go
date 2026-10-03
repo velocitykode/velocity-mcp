@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
@@ -64,13 +65,13 @@ func TestDispatchSwallowsError(t *testing.T) {
 func TestSessionIDGenerator(t *testing.T) {
 	s := New("demo", "1.0.0")
 	s.SetSessionIDGenerator(func() string { return "fixed-id" })
-	if s.sessionID() != "fixed-id" {
-		t.Fatalf("session id = %q", s.sessionID())
+	if id := s.sessionID(); !strings.HasPrefix(id, "fixed-id.") || !s.IssuedSessionID(id) {
+		t.Fatalf("session id = %q, want the tagged fixed-id", id)
 	}
 	// nil restores the default (non-empty random id).
 	s.SetSessionIDGenerator(nil)
-	if s.sessionID() == "" {
-		t.Fatal("default session id should be non-empty")
+	if id := s.sessionID(); id == "" || strings.HasPrefix(id, "fixed-id.") || !s.IssuedSessionID(id) {
+		t.Fatalf("default session id = %q, want a tagged random id", id)
 	}
 }
 
@@ -102,8 +103,8 @@ func TestHandleFallbackInitialize(t *testing.T) {
 	if res.Response.Error != nil {
 		t.Fatalf("unexpected error: %+v", res.Response.Error)
 	}
-	if res.SessionID != "sess-1" {
-		t.Fatalf("session id = %q", res.SessionID)
+	if !strings.HasPrefix(res.SessionID, "sess-1.") || !s.IssuedSessionID(res.SessionID) {
+		t.Fatalf("session id = %q, want the tagged sess-1", res.SessionID)
 	}
 }
 
@@ -126,8 +127,8 @@ func TestHandleInitializeUnknownVersion(t *testing.T) {
 	if want := InitializeSupportedVersions()[0]; result["protocolVersion"] != want {
 		t.Fatalf("protocolVersion = %v, want %q", result["protocolVersion"], want)
 	}
-	if res.SessionID != "sess-1" {
-		t.Fatalf("session id = %q", res.SessionID)
+	if !strings.HasPrefix(res.SessionID, "sess-1.") || !s.IssuedSessionID(res.SessionID) {
+		t.Fatalf("session id = %q, want the tagged sess-1", res.SessionID)
 	}
 }
 

@@ -206,7 +206,7 @@ func (s *Server) Notify(method string, params map[string]any) *Response {
 		s.fatalf("mcptest: decode reply for notification %q: %v", method, err)
 		return newResponse(s.t, method, nil)
 	}
-	return s.withNotifications(sentBefore, newResponse(s.t, method, resp))
+	return s.withNotifications(sentBefore, reply, newResponse(s.t, method, resp))
 }
 
 // call marshals a JSON-RPC request for method/params, drives it through the Fake
@@ -251,7 +251,7 @@ func (s *Server) call(method string, params map[string]any) *Response {
 		s.fatalf("mcptest: decode reply for %q: %v", method, err)
 		return newResponse(s.t, method, nil)
 	}
-	return s.withNotifications(sentBefore, newResponse(s.t, method, resp))
+	return s.withNotifications(sentBefore, reply, newResponse(s.t, method, resp))
 }
 
 // fatalf reports a harness failure through t when present, falling back to a

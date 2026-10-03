@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -43,8 +44,9 @@ func TestStdioMissingCommand(t *testing.T) {
 }
 
 func TestStdioReceiveTimeout(t *testing.T) {
-	// `sleep` produces no output; Receive must time out rather than block.
-	tr := NewStdioTransport("sleep", "5")
+	// `cat` is sent nothing and so produces no output; Receive must time out
+	// rather than block.
+	tr := NewStdioTransport("cat")
 	tr.SetTimeout(100 * time.Millisecond)
 	if err := tr.Connect(context.Background()); err != nil {
 		t.Fatalf("connect: %v", err)
@@ -192,32 +194,46 @@ func TestHTTPServerEventStreamJoinsDataLines(t *testing.T) {
 	}
 }
 
-// TestHTTPServerStreamRequestRejectedAcrossDataLines asserts a server-initiated
-// request is recognised from the whole event rather than from one of its lines:
-// a request spread over several data fields must be refused just the same.
-func TestHTTPServerStreamRequestRejectedAcrossDataLines(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"jsonrpc\": \"2.0\",\ndata: \"id\": 7,\ndata: \"method\": \"sampling/createMessage\"}\n\n")
-	}))
-	defer srv.Close()
-
-	tr := NewHTTPTransport(srv.URL)
-	if err := tr.Send(context.Background(), `{"id":1}`); err == nil {
-		t.Fatal("expected error for server-initiated stream request")
+// TestHTTPTransportDeliversAServerRequestOnTheStream asserts the transport
+// delivers a request the server initiated over the stream as a frame like any
+// other, whether it is written as one data line or across several: whether a
+// server may send one depends on the revision of the connection, which the
+// protocol knows and the transport does not, so the protocol answers or refuses
+// it (see server_frames_test.go).
+func TestHTTPTransportDeliversAServerRequestOnTheStream(t *testing.T) {
+	bodies := []struct {
+		name string
+		body string
+	}{
+		{name: "one data line", body: "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"sampling/createMessage\"}\n\n"},
+		{name: "several data lines", body: "data: {\"jsonrpc\": \"2.0\",\ndata: \"id\": 7,\ndata: \"method\": \"sampling/createMessage\"}\n\n"},
 	}
-}
+	for _, tc := range bodies {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
 
-func TestHTTPServerStreamRequestRejected(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		// A server-initiated request (method + id) over the stream is unsupported.
-		_, _ = w.Write([]byte("data: {\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"sampling/createMessage\"}\n\n"))
-	}))
-	defer srv.Close()
-
-	tr := NewHTTPTransport(srv.URL)
-	if err := tr.Send(context.Background(), `{"id":1}`); err == nil {
-		t.Fatal("expected error for server-initiated stream request")
+			tr := NewHTTPTransport(srv.URL)
+			if err := tr.Send(context.Background(), `{"id":1}`); err != nil {
+				t.Fatalf("send: %v", err)
+			}
+			frame, err := tr.Receive(context.Background())
+			if err != nil {
+				t.Fatalf("receive: %v", err)
+			}
+			var probe struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if err := json.Unmarshal([]byte(frame), &probe); err != nil {
+				t.Fatalf("frame %q: %v", frame, err)
+			}
+			if string(probe.ID) != "7" || probe.Method != "sampling/createMessage" {
+				t.Fatalf("frame = %q, want the server's request as it was sent", frame)
+			}
+		})
 	}
 }

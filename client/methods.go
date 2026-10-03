@@ -1,9 +1,11 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"time"
 )
 
@@ -84,9 +86,9 @@ func (c *Client) listOn(ctx context.Context, listType string, limit []int) (list
 		return unread(), nil
 	}
 
-	read, err := c.readPages(ctx, listType, lim, hasLimit)
+	read, err := readPages(ctx, c.proto.exchanged, listType, lim, hasLimit)
 	if errors.Is(err, errAuthorizationChanged) {
-		read, err = c.readPages(ctx, listType, lim, hasLimit)
+		read, err = readPages(ctx, c.proto.exchanged, listType, lim, hasLimit)
 	}
 	if errors.Is(err, errAuthorizationChanged) {
 		return unread(), newError("the credential presented to the server kept changing while the " +
@@ -95,27 +97,86 @@ func (c *Client) listOn(ctx context.Context, listType string, limit []int) (list
 	return read, err
 }
 
+// asker asks the server for one page of a listing and reports what it brought
+// back. authorization is the context the page insists on being asked in, where
+// zero insists on none.
+type asker func(ctx context.Context, method string, params any, authorization int64) (answered, error)
+
+// exchanged asks for a page in an exchange of its own.
+func (p *protocol) exchanged(ctx context.Context, method string, params any, authorization int64) (answered, error) {
+	return p.exchangeWith(ctx, method, params, terms{authorization: authorization})
+}
+
+// asked asks for a page over the held connection. The exchange is held, so the
+// credential cannot change between two pages and no page is asked for in
+// another context than the first.
+func (h heldConnection) asked(ctx context.Context, method string, params any, _ int64) (answered, error) {
+	return h.ask(ctx, method, params)
+}
+
+// maxListPages bounds how many pages a listing is followed for. A cursor is
+// the server's to hand out, and a server that hands out a fresh one on every
+// page would otherwise be followed, and its entries kept, for as long as the
+// caller's context lasts: a tool call that reads the catalogue before it is
+// sent has no bound of its own there. No catalogue a client could put to use
+// runs anywhere near this many pages, so the bound costs a well-behaved server
+// nothing and is reported to the caller when it is reached.
+const maxListPages = 1000
+
+// UnboundedListingError reports a listing this client stopped following: the
+// server handed out a new cursor on every page past the number of pages a
+// listing may run to. What was read is not returned, since a catalogue that was
+// never read to its end is no catalogue at all.
+type UnboundedListingError struct {
+	// Method is the list request whose pages ran past the bound.
+	Method string
+	// Pages is the number of pages read before the listing was given up.
+	Pages int
+}
+
+// Error implements the error interface.
+func (e *UnboundedListingError) Error() string {
+	if e == nil {
+		return "<nil client unbounded listing error>"
+	}
+	return "the server kept handing out cursors for [" + e.Method + "] past " +
+		strconv.Itoa(e.Pages) + " pages, so the listing was given up"
+}
+
 // readPages reads a listing from its first page to its last, or to the limit.
-func (c *Client) readPages(ctx context.Context, listType string, lim int, hasLimit bool) (listing, error) {
+//
+// The cursor is the server's and is opaque: the only thing read off it is
+// whether the result carried one. A nextCursor member that is a string, the
+// empty string included, names the page after this one and is sent back exactly
+// as it arrived; the specification forbids treating the empty string as the end
+// of the results. A member that is absent or null ends the listing, and one of
+// any other type is a malformed result, reported rather than read as an end:
+// a listing cut short would otherwise pass for the whole catalogue.
+//
+// Each page is asked for through ask, which is an exchange of its own for a
+// listing a caller reads, and a request over a connection already held for one
+// read on behalf of the call that holds it.
+func readPages(ctx context.Context, ask asker, listType string, lim int, hasLimit bool) (listing, error) {
 	read := unread()
-	cursor := ""
+	method := listType + "/list"
+	var cursor json.RawMessage
 	seen := map[string]bool{}
 	pages := 0
 
 	for {
-		if cursor != "" {
-			if seen[cursor] {
-				return unread(), newError("repeated " + listType + "/list cursor [" + cursor + "] received from server")
-			}
-			seen[cursor] = true
-		}
-
 		var params any
-		if cursor != "" {
+		if cursor != nil {
+			if seen[string(cursor)] {
+				return unread(), newError("repeated " + method + " cursor received from server")
+			}
+			seen[string(cursor)] = true
 			params = map[string]any{"cursor": cursor}
 		}
+		if pages == maxListPages {
+			return unread(), &UnboundedListingError{Method: method, Pages: pages}
+		}
 
-		reply, err := c.proto.exchangeWith(ctx, listType+"/list", params, terms{authorization: read.authorization})
+		reply, err := ask(ctx, method, params, read.authorization)
 		if err != nil {
 			return unread(), err
 		}
@@ -134,13 +195,13 @@ func (c *Client) readPages(ctx context.Context, listType string, lim int, hasLim
 		}
 		pages++
 
-		var result map[string]any
+		var result map[string]json.RawMessage
 		if err := json.Unmarshal(reply.result, &result); err != nil {
-			return unread(), newError("invalid " + listType + "/list response from server")
+			return unread(), newError("invalid " + method + " response from server")
 		}
-		page, ok := result[listType].([]any)
-		if !ok {
-			return unread(), newError("invalid " + listType + "/list response from server")
+		var page []any
+		if err := json.Unmarshal(result[listType], &page); err != nil || page == nil {
+			return unread(), newError("invalid " + method + " response from server")
 		}
 		for _, entry := range page {
 			m, ok := entry.(map[string]any)
@@ -153,12 +214,35 @@ func (c *Client) readPages(ctx context.Context, listType string, lim int, hasLim
 			read.entries = append(read.entries, listedEntry{payload: m, staleAfter: pageStaleAfter})
 		}
 
-		next, _ := result["nextCursor"].(string)
-		if next == "" {
+		next, err := nextCursorOf(method, result)
+		if err != nil {
+			return unread(), err
+		}
+		if next == nil {
 			return read, nil
 		}
 		cursor = next
 	}
+}
+
+// nextCursorOf reads the cursor of the page after this one from a list result,
+// returning nil when the result carries none: the member is absent or null,
+// which is how a server says the listing has ended. A member of any type other
+// than a string is reported, since the specification types the cursor as one.
+//
+// The cursor is returned as the member was written, not as the string it
+// decodes to: it is opaque and goes back exactly as it arrived, and a spelling
+// the decoder would replace or normalize, as a lone surrogate escape or an
+// escaped letter, is lost the moment it is read into a string.
+func nextCursorOf(method string, result map[string]json.RawMessage) (json.RawMessage, error) {
+	stated := trimJSONSpace(result["nextCursor"])
+	if len(stated) == 0 || bytes.Equal(stated, []byte("null")) {
+		return nil, nil
+	}
+	if _, isString := jsonString(stated); !isString {
+		return nil, newError("invalid " + method + " response from server: the nextCursor member is not a string")
+	}
+	return stated, nil
 }
 
 // resolveLimit interprets the optional variadic limit: absent means unlimited, a
