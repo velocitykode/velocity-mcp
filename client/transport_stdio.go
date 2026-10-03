@@ -38,6 +38,9 @@ type StdioTransport struct {
 	stderr  *tailBuffer
 	lines   chan string
 	readErr chan error
+	// unread counts what was read from the subprocess and not yet received,
+	// and holds the reader once it reaches the frame bound.
+	unread *backlog
 	// done is closed when the subprocess is given up, which releases whoever
 	// is waiting on its output: the reader, and a Receive in flight.
 	done chan struct{}
@@ -49,10 +52,65 @@ type StdioTransport struct {
 // said: the tail is kept and everything before it let go.
 const maxStderrBytes = 64 << 10
 
-// maxFrameBytes caps one frame read from the subprocess. It is the bound the
-// HTTP transport already reads a response body under, so a server cannot make
-// the client buffer more over one channel than over the other.
+// maxFrameBytes caps one frame read from the subprocess, and how much of what
+// it wrote is held read and not yet received. It is the bound the HTTP
+// transport already reads a response body under, so a server cannot make the
+// client buffer more over one channel than over the other: what the client
+// holds of a server writing while nobody receives is that much in the buffer
+// and the one frame in the reader's hands.
 const maxFrameBytes = 32 << 20
+
+// backlog counts the bytes of the frames read from a subprocess and not yet
+// received. The reader takes a frame only while what it holds is under the
+// bound, and otherwise waits for a Receive to make room, so a server that
+// writes while nobody receives blocks on its pipe as it would with no reader
+// at all, rather than filling the client's memory.
+type backlog struct {
+	mu     sync.Mutex
+	room   sync.Cond
+	held   int
+	closed bool
+}
+
+// newBacklog builds an empty backlog.
+func newBacklog() *backlog {
+	b := &backlog{}
+	b.room.L = &b.mu
+	return b
+}
+
+// take waits until a frame of n bytes may be held and holds it, reporting
+// false once the backlog is closed. One frame is always held, whatever its
+// size, so a frame as large as the bound is still delivered.
+func (b *backlog) take(n int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for !b.closed && b.held > 0 && b.held+n > maxFrameBytes {
+		b.room.Wait()
+	}
+	if b.closed {
+		return false
+	}
+	b.held += n
+	return true
+}
+
+// release lets go of a frame of n bytes that was received.
+func (b *backlog) release(n int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.held -= n
+	b.room.Broadcast()
+}
+
+// close releases a reader waiting for room: the subprocess was given up, and
+// nothing will be received any more.
+func (b *backlog) close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	b.room.Broadcast()
+}
 
 // tailBuffer keeps the last limit bytes written to it. It is safe for the
 // concurrent writes of the exec stderr copier and the reads of closedError.
@@ -159,8 +217,9 @@ func (t *StdioTransport) Connect(ctx context.Context) error {
 	t.stdin = stdin
 	t.lines = make(chan string, 16)
 	t.readErr = make(chan error, 1)
+	t.unread = newBacklog()
 	t.done = make(chan struct{})
-	go t.readLoop(stdout, t.lines, t.readErr, t.done)
+	go t.readLoop(stdout, t.lines, t.readErr, t.unread, t.done)
 	return nil
 }
 
@@ -175,12 +234,17 @@ func (t *StdioTransport) Connect(ctx context.Context) error {
 //
 // A frame larger than maxFrameBytes ends the delivery as the end of the stream
 // does: the stream cannot be put back in step past a frame that was not read to
-// its end.
-func (t *StdioTransport) readLoop(stdout io.Reader, lines chan<- string, readErr chan<- error, done <-chan struct{}) {
+// its end. What is read and not yet received is bounded by unread: a frame is
+// handed on only once there is room for it, and the reading waits until then.
+func (t *StdioTransport) readLoop(stdout io.Reader, lines chan<- string, readErr chan<- error, unread *backlog, done <-chan struct{}) {
 	reader := bufio.NewReader(stdout)
 	for {
 		line, err := readFrame(reader, maxFrameBytes)
 		if trimmed := strings.TrimRight(line, "\r\n"); trimmed != "" {
+			if !unread.take(len(trimmed)) {
+				_, _ = io.Copy(io.Discard, reader)
+				return
+			}
 			select {
 			case lines <- trimmed:
 			case <-done:
@@ -265,7 +329,7 @@ func (t *StdioTransport) Send(ctx context.Context, message string) error {
 // context/timeout elapses or the subprocess closes its output.
 func (t *StdioTransport) Receive(ctx context.Context) (string, error) {
 	t.mu.Lock()
-	lines, readErr, done, timeout := t.lines, t.readErr, t.done, t.timeout
+	lines, readErr, unread, done, timeout := t.lines, t.readErr, t.unread, t.done, t.timeout
 	t.mu.Unlock()
 	if lines == nil {
 		return "", newError("transport is not connected")
@@ -276,11 +340,13 @@ func (t *StdioTransport) Receive(ctx context.Context) (string, error) {
 
 	select {
 	case line := <-lines:
+		unread.release(len(line))
 		return line, nil
 	case err := <-readErr:
 		// Drain any line buffered alongside the terminating error.
 		select {
 		case line := <-lines:
+			unread.release(len(line))
 			return line, nil
 		default:
 		}
@@ -376,12 +442,15 @@ func (t *StdioTransport) closedError(err error) error {
 // exited its output is waited for no longer than pipeGrace.
 func (t *StdioTransport) Disconnect() error {
 	t.mu.Lock()
-	cmd, stdin, done := t.cmd, t.stdin, t.done
-	t.cmd, t.stdin, t.lines, t.readErr, t.done = nil, nil, nil, nil, nil
+	cmd, stdin, unread, done := t.cmd, t.stdin, t.unread, t.done
+	t.cmd, t.stdin, t.lines, t.readErr, t.unread, t.done = nil, nil, nil, nil, nil, nil
 	t.mu.Unlock()
 
 	if done != nil {
 		close(done)
+	}
+	if unread != nil {
+		unread.close()
 	}
 	if stdin != nil {
 		_ = stdin.Close()

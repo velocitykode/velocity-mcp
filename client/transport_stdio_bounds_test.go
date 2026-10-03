@@ -3,6 +3,8 @@ package client
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -126,5 +128,51 @@ func TestStdioRefusesAFrameItCannotBound(t *testing.T) {
 			}
 			assertStdioTornDown(t, tr)
 		})
+	}
+}
+
+// TestStdioHoldsABoundedAmountOfUnreadOutput asserts a server that writes while
+// nobody receives cannot make the client hold more than the frame bound of
+// what it wrote: once that much is read and not yet received, the reader takes
+// no more, and the server blocks on its pipe as it would with no reader at all.
+// The server here records how many frames it managed to write; each is a
+// quarter of the bound, so the count says how much the client took.
+func TestStdioHoldsABoundedAmountOfUnreadOutput(t *testing.T) {
+	const frame = frameCeiling / 4
+	written := filepath.Join(t.TempDir(), "written")
+	script := `blob=$(head -c ` + strconv.Itoa(frame-1) + ` /dev/zero | tr '\0' 'x'); i=0; ` +
+		`while [ $i -lt 24 ]; do printf '%s\n' "$blob"; i=$((i+1)); echo $i > '` + written + `'; done; exit 0`
+	tr := NewStdioTransport("/bin/sh", "-c", script)
+	if err := tr.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer tr.Disconnect()
+
+	count := func() int {
+		raw, err := os.ReadFile(written)
+		if err != nil {
+			return 0
+		}
+		n, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
+		return n
+	}
+	// The server writes until it blocks; the count is read once it has stood
+	// still for a while.
+	last, stillSince := -1, time.Now()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if n := count(); n != last {
+			last, stillSince = n, time.Now()
+		} else if time.Since(stillSince) > time.Second {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Logf("the server wrote %d frames of %d bytes before it blocked", last, frame)
+	// The bound in the buffer, one frame in the reader's hands, and one the
+	// pipe may hold part of.
+	if last > 6 {
+		t.Fatalf("the server wrote %d frames nobody received, want at most 6: the client holds about %d MiB of them",
+			last, last*frame>>20)
 	}
 }
