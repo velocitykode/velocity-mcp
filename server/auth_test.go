@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/velocitykode/velocity/auth"
+	"github.com/velocitykode/velocity/contract"
 )
 
 // person is the shape an application's user model takes: it satisfies the
@@ -211,6 +212,6 @@ func TestRequestUser_Concurrent(t *testing.T) {
 // but it must stay exactly velocity's authenticated-user contract: a value from
 // the application's auth scheme has to satisfy it with no adapter, and a
 // handler that asserts back to the concrete model has to keep working.
-var _ Identity = auth.Authenticatable(nil)
-var _ auth.Authenticatable = Identity(nil)
+var _ Identity = contract.Authenticatable(nil)
+var _ contract.Authenticatable = Identity(nil)
 var _ Identity = (*auth.AuthUser)(nil)

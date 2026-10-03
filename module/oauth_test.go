@@ -23,12 +23,12 @@ import (
 // MCP endpoint.
 type bearerScheme struct {
 	token string
-	user  auth.Authenticatable
+	user  contract.Authenticatable
 }
 
 func (s bearerScheme) Check(r *http.Request) bool { return s.User(r) != nil }
 
-func (s bearerScheme) User(r *http.Request) auth.Authenticatable {
+func (s bearerScheme) User(r *http.Request) contract.Authenticatable {
 	if r != nil && r.Header.Get("Authorization") == "Bearer "+s.token {
 		return s.user
 	}
@@ -39,7 +39,7 @@ func (s bearerScheme) ID(*http.Request) any                            { return 
 func (s bearerScheme) SetUserStore(auth.UserStore)                     {}
 func (s bearerScheme) Logout(http.ResponseWriter, *http.Request) error { return nil }
 
-func (s bearerScheme) Login(http.ResponseWriter, *http.Request, auth.Authenticatable, ...bool) error {
+func (s bearerScheme) Login(http.ResponseWriter, *http.Request, contract.Authenticatable, ...bool) error {
 	return nil
 }
 
@@ -53,8 +53,8 @@ func (s bearerScheme) Attempt(http.ResponseWriter, *http.Request, map[string]any
 // anything the auth manager cannot resolve an identity for.
 func requireAuth(next router.HandlerFunc) router.HandlerFunc {
 	return func(c *router.Context) error {
-		manager := auth.FromContext(c)
-		if manager == nil || manager.User(c.Request) == nil {
+		manager, err := c.Auth()
+		if err != nil || manager.User(c.Request) == nil {
 			return contract.NewHTTPError(http.StatusUnauthorized)
 		}
 		return next(c)
@@ -437,8 +437,12 @@ func TestModuleOAuth_NamedSchemeResolvesItsOwnIdentity(t *testing.T) {
 	// through to the handlers.
 	acceptEither := func(next router.HandlerFunc) router.HandlerFunc {
 		return func(c *router.Context) error {
-			manager := auth.FromContext(c)
-			if manager == nil {
+			svc, err := c.Auth()
+			if err != nil {
+				return contract.NewHTTPError(http.StatusUnauthorized)
+			}
+			manager, ok := svc.(*auth.Manager)
+			if !ok {
 				return contract.NewHTTPError(http.StatusUnauthorized)
 			}
 			for _, name := range []string{"web", "api"} {

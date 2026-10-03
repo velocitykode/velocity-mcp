@@ -21,8 +21,12 @@ func identityResolver(c *router.Context) server.IdentityResolver {
 	if c == nil || c.Request == nil {
 		return nil
 	}
-	manager := auth.FromContext(c)
-	if manager == nil {
+	svc, err := c.Auth()
+	if err != nil {
+		return nil
+	}
+	manager, ok := svc.(*auth.Manager)
+	if !ok {
 		return nil
 	}
 	req := c.Request

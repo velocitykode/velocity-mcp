@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/velocitykode/velocity/auth"
 	"github.com/velocitykode/velocity/contract"
 	"github.com/velocitykode/velocity/router"
 	"github.com/velocitykode/velocity/str"
@@ -43,9 +42,9 @@ const (
 type SessionStore struct{}
 
 // session returns the active velocity session for the request, or nil.
-func (SessionStore) session(c *router.Context) auth.Session {
-	m := auth.FromContext(c)
-	if m == nil {
+func (SessionStore) session(c *router.Context) contract.Session {
+	m, err := c.Auth()
+	if err != nil {
 		return nil
 	}
 	return m.Session(c.Request)

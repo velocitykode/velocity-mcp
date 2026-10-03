@@ -10,6 +10,7 @@ import (
 
 	velapp "github.com/velocitykode/velocity/app"
 	"github.com/velocitykode/velocity/auth"
+	"github.com/velocitykode/velocity/contract"
 	"github.com/velocitykode/velocity/router"
 
 	"github.com/velocitykode/velocity-mcp/server"
@@ -19,12 +20,12 @@ import (
 // thing that behaves like the scheme an application guards an endpoint with.
 type tokenScheme struct {
 	token string
-	user  auth.Authenticatable
+	user  contract.Authenticatable
 }
 
 func (s tokenScheme) Check(r *http.Request) bool { return s.User(r) != nil }
 
-func (s tokenScheme) User(r *http.Request) auth.Authenticatable {
+func (s tokenScheme) User(r *http.Request) contract.Authenticatable {
 	if r != nil && r.Header.Get("Authorization") == "Bearer "+s.token {
 		return s.user
 	}
@@ -35,7 +36,7 @@ func (s tokenScheme) ID(*http.Request) any                            { return n
 func (s tokenScheme) SetUserStore(auth.UserStore)                     {}
 func (s tokenScheme) Logout(http.ResponseWriter, *http.Request) error { return nil }
 
-func (s tokenScheme) Login(http.ResponseWriter, *http.Request, auth.Authenticatable, ...bool) error {
+func (s tokenScheme) Login(http.ResponseWriter, *http.Request, contract.Authenticatable, ...bool) error {
 	return nil
 }
 
@@ -49,8 +50,21 @@ func (s tokenScheme) Attempt(http.ResponseWriter, *http.Request, map[string]any,
 // manager, the shape a replacement implementation or a test double takes.
 type notVelocitysManager struct{}
 
-func (notVelocitysManager) Allows(*http.Request, string, ...any) bool     { return false }
-func (notVelocitysManager) Authorize(*http.Request, string, ...any) error { return nil }
+func (notVelocitysManager) Allows(*http.Request, string, ...any) bool       { return false }
+func (notVelocitysManager) Authorize(*http.Request, string, ...any) error   { return nil }
+func (notVelocitysManager) Check(*http.Request) bool                        { return false }
+func (notVelocitysManager) User(*http.Request) contract.Authenticatable     { return nil }
+func (notVelocitysManager) Session(*http.Request) contract.Session          { return nil }
+func (notVelocitysManager) Logout(http.ResponseWriter, *http.Request) error { return nil }
+func (notVelocitysManager) Hash(string) (string, error)                     { return "", nil }
+
+func (notVelocitysManager) Login(http.ResponseWriter, *http.Request, contract.Authenticatable, ...bool) error {
+	return nil
+}
+
+func (notVelocitysManager) Attempt(http.ResponseWriter, *http.Request, map[string]any, ...bool) (bool, error) {
+	return false, nil
+}
 
 // whoamiServer serves a tool that reports the identity resolved for the call,
 // under the default scheme or a named one.

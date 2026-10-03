@@ -10,6 +10,7 @@ import (
 	velapp "github.com/velocitykode/velocity/app"
 	"github.com/velocitykode/velocity/auth"
 	"github.com/velocitykode/velocity/chain"
+	"github.com/velocitykode/velocity/contract"
 	"github.com/velocitykode/velocity/router"
 
 	"github.com/velocitykode/velocity-mcp/client/oauth"
@@ -17,11 +18,11 @@ import (
 
 // sessionScheme is an authentication scheme that only does what SessionStore
 // needs: hand out one in-memory session for the request.
-type sessionScheme struct{ session auth.Session }
+type sessionScheme struct{ session contract.Session }
 
-func (s *sessionScheme) Session(*http.Request) auth.Session { return s.session }
-func (s *sessionScheme) Check(*http.Request) bool           { return true }
-func (s *sessionScheme) User(*http.Request) auth.Authenticatable {
+func (s *sessionScheme) Session(*http.Request) contract.Session { return s.session }
+func (s *sessionScheme) Check(*http.Request) bool               { return true }
+func (s *sessionScheme) User(*http.Request) contract.Authenticatable {
 	return nil
 }
 func (s *sessionScheme) ID(*http.Request) interface{} { return nil }
@@ -29,7 +30,7 @@ func (s *sessionScheme) SetUserStore(auth.UserStore)  {}
 func (s *sessionScheme) Logout(http.ResponseWriter, *http.Request) error {
 	return nil
 }
-func (s *sessionScheme) Login(http.ResponseWriter, *http.Request, auth.Authenticatable, ...bool) error {
+func (s *sessionScheme) Login(http.ResponseWriter, *http.Request, contract.Authenticatable, ...bool) error {
 	return nil
 }
 func (s *sessionScheme) LoginByID(http.ResponseWriter, *http.Request, interface{}, ...bool) error {
@@ -41,7 +42,7 @@ func (s *sessionScheme) Attempt(http.ResponseWriter, *http.Request, map[string]i
 
 // sessionServices builds a service container whose auth manager hands out the
 // given session, the way the web middleware stack does in a real application.
-func sessionServices(session auth.Session) *velapp.Services {
+func sessionServices(session contract.Session) *velapp.Services {
 	manager := auth.NewManager()
 	manager.RegisterScheme("web", &sessionScheme{session: session})
 	manager.SetDefaultScheme("web")
