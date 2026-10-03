@@ -397,11 +397,20 @@ func TestAServerSilentThroughTwoTimeoutsIsReplaced(t *testing.T) {
 // is held for as long as the write blocks: a write held to that deadline would
 // keep the caller, and everyone queued behind it, ten times longer than the
 // timeout they were promised.
+//
+// The clock of the test starts when the first byte of the call reaches the
+// server, which the server reports by writing a marker. What the call costs
+// before that is the encoding of its arguments, work of the client's own that
+// the race detector and a loaded machine stretch many times over (a second
+// alone and over three in a loaded CI run for the arguments below), and the
+// bound under test is on the write alone.
 func TestACallIntoAServerThatStoppedReadingEndsWithTheTimeout(t *testing.T) {
 	const timeout = 500 * time.Millisecond
-	// The server answers the handshake and then never reads its input again.
+	// The server answers the handshake, takes one byte of the call, records
+	// that it has, and never reads its input again. %[1]q is the marker file.
 	script := `IFS= read -r line; echo '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete",` +
-		`"supportedVersions":["` + LatestProtocolVersion + `"],"capabilities":{},"ttlMs":600000}}'; exec sleep 30`
+		`"supportedVersions":["` + LatestProtocolVersion + `"],"capabilities":{},"ttlMs":600000}}'; ` +
+		`dd bs=1 count=1 of=/dev/null 2>/dev/null; echo started > %[1]q; exec sleep 30`
 	tests := []struct {
 		name string
 		// maximum is the maximum set on the client, or zero for the default of
@@ -414,7 +423,8 @@ func TestACallIntoAServerThatStoppedReadingEndsWithTheTimeout(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			c := New(NewStdioTransport("/bin/sh", "-c", script), testClientInfo())
+			marker := filepath.Join(t.TempDir(), "started")
+			c := New(NewStdioTransport("/bin/sh", "-c", strings.Replace(script, "%[1]q", "'"+marker+"'", 1)), testClientInfo())
 			defer c.Disconnect()
 			if err := c.Connect(context.Background()); err != nil {
 				t.Fatalf("connect: %v", err)
@@ -423,33 +433,49 @@ func TestACallIntoAServerThatStoppedReadingEndsWithTheTimeout(t *testing.T) {
 			if tt.maximum > 0 {
 				c.WithMaxTimeout(tt.maximum)
 			}
+			if _, err := os.Stat(marker); err == nil {
+				t.Fatal("the server read a byte of its input before the call was made")
+			}
 
-			// Far more than a pipe holds, so the write blocks.
-			arguments := map[string]any{"blob": strings.Repeat("x", 4<<20)}
+			// Far more than a pipe holds, so the write blocks: a pipe holds
+			// 64 KiB unless it was given more, and at most 1 MiB then.
+			arguments := map[string]any{"blob": strings.Repeat("x", 2<<20)}
 			done := make(chan error, 1)
-			start := time.Now()
 			go func() {
 				_, err := c.CallTool(context.Background(), "upload", arguments)
 				done <- err
 			}()
+			if !pollFor(30*time.Second, func() bool {
+				_, err := os.Stat(marker)
+				return err == nil
+			}) {
+				t.Fatal("the call never reached the server")
+			}
+			start := time.Now()
 
 			// The write gives up after the timeout, and the server that would
-			// not take the frame is then stopped. At worst that takes every
-			// stage of the shutdown: the grace to exit by itself, the grace
-			// after it is asked to, and the grace for its output. The ceiling
-			// is that worst case and a second of slack, which still ends
-			// before a write held to the smallest maximum here (ten timeouts)
-			// could have given up and been stopped.
-			const ceiling = timeout + 2*shutdownGrace + pipeGrace + time.Second
+			// not take the frame is then stopped. It ignores the end of its
+			// input, so that stage takes its whole grace, and the request to
+			// terminate that follows ends it at once: measured on Linux and
+			// macOS, in CI and under the race detector, the stop takes the
+			// grace and under ten milliseconds. The ceiling is that and a
+			// second of slack. A write held to the smallest maximum here, ten
+			// timeouts, would return no sooner than ten timeouts and the stop.
+			const ceiling = timeout + shutdownGrace + time.Second
 			select {
 			case err := <-done:
+				took := time.Since(start)
 				var transportErr *TransportError
 				if !errors.As(err, &transportErr) {
 					t.Fatalf("error = %v (%T), want a transport failure", err, err)
 				}
-				if took := time.Since(start); took > ceiling {
+				if took < timeout/2 {
+					t.Fatalf("the call returned after %v, before its timeout of %v: the write did not block", took, timeout)
+				}
+				if took > ceiling {
 					t.Fatalf("the call returned after %v, want within %v", took, ceiling)
 				}
+				t.Logf("the call returned %v after its first byte reached the server", took)
 			case <-time.After(ceiling):
 				t.Fatalf("the call had not returned after %v with a timeout of %v", ceiling, timeout)
 			}
