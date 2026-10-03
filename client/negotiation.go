@@ -382,7 +382,7 @@ func (p *protocol) discover(ctx context.Context, pinned ProtocolVersion) (*negot
 
 	settled, ok := preferredProtocolVersion(result.SupportedVersions...)
 	if !ok {
-		return nil, newError("the server supports protocol versions [" + joinVersions(result.SupportedVersions) +
+		return nil, newError("the server supports protocol versions [" + quoted(joinVersions(result.SupportedVersions)) +
 			"]; this client supports [" + joinVersions(clientSupportedVersions()) + "]")
 	}
 	if pinned != "" && settled != pinned {

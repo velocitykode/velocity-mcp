@@ -1299,11 +1299,11 @@ func (p *protocol) serveServerFrame(ctx context.Context, raw []byte, version Pro
 	// frame the client cannot read does, on every revision.
 	var id jsonrpc.ID
 	if err := id.UnmarshalJSON(probe.ID); err != nil || !id.IsValidRequestID() {
-		return true, newError("invalid JSON-RPC message from server: the [" + *probe.Method +
+		return true, newError("invalid JSON-RPC message from server: the [" + quoted(*probe.Method) +
 			"] frame carries an id that is neither a string nor a number")
 	}
 	if handshakeFor(version) == handshakeDiscovery {
-		return true, newError("the server sent a [" + *probe.Method + "] request over a connection of protocol version [" +
+		return true, newError("the server sent a [" + quoted(*probe.Method) + "] request over a connection of protocol version [" +
 			version + "], which forbids it; this client sends no response")
 	}
 

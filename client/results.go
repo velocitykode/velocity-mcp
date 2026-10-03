@@ -38,7 +38,7 @@ func parseInitializeResult(raw json.RawMessage) (*InitializeResult, error) {
 		if reported == "" {
 			reported = "none"
 		}
-		return nil, newError("the server chose protocol version [" + reported +
+		return nil, newError("the server chose protocol version [" + quoted(reported) +
 			"]; this client supports [" + joinVersions(initializeSupportedVersions()) + "]")
 	}
 

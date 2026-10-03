@@ -1,6 +1,9 @@
 package client
 
-import "errors"
+import (
+	"errors"
+	"strconv"
+)
 
 // Error is a client-side protocol or transport failure (as opposed to a
 // jsonrpc.Error returned by the server, which surfaces unchanged). It optionally
@@ -130,4 +133,29 @@ func (u *unanswered) Unwrap() error {
 func isUnanswered(err error) bool {
 	var mark *unanswered
 	return errors.As(err, &mark)
+}
+
+// quotedLimit is how much of a text the server sent an error quotes.
+const quotedLimit = 256
+
+// quoted renders text the server sent for an error message, cut to quotedLimit
+// bytes. A server names things, in the frames it sends and on its standard
+// error, and an error that quoted them verbatim would hand the server whatever
+// renders the error: a terminal acts on a control character and a log reader
+// on a line break. The text is escaped the way a Go string literal is, with
+// every control character and every byte that is not valid text written out as
+// an escape, so what the server sent is reported and never acted on.
+func quoted(text string) string {
+	if len(text) <= quotedLimit {
+		return escaped(text)
+	}
+	return escaped(text[:quotedLimit]) + "..."
+}
+
+// escaped renders text with its control characters, and every other character
+// that is not printable, written as escapes. It is the body of a Go string
+// literal for the text: the quotes a literal has around it are left off.
+func escaped(text string) string {
+	literal := strconv.Quote(text)
+	return literal[1 : len(literal)-1]
 }

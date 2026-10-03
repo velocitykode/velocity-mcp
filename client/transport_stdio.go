@@ -350,7 +350,13 @@ func (t *StdioTransport) closedError(err error) error {
 		msg = "subprocess [" + t.command + "] sent a frame this client does not read to its end"
 	}
 	if captured != nil {
-		if stderr := strings.TrimSpace(captured.String()); stderr != "" {
+		// What the server said is quoted escaped, as every text a server sent
+		// is (see quoted), and it is the tail of it that is kept: the last
+		// thing it said is what explains why it ended.
+		if stderr := escaped(strings.TrimSpace(captured.String())); stderr != "" {
+			if len(stderr) > maxStderrBytes {
+				stderr = stderr[len(stderr)-maxStderrBytes:]
+			}
 			msg += "; stderr: " + stderr
 		}
 	}
