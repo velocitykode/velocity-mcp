@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/velocitykode/velocity/auth"
+	"github.com/velocitykode/velocity/contract"
 	"github.com/velocitykode/velocity/router"
 	"github.com/velocitykode/velocity/str"
 
@@ -150,19 +151,24 @@ func NewMemoryStore() *MemoryStore {
 }
 
 // sid returns the browser session id, minting and setting the cookie if absent.
-// The cookie is velocity's canonical one (Path=/, HttpOnly, SameSite=Lax) and
-// carries the Secure attribute on the framework's own terms: always, unless the
+// The cookie is built by the application's cookie policy, so it is HttpOnly and
+// carries the same Path, Domain and SameSite as velocity's own cookies, and the
+// Secure attribute on the framework's own terms: always, unless the
 // application's validated session-cookie configuration opted out, which
-// velocity permits in development and test profiles only. The id is all that
-// stands between another party and this browser's token, so it is not sent over
-// a connection anyone on the path can read.
+// velocity permits in development and test profiles only. With no services
+// wired the zero-value policy applies (Path=/, Secure, SameSite=Lax). The id is
+// all that stands between another party and this browser's token, so it is not
+// sent over a connection anyone on the path can read.
 func (m *MemoryStore) sid(c *router.Context) string {
 	if ck, err := c.Cookie(m.cookieName); err == nil && ck.Value != "" {
 		return ck.Value
 	}
 	id := newID()
-	s := c.ServicesIfSet()
-	c.SetCookie(router.FlashCookie(m.cookieName, id, 0, s == nil || !s.InsecureFlashCookies))
+	var policy contract.CookiePolicy
+	if s := c.ServicesIfSet(); s != nil {
+		policy = s.CookiePolicy
+	}
+	c.SetCookie(policy.Cookie(m.cookieName, id, 0, true))
 	return id
 }
 

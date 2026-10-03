@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/velocitykode/velocity/contract"
+
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
 )
 
@@ -36,6 +38,9 @@ func (l *captureLogger) Info(string, ...any)  {}
 func (l *captureLogger) Warn(string, ...any)  {}
 func (l *captureLogger) Error(string, ...any) { l.errors++ }
 func (l *captureLogger) Fatal(string, ...any) {}
+func (l *captureLogger) With(kvs ...any) contract.Logger {
+	return contract.BindFields(l, kvs...)
+}
 
 func TestWithLoggerAndDispatchError(t *testing.T) {
 	lg := &captureLogger{}

@@ -14,6 +14,7 @@ import (
 	"github.com/velocitykode/velocity/auth"
 	"github.com/velocitykode/velocity/auth/drivers/schemes"
 	"github.com/velocitykode/velocity/chain"
+	"github.com/velocitykode/velocity/contract"
 	"github.com/velocitykode/velocity/crypto"
 	"github.com/velocitykode/velocity/router"
 
@@ -34,7 +35,7 @@ func TestSessionStoreNeverHandsTheBrowserAReadablePendingAuthorization(t *testin
 		t.Fatalf("encryptor: %v", err)
 	}
 	scheme, err := schemes.NewSessionScheme(nil, auth.SessionConfig{
-		Name: "app_session", Lifetime: 120, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode,
+		Name: "app_session", IdleLifetime: 120, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode,
 	}, encryptor)
 	if err != nil {
 		t.Fatalf("session scheme: %v", err)
@@ -253,7 +254,7 @@ func TestMemoryStoreCookieIsSecureUnlessTheApplicationOptedOut(t *testing.T) {
 	}{
 		{name: "no services wired", services: nil, wantSecure: true},
 		{name: "services with the default cookie posture", services: &velapp.Services{}, wantSecure: true},
-		{name: "services that opted out for development", services: &velapp.Services{InsecureFlashCookies: true}, wantSecure: false},
+		{name: "services that opted out for development", services: &velapp.Services{CookiePolicy: contract.NewCookiePolicy("", "", false, http.SameSiteLaxMode)}, wantSecure: false},
 	}
 	writes := []struct {
 		name  string

@@ -16,6 +16,7 @@ import (
 	"github.com/velocitykode/velocity-mcp/jsonrpc"
 	"github.com/velocitykode/velocity-mcp/server"
 	"github.com/velocitykode/velocity/app"
+	"github.com/velocitykode/velocity/contract"
 	"github.com/velocitykode/velocity/router"
 )
 
@@ -439,6 +440,9 @@ func (l *capturingLogger) Error(msg string, kvs ...any) {
 	l.mu.Unlock()
 }
 func (l *capturingLogger) Fatal(msg string, kvs ...any) {}
+func (l *capturingLogger) With(kvs ...any) contract.Logger {
+	return contract.BindFields(l, kvs...)
+}
 
 func (l *capturingLogger) count() int {
 	l.mu.Lock()

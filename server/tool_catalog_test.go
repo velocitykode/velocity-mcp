@@ -11,6 +11,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	"github.com/velocitykode/velocity/contract"
 	"github.com/velocitykode/velocity/validation"
 
 	"github.com/velocitykode/velocity-mcp/content"
@@ -3619,6 +3620,9 @@ func (l *countingLogger) Debug(string, ...any) {}
 func (l *countingLogger) Info(string, ...any)  {}
 func (l *countingLogger) Warn(string, ...any)  {}
 func (l *countingLogger) Fatal(string, ...any) {}
+func (l *countingLogger) With(kvs ...any) contract.Logger {
+	return contract.BindFields(l, kvs...)
+}
 func (l *countingLogger) Error(string, ...any) {
 	l.mu.Lock()
 	l.count++

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	velapp "github.com/velocitykode/velocity/app"
+	"github.com/velocitykode/velocity/contract"
 	"github.com/velocitykode/velocity/router"
 )
 
@@ -25,6 +26,9 @@ func (l *recordingLogger) Debug(msg string, kvs ...any) {}
 func (l *recordingLogger) Info(msg string, kvs ...any)  {}
 func (l *recordingLogger) Warn(msg string, kvs ...any)  {}
 func (l *recordingLogger) Fatal(msg string, kvs ...any) {}
+func (l *recordingLogger) With(kvs ...any) contract.Logger {
+	return contract.BindFields(l, kvs...)
+}
 func (l *recordingLogger) Error(msg string, kvs ...any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
